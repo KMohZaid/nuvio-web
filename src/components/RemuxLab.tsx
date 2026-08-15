@@ -8,6 +8,7 @@ import {
 } from "../lib/matroska";
 import { scanBlocks, type BlockScan } from "../lib/matroskaBlocks";
 import { describeTrack, samplesFor } from "../lib/remux";
+import { RemuxStreamer, type StreamerStatus } from "../lib/remuxStreamer";
 import { buildInitSegment, buildMediaSegment } from "../lib/fmp4";
 
 /**
@@ -56,6 +57,18 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
   const [scan, setScan] = useState<BlockScan | null>(null);
   const [copied, setCopied] = useState(false);
   const [playState, setPlayState] = useState("");
+  const [stream, setStream] = useState<StreamerStatus | null>(null);
+  const streamerRef = useRef<RemuxStreamer | null>(null);
+
+  const startStream = () => {
+    const element = videoRef.current;
+    if (!element || !url.trim()) return;
+    streamerRef.current?.stop();
+    setPlayState("");
+    const streamer = new RemuxStreamer(url.trim(), element, setStream);
+    streamerRef.current = streamer;
+    void streamer.start();
+  };
   const videoRef = useRef<HTMLVideoElement>(null);
 
   /**
@@ -323,14 +336,36 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
         <div className="setting-card">
           <header>
             <h2>Playback attempt</h2>
-            <button className="secondary" onClick={() => void attempt()}>
-              Try remux
-            </button>
+            <div className="source-sheet-tools">
+              <button className="secondary" onClick={() => void attempt()}>
+                One fragment
+              </button>
+              <button className="primary" onClick={startStream}>
+                Stream
+              </button>
+            </div>
           </header>
           {playState && (
             <div className="info-row">
               <span>
                 <small>{playState}</small>
+              </span>
+            </div>
+          )}
+          {stream && (
+            <div className="info-row">
+              <span>
+                <strong>{stream.state}</strong>
+                <small
+                  className={
+                    stream.state === "error" ? "probe-blocked" : "probe-ok"
+                  }
+                >
+                  {stream.message}
+                  {stream.bufferedSeconds != null
+                    ? ` · ${stream.bufferedSeconds.toFixed(1)}s buffered ahead`
+                    : ""}
+                </small>
               </span>
             </div>
           )}
