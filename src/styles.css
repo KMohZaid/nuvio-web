@@ -2831,3 +2831,68 @@ body.is-locked {
   color: #8d97a2;
   font-size: 14px;
 }
+
+/* ---- External playback prompt ------------------------------------------ */
+.watch-prompt {
+  width: min(520px, 100%);
+  margin: auto;
+  padding: 26px 26px max(26px, env(safe-area-inset-bottom));
+  border: 1px solid #30363d;
+  border-radius: 22px;
+  background: #111417;
+}
+.watch-prompt h2 {
+  margin: 6px 0 10px;
+  font-size: 22px;
+  line-height: 1.2;
+}
+.watch-prompt > p {
+  margin: 0 0 20px;
+  color: #8d97a2;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.watch-prompt-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.watch-prompt-fields label {
+  display: grid;
+  gap: 7px;
+  color: #c4cbd2;
+  font-size: 12px;
+}
+.watch-prompt-fields input {
+  height: 46px;
+  padding: 0 13px;
+  border: 1px solid #2e353d;
+  border-radius: 12px;
+  background: #191d22;
+  color: #fff;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.watch-prompt-fields input:focus {
+  border-color: #4d5761;
+  outline: 0;
+}
+.watch-prompt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+/* Centred rather than bottom-anchored: this is a question, not a sheet of
+   options to scroll. */
+.sheet-backdrop:has(.watch-prompt) {
+  align-items: center;
+  padding: 20px;
+}
+@media (max-width: 760px) {
+  .watch-prompt-actions button {
+    flex: 1;
+    min-width: 140px;
+  }
+}

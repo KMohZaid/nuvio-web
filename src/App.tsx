@@ -24,6 +24,7 @@ import { AuthScreen } from "./components/AuthScreen";
 import { ContinueWatching } from "./components/ContinueWatching";
 import { Details } from "./components/Details";
 import { Discover } from "./components/Discover";
+import { ExternalWatchPrompt } from "./components/ExternalWatchPrompt";
 import {
   CollectionFolderView,
   CollectionRow,
@@ -140,6 +141,11 @@ export function App() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [homeLayout, setHomeLayout] = useState<HomeLayout | null>(null);
   const [folder, setFolder] = useState<CollectionFolder | null>(null);
+  // Raised after a hand-off to another player, which reports nothing back.
+  const [externalWatch, setExternalWatch] = useState<{
+    meta: Meta;
+    video?: Video;
+  } | null>(null);
   const [externalPlayer, setExternalPlayer] = useState<ExternalPlayerMode>(() => {
     const stored = localStorage.getItem(
       "nuvio-web-external-player",
@@ -888,6 +894,24 @@ export function App() {
           </button>
         ))}
       </nav>
+      {externalWatch && (
+        <ExternalWatchPrompt
+          meta={externalWatch.meta}
+          video={externalWatch.video}
+          onDismiss={() => setExternalWatch(null)}
+          onFinished={() => {
+            const current = externalWatch;
+            setExternalWatch(null);
+            void toggleWatched(current.meta, current.video, true);
+          }}
+          onStopped={(positionMs, durationMs) => {
+            const current = externalWatch;
+            setExternalWatch(null);
+            savePlaybackProgress(current, positionMs, durationMs, false);
+            setMessage("Saved your position.");
+          }}
+        />
+      )}
       {playback && (
         /* An overlay rather than an early return: unmounting the shell to show
            the player threw away the resolved detail page, so closing it
@@ -940,7 +964,9 @@ export function App() {
                     : `Opening ${externalPlayer === "vlc" ? "VLC" : "Outplayer"}…`,
               );
               // Details stays open: the stream opened elsewhere, so this page
-              // is exactly where you want to be when you come back.
+              // is exactly where you want to be when you come back. The prompt
+              // is the only way progress from that player can be recorded.
+              setExternalWatch({ meta, video });
               return;
             }
             setPlayback({ stream, meta, video });
