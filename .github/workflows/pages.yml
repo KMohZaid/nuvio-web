@@ -31,12 +31,13 @@ jobs:
           # A project site is served from /<repo>/, so the bundle has to be
           # built for that prefix. Change this if you move to a custom domain.
           VITE_BASE_PATH: /${{ github.event.repository.name }}/
-          # The Supabase anon key is a publishable client credential — it ships
-          # in every Nuvio client. Repository *variables*, not secrets, so the
-          # build logs stay readable.
-          NUVIO_SUPABASE_URL: ${{ vars.NUVIO_SUPABASE_URL }}
-          NUVIO_SUPABASE_FALLBACK_URL: ${{ vars.NUVIO_SUPABASE_FALLBACK_URL }}
-          NUVIO_SUPABASE_ANON_KEY: ${{ vars.NUVIO_SUPABASE_ANON_KEY }}
+          # Secrets, so nothing backend-related lives in the repository. They
+          # are still compiled into the public bundle — the anon key is a
+          # publishable credential and RLS is what enforces access — but the
+          # repo itself stays free of backend configuration.
+          NUVIO_SUPABASE_URL: ${{ secrets.NUVIO_SUPABASE_URL }}
+          NUVIO_SUPABASE_FALLBACK_URL: ${{ secrets.NUVIO_SUPABASE_FALLBACK_URL }}
+          NUVIO_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

@@ -27,7 +27,7 @@ export function AuthScreen({ onSession }: { onSession(session: Session): void })
 
   return <main className="auth-screen">
     <section className="auth-card">
-      <img className="auth-logo" src="/nuvio-wordmark.png" alt="Nuvio" />
+      <img className="auth-logo" src={`${import.meta.env.BASE_URL}nuvio-wordmark.png`} alt="Nuvio" />
       <span className="eyebrow">WEB PREVIEW</span>
       <h1>Your Nuvio, anywhere.</h1>
       <p>Install it from Safari or Chrome and keep your profiles, addons, and library in sync.</p>

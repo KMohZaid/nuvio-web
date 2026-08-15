@@ -480,7 +480,7 @@ export function App() {
   if (booting)
     return (
       <div className="splash">
-        <img src="/Nuvio-icon.png" alt="" />
+        <img src={`${import.meta.env.BASE_URL}Nuvio-icon.png`} alt="" />
         <span>Restoring Nuvio…</span>
       </div>
     );
@@ -488,7 +488,7 @@ export function App() {
   return (
     <div className="app-shell">
       <aside className="rail">
-        <img src="/Nuvio-icon.png" alt="Nuvio" />
+        <img src={`${import.meta.env.BASE_URL}Nuvio-icon.png`} alt="Nuvio" />
         {nav.map((item) => (
           <button
             key={item.key}
