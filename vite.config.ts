@@ -4,7 +4,12 @@ import { VitePWA } from "vite-plugin-pwa";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
+  // A GitHub project site is served from /<repo>/, not the domain root. The
+  // workflow sets this; everything else (custom domain, local preview) stays
+  // at "/" and is unaffected.
+  const base = env.VITE_BASE_PATH || "/";
   return {
+    base,
     define: {
       // Changes every build, so Settings can show which one is running — the
       // quickest way to confirm an update actually applied.
@@ -32,17 +37,18 @@ export default defineConfig(({ mode }) => {
           background_color: "#080a0d",
           display: "standalone",
           orientation: "any",
-          start_url: "/",
+          start_url: base,
+          scope: base,
           icons: [
-            { src: "/app-icon-1024.png", sizes: "1024x1024", type: "image/png", purpose: "any" },
+            { src: `${base}app-icon-1024.png`, sizes: "1024x1024", type: "image/png", purpose: "any" },
             // Kept separate from "any": a maskable icon is cropped to the
             // platform's safe zone, so declaring one entry as both lets
             // Android crop artwork that was never padded for it.
-            { src: "/app-icon-1024.png", sizes: "1024x1024", type: "image/png", purpose: "maskable" }
+            { src: `${base}app-icon-1024.png`, sizes: "1024x1024", type: "image/png", purpose: "maskable" }
           ]
         },
         workbox: {
-          navigateFallback: "/index.html",
+          navigateFallback: `${base}index.html`,
           runtimeCaching: [
             {
               urlPattern: ({ request }) => request.destination === "image",

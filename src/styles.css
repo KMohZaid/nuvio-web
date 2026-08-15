@@ -1,10 +1,10 @@
 @font-face {
   font-family: Nuvio;
-  src: url("/jetbrains_sans_regular.ttf");
+  src: url("./assets/jetbrains_sans_regular.ttf");
 }
 @font-face {
   font-family: Nuvio;
-  src: url("/jetbrains_sans_bold.ttf");
+  src: url("./assets/jetbrains_sans_bold.ttf");
   font-weight: 700;
 }
 * {
