@@ -828,6 +828,19 @@ export function App() {
            rebuilt home from scratch and only then re-opened details. */
         <Player
           {...playback}
+          startPositionMs={(() => {
+            const row = watchIndex.progress.get(
+              watchKey(
+                playback.meta.id,
+                playback.video?.season,
+                playback.video?.episode,
+              ),
+            );
+            // A finished title starts over rather than resuming at the credits.
+            if (!row || isComplete(row.positionMs, row.durationMs, false))
+              return 0;
+            return row.positionMs;
+          })()}
           onClose={() => setPlayback(null)}
           onProgress={(positionMs, durationMs, ended) =>
             savePlaybackProgress(playback, positionMs, durationMs, ended)

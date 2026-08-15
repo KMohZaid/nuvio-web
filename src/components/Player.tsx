@@ -51,11 +51,14 @@ export function Player({
   video,
   onClose,
   onProgress,
+  startPositionMs = 0,
 }: {
   stream: Stream;
   meta: Meta;
   video?: Video;
   onClose(): void;
+  /** Where to resume from. 0 starts at the beginning. */
+  startPositionMs?: number;
   /** Reports a resume point. Fired periodically, on pause, and on exit. */
   onProgress(positionMs: number, durationMs: number, ended: boolean): void;
 }) {
@@ -199,6 +202,20 @@ export function Player({
       setWaiting(false);
       setStatus("");
     };
+    // Seek once, on the first metadata event: setting currentTime before the
+    // duration is known is silently ignored, and re-seeking on every event
+    // would fight the user.
+    let resumed = startPositionMs <= 0;
+    const onResume = () => {
+      if (resumed || !Number.isFinite(element.duration)) return;
+      resumed = true;
+      const target = startPositionMs / 1000;
+      // Never seek past the end; a stale row from a different cut of the same
+      // episode would otherwise drop playback at the credits.
+      if (target < element.duration - 5) element.currentTime = target;
+    };
+    element.addEventListener("loadedmetadata", onResume);
+    element.addEventListener("canplay", onResume);
     const onTime = () => setCurrentTime(element.currentTime || 0);
     const onDuration = () => {
       setDuration(Number.isFinite(element.duration) ? element.duration : 0);
@@ -294,6 +311,8 @@ export function Player({
       element.removeEventListener("pause", onPause);
       element.removeEventListener("waiting", onWaiting);
       element.removeEventListener("canplay", onCanPlay);
+      element.removeEventListener("loadedmetadata", onResume);
+      element.removeEventListener("canplay", onResume);
       element.removeEventListener("timeupdate", onTime);
       element.removeEventListener("durationchange", onDuration);
       element.removeEventListener("loadedmetadata", onDuration);
