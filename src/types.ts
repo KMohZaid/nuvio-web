@@ -161,7 +161,13 @@ export type ExternalPlayerMode =
   | "vlc"
   | "outplayer"
   | "m3u";
-export type NavKey = "home" | "discover" | "library" | "addons" | "settings";
+export type NavKey =
+  | "home"
+  | "discover"
+  | "library"
+  | "addons"
+  | "remuxLab"
+  | "settings";
 
 /** One catalog feeding a collection folder. */
 export type CollectionCatalogSource = {

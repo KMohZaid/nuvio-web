@@ -1,6 +1,7 @@
 import {
   ArrowLeft,
   ChevronRight,
+  FlaskConical,
   RefreshCw,
   X,
   Compass,
@@ -25,6 +26,7 @@ import { ContinueWatching } from "./components/ContinueWatching";
 import { Details } from "./components/Details";
 import { Discover } from "./components/Discover";
 import { ExternalWatchPrompt } from "./components/ExternalWatchPrompt";
+import { RemuxLab } from "./components/RemuxLab";
 import {
   CollectionFolderView,
   CollectionRow,
@@ -841,6 +843,8 @@ export function App() {
             index={watchIndex}
             onOpen={setSelected}
           />
+        ) : deferredActive === "remuxLab" ? (
+          <RemuxLab onBack={() => setActive("settings")} />
         ) : deferredActive === "addons" ? (
           <AddonsPage
             onBack={() => setActive("settings")}
@@ -859,6 +863,7 @@ export function App() {
         ) : (
           <SettingsPage
             onAddons={() => setActive("addons")}
+            onRemuxLab={() => setActive("remuxLab")}
             session={session}
             profile={profile}
             amoled={amoled}
@@ -1366,6 +1371,7 @@ function UpdateRow() {
 
 function SettingsPage({
   onAddons,
+  onRemuxLab,
   session,
   profile,
   amoled,
@@ -1378,6 +1384,7 @@ function SettingsPage({
   onSignOut,
 }: {
   onAddons(): void;
+  onRemuxLab(): void;
   session: Session;
   profile: Profile | null;
   amoled: boolean;
@@ -1521,6 +1528,16 @@ function SettingsPage({
         </header>
         <UpdateRow />
       </div>
+      <button className="setting-link" onClick={onRemuxLab}>
+        <FlaskConical />
+        <span>
+          <strong>Remux probe</strong>
+          <small>
+            Experiment: check whether an MKV could play here after remuxing
+          </small>
+        </span>
+        <ChevronRight />
+      </button>
       <div className="setting-card">
         <header>
           <h2>Install as an app</h2>

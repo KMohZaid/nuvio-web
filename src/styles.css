@@ -2921,3 +2921,18 @@ body.is-locked {
     min-width: 140px;
   }
 }
+
+/* ---- Remux probe ------------------------------------------------------- */
+.probe-ok {
+  color: #7fd9a3;
+}
+.probe-transcode {
+  color: #e0c07f;
+}
+.probe-blocked {
+  color: #e58b8b;
+}
+.info-row code {
+  opacity: 0.6;
+  font-size: 11px;
+}
