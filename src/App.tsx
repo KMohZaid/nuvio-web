@@ -78,6 +78,7 @@ import {
 import {
   buildContinueWatching,
   buildWatchIndex,
+  continueWatchingCandidates,
   watchKey,
   type WatchIndex,
 } from "./lib/progress";
@@ -280,30 +281,15 @@ export function App() {
       const watchedTitles = new Map(
         nextWatched.map((item) => [item.contentId, item.title]),
       );
-      const identities = [
-        ...nextProgress.map((item) => ({
-          id: item.contentId,
-          type: item.contentType,
-          at: item.lastWatched,
-        })),
-        ...nextWatched.map((item) => ({
-          id: item.contentId,
-          type: item.contentType,
-          at: item.watchedAt,
-        })),
-      ]
-        .filter((item) => item.id && item.type)
-        .sort((a, b) => b.at - a.at);
-      const unique = new Map<string, { type: string; at: number }>();
-      for (const item of identities)
-        if (!unique.has(item.id))
-          unique.set(item.id, { type: item.type, at: item.at });
+      // Only titles that could actually yield a card, newest first.
+      const unique = continueWatchingCandidates(nextProgress, nextWatched);
+
       // A title with no metadata is dropped from Continue Watching entirely,
       // so this cap is really a cap on how much of the list is shown. Twenty
       // was hiding rows for anyone with more in flight than that.
-      const RESOLVE_LIMIT = 60;
+      const RESOLVE_LIMIT = 80;
       const RESOLVE_CONCURRENCY = 6;
-      const pending = [...unique].slice(0, RESOLVE_LIMIT);
+      const pending = unique.slice(0, RESOLVE_LIMIT);
       const resolved: Meta[] = [];
       // Batched rather than one Promise.all over the whole set: sixty parallel
       // requests to a handful of addon hosts is how you get rate-limited.
@@ -311,12 +297,12 @@ export function App() {
         const batch = await Promise.all(
           pending
             .slice(cursor, cursor + RESOLVE_CONCURRENCY)
-            .map(async ([id, identity]) => {
+            .map(async ({ id, type }) => {
               const existing = known.get(id);
               if (existing?.videos.length) return existing;
               const seed: Meta = {
                 id,
-                type: identity.type,
+                type,
                 name:
                   watchedTitles.get(id) || existing?.name || "Recently watched",
                 genres: [],

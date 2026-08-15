@@ -19,6 +19,52 @@ const entriesFor = (entries: ProgressRow[], id: string) =>
     .filter((entry) => entry.contentId === id)
     .sort((a, b) => b.lastWatched - a.lastWatched);
 
+/**
+ * Titles that could actually produce a Continue Watching card, newest first.
+ *
+ * Only two things ever yield one: a part-watched row, or a series with a
+ * later episode available. A finished *movie* can never qualify — so spending
+ * a metadata lookup on one is wasted, and with a long watch history those
+ * lookups crowd out the titles that would have shown. That is what made the
+ * row look capped.
+ *
+ * Uses the same completion and series rules as buildContinueWatching, so the
+ * two cannot disagree about what is worth resolving.
+ */
+export function continueWatchingCandidates(
+  entries: ProgressRow[],
+  watched: WatchedItem[],
+): Array<{ id: string; type: string; at: number }> {
+  const best = new Map<string, { id: string; type: string; at: number }>();
+  const consider = (
+    id: string,
+    type: string,
+    at: number,
+    qualifies: boolean,
+  ) => {
+    if (!id || !type || !qualifies) return;
+    const existing = best.get(id);
+    if (!existing || at > existing.at) best.set(id, { id, type, at });
+  };
+  for (const entry of entries) {
+    const part = percent(entry) > 0 && !completed(entry);
+    consider(
+      entry.contentId,
+      entry.contentType,
+      entry.lastWatched,
+      part || isSeries(entry.contentType),
+    );
+  }
+  for (const entry of watched)
+    consider(
+      entry.contentId,
+      entry.contentType,
+      entry.watchedAt,
+      isSeries(entry.contentType),
+    );
+  return [...best.values()].sort((a, b) => b.at - a.at);
+}
+
 export function buildContinueWatching(
   entries: ProgressRow[],
   watched: WatchedItem[],
