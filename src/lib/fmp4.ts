@@ -67,7 +67,7 @@ const fullBox = (
 export type MuxTrack = {
   id: number;
   kind: "video" | "audio";
-  /** Sample entry type: av01, avc1, hvc1 or mp4a. */
+  /** Sample entry type: av01, avc1, hvc1, mp4a, ec-3 or ac-3. */
   sampleEntry: string;
   /** The codec-specific configuration box payload, verbatim. */
   config: Uint8Array;
@@ -156,8 +156,16 @@ function sampleEntryFor(track: MuxTrack) {
       configBox,
     );
   }
+  // Dolby codecs carry their config directly; only AAC needs the descriptor
+  // chain rebuilt around it.
+  const configBox =
+    track.sampleEntry === "ec-3"
+      ? box("dec3", track.config)
+      : track.sampleEntry === "ac-3"
+        ? box("dac3", track.config)
+        : esds(track.config);
   return box(
-    "mp4a",
+    track.sampleEntry,
     reserved,
     u16(1),
     u32(0),
@@ -167,7 +175,7 @@ function sampleEntryFor(track: MuxTrack) {
     u16(0),
     u16(0),
     u32((track.sampleRate ?? 48000) << 16),
-    esds(track.config),
+    configBox,
   );
 }
 

@@ -7,7 +7,8 @@ import {
   type ProbeResult,
 } from "../lib/matroska";
 import { scanBlocks, type BlockScan } from "../lib/matroskaBlocks";
-import { buildSegments, describeTrack } from "../lib/remux";
+import { describeTrack, samplesFor } from "../lib/remux";
+import { buildInitSegment, buildMediaSegment } from "../lib/fmp4";
 
 /**
  * Step one of the remux spike: can this device read a real debrid file and
@@ -62,79 +63,6 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
    *
    * MSE reports configuration problems by rejecting the append rather than by
    * playing badly, so a failure here is specific and worth surfacing verbatim.
-   */
-  const attempt = async () => {
-    if (!result || !scan) return;
-    setPlayState("Preparing…");
-    const video = scan.tracks.find((track) => track.kind === "video");
-    if (!video) {
-      setPlayState("No video track in this range.");
-      return;
-    }
-    const meta = result.tracks.find((track) => track.kind === "video");
-    const described = describeTrack(video, meta?.width, meta?.height);
-    if ("reason" in described) {
-      setPlayState(described.reason);
-      return;
-    }
-
-    const { init, media, sampleCount } = buildSegments(
-      scan,
-      result.buffer,
-      described,
-    );
-    const codec =
-      described.sampleEntry === "av01"
-        ? "av01.0.08M.10"
-        : described.sampleEntry === "hvc1"
-          ? "hvc1.1.6.L93.B0"
-          : "avc1.640028";
-    const mime = `video/mp4; codecs="${codec}"`;
-    const Source =
-      (window as unknown as { ManagedMediaSource?: typeof MediaSource })
-        .ManagedMediaSource ?? window.MediaSource;
-    if (!Source?.isTypeSupported(mime)) {
-      setPlayState(`This browser rejects ${mime}.`);
-      return;
-    }
-
-    const source = new Source();
-    const element = videoRef.current;
-    if (!element) return;
-    // ManagedMediaSource needs the element to advertise it wants the data.
-    element.disableRemotePlayback = true;
-    element.src = URL.createObjectURL(source as unknown as MediaSource);
-    source.addEventListener("sourceopen", () => {
-      try {
-        const buffer = (source as MediaSource).addSourceBuffer(mime);
-        buffer.addEventListener("error", () =>
-          setPlayState("SourceBuffer rejected the media segment."),
-        );
-        buffer.addEventListener("updateend", () => {
-          if ((source as MediaSource).readyState === "open" && buffer.buffered.length)
-            setPlayState(
-              `Buffered ${buffer.buffered.end(0).toFixed(2)}s from ${sampleCount} samples — press play.`,
-            );
-        });
-        buffer.appendBuffer(init as unknown as BufferSource);
-        buffer.addEventListener(
-          "updateend",
-          () => buffer.appendBuffer(media as unknown as BufferSource),
-          { once: true },
-        );
-      } catch (error) {
-        setPlayState(
-          error instanceof Error ? error.message : "Could not open a buffer.",
-        );
-      }
-    });
-    setPlayState(`Appending ${sampleCount} samples as ${codec}…`);
-  };
-
-  /**
-   * A plain-text summary to paste somewhere. The URL is reduced to its host on
-   * purpose: a debrid link carries an account token, and this is meant to be
-   * shared.
    */
   const buildReport = (probe: ProbeResult, blocks: BlockScan | null) => {
     const plan = planRemux(probe.tracks);
@@ -216,6 +144,131 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
       // selectable, which beats screenshotting it.
       window.prompt("Copy the probe report", text);
     }
+  };
+
+  const attempt = async () => {
+    if (!result || !scan) return;
+    setPlayState("Preparing…");
+
+    const codecStringFor = (entry: string) =>
+      entry === "av01"
+        ? "av01.0.08M.10"
+        : entry === "hvc1"
+          ? "hvc1.1.6.L93.B0"
+          : entry === "avc1"
+            ? "avc1.640028"
+            : entry === "ec-3"
+              ? "ec-3"
+              : entry === "ac-3"
+                ? "ac-3"
+                : "mp4a.40.2";
+
+    // Video first, then the best audio the plan chose — the same selection the
+    // source list uses, so a TrueHD default does not get picked here either.
+    const plan = planRemux(result.tracks);
+    const pick = (kind: "video" | "audio", codecId?: string) =>
+      scan.tracks.find(
+        (track) =>
+          track.kind === kind &&
+          (!codecId || track.codecId === codecId) &&
+          scan.frames.some((frame) => frame.track === track.number),
+      );
+
+    const videoTrack = pick("video", plan.video?.codecId);
+    const audioTrack = pick("audio", plan.audio?.codecId);
+    if (!videoTrack) {
+      setPlayState("No video frames in this range.");
+      return;
+    }
+
+    const firstFrameOf = (trackNumber: number) => {
+      const frame = scan.frames.find((item) => item.track === trackNumber);
+      return frame
+        ? result.buffer.subarray(frame.offset, frame.offset + frame.size)
+        : undefined;
+    };
+
+    const meta = result.tracks.find((track) => track.kind === "video");
+    const video = describeTrack(videoTrack, meta?.width, meta?.height);
+    if ("reason" in video) {
+      setPlayState(video.reason);
+      return;
+    }
+    const audio = audioTrack
+      ? describeTrack(
+          audioTrack,
+          undefined,
+          undefined,
+          undefined,
+          firstFrameOf(audioTrack.number),
+        )
+      : null;
+    const audioReason = audio && "reason" in audio ? audio.reason : null;
+    const audioTrackReady = audio && !("reason" in audio) ? audio : null;
+
+    const mime = `video/mp4; codecs="${codecStringFor(video.sampleEntry)}${
+      audioTrackReady ? `,${codecStringFor(audioTrackReady.sampleEntry)}` : ""
+    }"`;
+    const Source =
+      (window as unknown as { ManagedMediaSource?: typeof MediaSource })
+        .ManagedMediaSource ?? window.MediaSource;
+    if (!Source?.isTypeSupported(mime)) {
+      setPlayState(`This browser rejects ${mime}.`);
+      return;
+    }
+
+    const element = videoRef.current;
+    if (!element) return;
+    const source = new Source();
+    element.disableRemotePlayback = true;
+    element.src = URL.createObjectURL(source as unknown as MediaSource);
+
+    source.addEventListener("sourceopen", () => {
+      try {
+        // Both tracks share one buffer, which keeps their timelines aligned
+        // without having to coordinate two independent append queues.
+        const buffer = (source as MediaSource).addSourceBuffer(mime);
+        const tracks = audioTrackReady ? [video, audioTrackReady] : [video];
+        const init = buildInitSegment(tracks);
+        const media = tracks.map((track) => {
+          const samples = samplesFor(scan, result.buffer, track.id);
+          const first = scan.frames
+            .filter((frame) => frame.track === track.id)
+            .reduce((lowest, frame) => Math.min(lowest, frame.timeMs), Infinity);
+          return buildMediaSegment(
+            1,
+            track.id,
+            Number.isFinite(first) ? Math.round(first) : 0,
+            samples,
+          );
+        });
+
+        const queue = [init, ...media];
+        const pump = () => {
+          const next = queue.shift();
+          if (!next) {
+            const end = buffer.buffered.length ? buffer.buffered.end(0) : 0;
+            setPlayState(
+              `Buffered ${end.toFixed(2)}s · ${tracks.length === 2 ? "video + audio" : "video only"}${
+                audioReason ? ` · audio skipped: ${audioReason}` : ""
+              } — press play.`,
+            );
+            return;
+          }
+          buffer.appendBuffer(next as unknown as BufferSource);
+        };
+        buffer.addEventListener("updateend", pump);
+        buffer.addEventListener("error", () =>
+          setPlayState("SourceBuffer rejected a segment."),
+        );
+        pump();
+      } catch (error) {
+        setPlayState(
+          error instanceof Error ? error.message : "Could not open a buffer.",
+        );
+      }
+    });
+    setPlayState(`Appending as ${mime}…`);
   };
 
   return (

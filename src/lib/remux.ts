@@ -1,5 +1,6 @@
 import { buildInitSegment, buildMediaSegment, type MuxTrack, type MuxSample } from "./fmp4";
 import type { BlockScan, TrackHeader } from "./matroskaBlocks";
+import { buildDac3, buildDec3, parseAc3 } from "./eac3";
 
 /**
  * Turns a Matroska scan into fMP4 segments.
@@ -16,6 +17,8 @@ export function sampleEntryFor(codecId: string): string | null {
   if (id.startsWith("V_MPEG4/ISO/AVC")) return "avc1";
   if (id.startsWith("V_MPEGH/ISO/HEVC")) return "hvc1";
   if (id.startsWith("A_AAC")) return "mp4a";
+  if (id.startsWith("A_EAC3")) return "ec-3";
+  if (id.startsWith("A_AC3")) return "ac-3";
   return null;
 }
 
@@ -26,27 +29,48 @@ export function describeTrack(
   width?: number,
   height?: number,
   channels?: number,
+  /** First frame of this track, needed for codecs that carry no CodecPrivate. */
+  firstFrame?: Uint8Array,
 ): MuxTrack | RemuxError {
   const entry = sampleEntryFor(track.codecId);
   if (!entry)
     return { track, reason: `${track.codecId} has no MP4 sample entry here.` };
-  if (!track.codecPrivate?.length)
+
+  const dolby = entry === "ec-3" || entry === "ac-3";
+  let config = track.codecPrivate;
+  let rate: number | undefined;
+  let channelCount = channels;
+
+  if (dolby) {
+    // Matroska stores nothing for these, so the parameters are read out of the
+    // first audio frame and the box is rebuilt from them.
+    if (!firstFrame?.length)
+      return { track, reason: `${track.codecId} needs a frame to read its configuration from.` };
+    const info = parseAc3(firstFrame);
+    if (!info)
+      return { track, reason: `No ${track.codecId} sync frame found to configure from.` };
+    config = entry === "ec-3" ? buildDec3(info) : buildDac3(info);
+    rate = info.sampleRate;
+    channelCount = info.channels;
+  }
+
+  if (!config?.length)
     return {
       track,
-      // E-AC-3 and AC-3 land here: Matroska stores no config and MP4 needs a
-      // dec3/dac3 box synthesised from the bitstream, which is separate work.
-      reason: `${track.codecId} carries no CodecPrivate, so its decoder config would have to be synthesised.`,
+      reason: `${track.codecId} carries no CodecPrivate and none could be synthesised.`,
     };
+
   return {
     id: track.number,
-    kind: entry === "mp4a" ? "audio" : "video",
+    kind: entry === "av01" || entry === "avc1" || entry === "hvc1" ? "video" : "audio",
     sampleEntry: entry,
-    config: track.codecPrivate,
+    config,
     // Milliseconds: the scan already scaled timestamps into them.
     timescale: 1000,
     width,
     height,
-    channels,
+    channels: channelCount,
+    sampleRate: rate,
   };
 }
 
