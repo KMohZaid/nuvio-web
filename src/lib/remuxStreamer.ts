@@ -14,7 +14,14 @@ import type { TrackHeader } from "./matroskaBlocks";
  * shuffling, which is why this runs on a phone at all.
  */
 
-const CHUNK_BYTES = 1024 * 1024;
+/**
+ * 8 MB, not 1 MB. A 4K stream runs at tens of megabits, so small chunks mean
+ * hundreds of sequential requests per minute — which debrid hosts rate limit,
+ * and which shows up as a generic network failure part way in.
+ */
+const CHUNK_BYTES = 8 * 1024 * 1024;
+/** A refused range is usually transient: back off and try again. */
+const FETCH_ATTEMPTS = 3;
 /** How far ahead of the playhead to stay. */
 const TARGET_AHEAD_SECONDS = 30;
 /** How much history to keep before evicting; MSE throws when the quota goes. */
@@ -214,6 +221,51 @@ export class RemuxStreamer {
       };
     this.fetching = true;
     try {
+      return await this.fetchWithRetry();
+    } finally {
+      this.fetching = false;
+    }
+  }
+
+  private async fetchWithRetry(): Promise<
+    { bytes: Uint8Array } | { done: true; reason: string }
+  > {
+    let lastReason = "";
+    for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
+      // A CDN link can expire mid-stream, so re-resolve before the last try
+      // rather than giving up on a URL that has simply gone stale.
+      if (attempt === FETCH_ATTEMPTS) await this.reresolve();
+      const outcome = await this.fetchOnce();
+      if (!("retry" in outcome)) return outcome;
+      lastReason = outcome.reason;
+      if (this.stopped) break;
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, 400 * attempt),
+      );
+    }
+    return {
+      done: true,
+      reason: `${lastReason} Gave up after ${FETCH_ATTEMPTS} attempts at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB.`,
+    };
+  }
+
+  private async reresolve() {
+    try {
+      const head = await fetch(this.url, {
+        headers: { Range: "bytes=0-1" },
+        cache: "no-store",
+      });
+      if (head.url) this.resolvedUrl = head.url;
+      await head.body?.cancel().catch(() => undefined);
+    } catch {
+      // Keep the previous URL; the retry will report if it still fails.
+    }
+  }
+
+  private async fetchOnce(): Promise<
+    { bytes: Uint8Array } | { done: true; reason: string } | { retry: true; reason: string }
+  > {
+    try {
       const end = this.nextByte + CHUNK_BYTES - 1;
       const response = await fetch(this.resolvedUrl || this.url, {
         headers: { Range: `bytes=${this.nextByte}-${end}` },
@@ -221,8 +273,8 @@ export class RemuxStreamer {
       });
       if (!response.ok && response.status !== 206)
         return {
-          done: true,
-          reason: `Host refused a range at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB (HTTP ${response.status}). The link may have expired or be rate limited.`,
+          retry: true,
+          reason: `Host answered HTTP ${response.status} at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB.`,
         };
       // Capped read, not arrayBuffer(): a host that ignores the range answers
       // with the whole file, and buffering that is an out-of-memory kill.
@@ -238,8 +290,7 @@ export class RemuxStreamer {
         read += value.byteLength;
       }
       await reader.cancel().catch(() => undefined);
-      if (read === 0)
-        return { done: true, reason: "Host returned an empty range." };
+      if (read === 0) return { retry: true, reason: "Host returned no bytes." };
       const bytes = new Uint8Array(Math.min(read, CHUNK_BYTES));
       let offset = 0;
       for (const part of parts) {
@@ -258,11 +309,9 @@ export class RemuxStreamer {
       return { bytes };
     } catch (error) {
       return {
-        done: true,
+        retry: true,
         reason: `Range request failed: ${error instanceof Error ? error.message : "unknown"}.`,
       };
-    } finally {
-      this.fetching = false;
     }
   }
 
