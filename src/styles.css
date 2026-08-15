@@ -352,7 +352,10 @@ a {
   background: #301b1e;
   border-color: #66353b;
 }
-.notice button {
+/* Excludes the two styled controls by name. This selector carries an element,
+   so it outranks a bare class — it was quietly resetting the Reload button and
+   the dismiss icon to transparent, and only losing to them on :hover. */
+.notice button:not(.notice-action):not(.notice-dismiss) {
   border: 0;
   background: transparent;
 }
