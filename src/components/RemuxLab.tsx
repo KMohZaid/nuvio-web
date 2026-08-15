@@ -52,6 +52,74 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
   };
   const [elapsed, setElapsed] = useState(0);
   const [scan, setScan] = useState<BlockScan | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  /**
+   * A plain-text summary to paste somewhere. The URL is reduced to its host on
+   * purpose: a debrid link carries an account token, and this is meant to be
+   * shared.
+   */
+  const buildReport = (probe: ProbeResult, blocks: BlockScan | null) => {
+    const plan = planRemux(probe.tracks);
+    const host = (() => {
+      try {
+        return new URL(probe.finalUrl || url).host;
+      } catch {
+        return "unknown host";
+      }
+    })();
+    const lines = [
+      "Nuvio remux probe",
+      `host: ${host} (url withheld — carries an account token)`,
+      `media source: ${mediaSourceSupport()}`,
+      `http ${probe.status}${probe.redirected ? " (redirected)" : ""} · accept-ranges: ${probe.acceptRangesHeader ?? "absent"} · ranges ${probe.acceptsRanges ? "honoured" : "IGNORED"}`,
+      `read ${(probe.bytesRead / 1024).toFixed(0)} KB${probe.totalBytes ? ` of ${(probe.totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB` : ""} in ${elapsed} ms`,
+      "",
+      `plan: ${plan.needsAudioTranscode ? "needs an audio transcode" : "remuxable as-is"} — ${plan.summary}`,
+      "",
+      "tracks:",
+      ...probe.tracks.map((track) => {
+        const verdict = verdictFor(track);
+        const shape = [
+          track.width ? `${track.width}x${track.height}` : null,
+          track.channels ? `${track.channels}ch` : null,
+          track.language && track.language !== "und" ? track.language : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        return `  ${track.kind.padEnd(8)} ${verdict.label.padEnd(8)} ${shape.padEnd(16)} ${verdict.status.padEnd(9)} ${track.codecId}`;
+      }),
+    ];
+    if (blocks) {
+      const keys = blocks.frames.filter((frame) => frame.keyframe).length;
+      const times = blocks.frames.map((frame) => frame.timeMs);
+      const span = times.length ? Math.max(...times) - Math.min(...times) : 0;
+      const config = blocks.tracks.filter(
+        (track) => track.codecPrivate?.length,
+      ).length;
+      lines.push(
+        "",
+        `frames: ${blocks.frames.length} across ${blocks.clusters} cluster(s) · ${keys} keyframes · ${(span / 1000).toFixed(2)}s spanned`,
+        `config: ${config}/${blocks.tracks.length} tracks carry decoder config · timestamp scale ${blocks.timestampScaleNs / 1000}µs`,
+        blocks.truncated ? "note: buffer ended mid-element" : "",
+      );
+    }
+    return lines.filter((line) => line !== undefined).join("\n").trim();
+  };
+
+  const copyReport = async () => {
+    if (!result) return;
+    const text = buildReport(result, scan);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard access can be refused even on HTTPS; a prompt is still
+      // selectable, which beats screenshotting it.
+      window.prompt("Copy the probe report", text);
+    }
+  };
 
   return (
     <section className="settings-page">
@@ -124,6 +192,9 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
         <div className="setting-card">
           <header>
             <h2>Result</h2>
+            <button className="secondary" onClick={() => void copyReport()}>
+              {copied ? "Copied" : "Copy report"}
+            </button>
           </header>
           <div className="info-row">
             <span>
