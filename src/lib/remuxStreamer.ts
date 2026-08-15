@@ -1,3 +1,4 @@
+import { codecStringFor } from "./codecString";
 import { buildInitSegment, buildMediaSegment, type MuxTrack } from "./fmp4";
 import { MatroskaStream, type StreamFrame } from "./matroskaStream";
 import { describeTrack } from "./remux";
@@ -78,6 +79,21 @@ export class RemuxStreamer {
   private triedPlay = false;
   /** What was handed to the SourceBuffer most recently. */
   private lastSegment = "";
+  /** The MIME actually negotiated, worth seeing when a decoder refuses. */
+  private mime = "";
+  /**
+   * Latches the first failure. Progress updates kept overwriting the reason a
+   * run died — an element error would appear and be replaced by the next
+   * "buffering" line before it could be read.
+   */
+  private failed = false;
+  private closedWaits = 0;
+
+  private report(status: StreamerStatus) {
+    if (this.failed && status.state !== "error") return;
+    if (status.state === "error") this.failed = true;
+    this.onStatus(status);
+  }
 
   constructor(
     private readonly url: string,
@@ -96,7 +112,7 @@ export class RemuxStreamer {
   }
 
   async start() {
-    this.onStatus({ state: "starting", message: "Resolving source…" });
+    this.report({ state: "starting", message: "Resolving source…" });
     try {
       // One resolution up front: debrid links redirect, and the Range header
       // does not survive the hop.
@@ -114,7 +130,7 @@ export class RemuxStreamer {
         Number.isFinite(parsed) && parsed > CHUNK_BYTES ? parsed : null;
       await head.body?.cancel().catch(() => undefined);
     } catch (error) {
-      this.onStatus({
+      this.report({
         state: "error",
         message: error instanceof Error ? error.message : "Could not reach the source.",
       });
@@ -134,13 +150,13 @@ export class RemuxStreamer {
     }
     if (this.stopped) return;
     if (!this.demuxer.headerComplete) {
-      this.onStatus({ state: "error", message: "No track headers found." });
+      this.report({ state: "error", message: "No track headers found." });
       return;
     }
 
     const tracks = this.chooseTracks();
     if (!tracks.length) {
-      this.onStatus({
+      this.report({
         state: "error",
         message: "No track in this file can be remuxed here.",
       });
@@ -148,11 +164,12 @@ export class RemuxStreamer {
     }
 
     const mime = `video/mp4; codecs="${tracks.map(codecString).join(",")}"`;
+    this.mime = mime;
     const Source =
       (window as unknown as { ManagedMediaSource?: typeof MediaSource })
         .ManagedMediaSource ?? window.MediaSource;
     if (!Source?.isTypeSupported(mime)) {
-      this.onStatus({ state: "error", message: `Browser rejects ${mime}.` });
+      this.report({ state: "error", message: `Browser rejects ${mime}.` });
       return;
     }
 
@@ -181,7 +198,7 @@ export class RemuxStreamer {
       this.buffer = buffer;
       buffer.addEventListener("updateend", () => this.pump());
       buffer.addEventListener("error", () =>
-        this.onStatus({
+        this.report({
           state: "error",
           message: `SourceBuffer rejected a segment — ${this.lastSegment || "no segment recorded"} · element error ${this.element.error?.message || this.element.error?.code || "none"} · source ${this.source?.readyState ?? "none"}`,
           ranges: this.describeRanges(),
@@ -197,7 +214,7 @@ export class RemuxStreamer {
       }
       this.enqueue(buildInitSegment(tracks));
     } catch (error) {
-      this.onStatus({
+      this.report({
         state: "error",
         message: error instanceof Error ? error.message : "Could not open a buffer.",
       });
@@ -223,7 +240,7 @@ export class RemuxStreamer {
     this.element.addEventListener("error", () => {
       const error = this.element.error;
       note(`element error ${error?.code ?? "?"}: ${error?.message || "no detail"}`);
-      this.onStatus({
+      this.report({
         state: "error",
         message: `The video element rejected the stream — ${error?.message || `code ${error?.code}`}.`,
         ranges: this.describeRanges(),
@@ -254,7 +271,7 @@ export class RemuxStreamer {
     try {
       await this.pump0();
     } catch (error) {
-      this.onStatus({
+      this.report({
         state: "error",
         message: `Streaming stopped: ${describeError(error)} · source ${this.source?.readyState ?? "none"} · at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB`,
         ranges: this.describeRanges(),
@@ -282,7 +299,7 @@ export class RemuxStreamer {
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         this.evict();
         this.tryPlay();
-        this.onStatus({
+        this.report({
           state: "ready",
           message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · readyState ${this.element.readyState}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
           bufferedSeconds: ahead,
@@ -296,7 +313,7 @@ export class RemuxStreamer {
         this.flush(true);
         const complete =
           this.totalBytes != null && this.nextByte >= this.totalBytes;
-        this.onStatus({
+        this.report({
           state: complete ? "ended" : "error",
           message: chunk.reason,
           bufferedSeconds: this.bufferedAhead(),
@@ -317,7 +334,7 @@ export class RemuxStreamer {
       } else {
         this.bytesSinceProgress += chunk.bytes.byteLength;
         if (this.bytesSinceProgress > 48 * 1024 * 1024) {
-          this.onStatus({
+          this.report({
             state: "error",
             message: `Read 48 MB without the buffer advancing — segments are not landing. Buffered end stuck at ${end.toFixed(1)}s.`,
             ranges: this.describeRanges(),
@@ -331,9 +348,9 @@ export class RemuxStreamer {
         0,
       );
       this.tryPlay();
-      this.onStatus({
+      this.report({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
-        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
+        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held · ${this.mime}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
         ranges: this.describeRanges(),
@@ -589,9 +606,22 @@ export class RemuxStreamer {
     // worth waiting on, because a ManagedMediaSource detaches under memory
     // pressure and can be reattached rather than being a dead end.
     if (this.source?.readyState !== "open") {
+      this.closedWaits += 1;
+      // Waiting forever would turn a dead source into a silent hang, which is
+      // exactly the failure this guard was added to make visible.
+      if (this.closedWaits > 20) {
+        this.report({
+          state: "error",
+          message: `MediaSource has been ${this.source?.readyState ?? "detached"} for 10s · ${this.mime} · element error ${this.element.error?.message || this.element.error?.code || "none"} · last segment ${this.lastSegment || "none"}`,
+          ranges: this.describeRanges(),
+          fetchedBytes: this.nextByte,
+        });
+        return;
+      }
       window.setTimeout(() => this.pump(), 500);
       return;
     }
+    this.closedWaits = 0;
     const next = this.queue.shift();
     if (!next) return;
     try {
@@ -607,7 +637,7 @@ export class RemuxStreamer {
         if (!freed) window.setTimeout(() => this.pump(), 500);
         return;
       }
-      this.onStatus({
+      this.report({
         state: "error",
         message: `Append failed: ${describeError(error)} · source ${this.source?.readyState ?? "none"} · updating ${buffer.updating} · queue ${this.queue.length} · segment ${(next.byteLength / 1024).toFixed(0)} KB · readyState ${this.element.readyState}`,
         ranges: this.describeRanges(),
@@ -726,19 +756,5 @@ function asHeader(track: {
   };
 }
 
-function codecString(track: MuxTrack) {
-  switch (track.sampleEntry) {
-    case "av01":
-      return "av01.0.08M.10";
-    case "hvc1":
-      return "hvc1.1.6.L93.B0";
-    case "avc1":
-      return "avc1.640028";
-    case "ec-3":
-      return "ec-3";
-    case "ac-3":
-      return "ac-3";
-    default:
-      return "mp4a.40.2";
-  }
-}
+const codecString = (track: MuxTrack) =>
+  codecStringFor(track.sampleEntry, track.config);
