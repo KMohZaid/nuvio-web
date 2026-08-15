@@ -28,8 +28,8 @@ on the sign-in screen and enter a URL and publishable key on the device.
   for Matroska audio the browser cannot decode
 - Installable PWA shell with a prompted update flow
 
-Watched and progress writes mirror the desktop client's sync payloads. The home
-layout is read-only here: this client never pushes it, so it cannot overwrite
-what another device saved.
+Library, watched and progress writes mirror the desktop client's sync payloads
+field for field. The home layout and collections are read-only here: this
+client never pushes them, so it cannot overwrite what another device saved.
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design and limitations.
 

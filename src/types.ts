@@ -83,6 +83,8 @@ export type Meta = {
   poster?: string;
   background?: string;
   banner?: string;
+  /** Stremio's posterShape: "poster" | "landscape" | "square". */
+  posterShape?: string;
   logo?: string;
   description?: string;
   releaseInfo?: string;

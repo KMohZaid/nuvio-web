@@ -50,11 +50,14 @@ export function Player({
   meta,
   video,
   onClose,
+  onProgress,
 }: {
   stream: Stream;
   meta: Meta;
   video?: Video;
   onClose(): void;
+  /** Reports a resume point. Fired periodically, on pause, and on exit. */
+  onProgress(positionMs: number, durationMs: number, ended: boolean): void;
 }) {
   const playerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -72,6 +75,10 @@ export function Player({
   }, [warning]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  // Kept in a ref so the reporting effect can run once for the whole session
+  // rather than resubscribing on every timeupdate.
+  const reportRef = useRef(onProgress);
+  reportRef.current = onProgress;
   const [volume, setVolume] = useState(() =>
     Number(localStorage.getItem("nuvio-web-volume") ?? 1),
   );
@@ -327,6 +334,38 @@ export function Player({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [seekBy, toggleFullscreen, togglePlayback]);
+
+  useEffect(() => {
+    const element = videoRef.current;
+    if (!element) return;
+    const report = (ended: boolean) => {
+      const position = element.currentTime * 1000;
+      const total = Number.isFinite(element.duration)
+        ? element.duration * 1000
+        : 0;
+      if (position > 0 || ended) reportRef.current(position, total, ended);
+    };
+    // Every 15s while playing, plus the moments a position actually matters.
+    const timer = window.setInterval(() => {
+      if (!element.paused) report(false);
+    }, 15_000);
+    const onPause = () => report(false);
+    const onEnded = () => report(true);
+    // `pagehide` rather than `unload`: iOS never fires unload for a PWA being
+    // backgrounded, so the last position would be lost every time.
+    const onHide = () => report(element.ended);
+    element.addEventListener("pause", onPause);
+    element.addEventListener("ended", onEnded);
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      window.clearInterval(timer);
+      element.removeEventListener("pause", onPause);
+      element.removeEventListener("ended", onEnded);
+      window.removeEventListener("pagehide", onHide);
+      // Closing the player is the most important report of all.
+      report(element.ended);
+    };
+  }, []);
 
   const selectAudio = (id: number) => {
     if (hlsRef.current) hlsRef.current.audioTrack = id;

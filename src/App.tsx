@@ -37,6 +37,7 @@ import {
   loadAvatarCatalog,
   loadLibrary,
   loadProfiles,
+  addToLibrary,
   loadCollections,
   loadHomeLayout,
   loadProgress,
@@ -45,7 +46,10 @@ import {
   loadSettingsBlob,
   loadWatchedItems,
   pushBlobBoolean,
+  pushProgress,
+  isComplete,
   restoreSession,
+  removeFromLibrary,
   saveAddons,
   settingsPlatform,
   setWatched,
@@ -123,6 +127,10 @@ export function App() {
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [progress, setProgress] = useState<ProgressRow[]>([]);
   const [watchedItems, setWatchedItems] = useState<WatchedItem[]>([]);
+  // Read inside playback callbacks, which must see the latest rows to recover
+  // the server's progress key rather than rebuilding it.
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
   const [recentMetadata, setRecentMetadata] = useState<Meta[]>([]);
   const [settingsBlob, setSettingsBlob] = useState<SettingsBlob | null>(null);
   const [collections, setCollections] = useState<Collection[]>([]);
@@ -435,6 +443,93 @@ export function App() {
   }, [collections, homeLayout, sections]);
 
   /**
+   * Stores a resume point for whatever is playing.
+   *
+   * Fire-and-forget: a failed write must never interrupt playback, and the
+   * next report a few seconds later supersedes it anyway. The local snapshot
+   * is updated so Continue Watching reflects it without a refetch.
+   */
+  function savePlaybackProgress(
+    current: { meta: Meta; video?: Video },
+    positionMs: number,
+    durationMs: number,
+    ended: boolean,
+  ) {
+    if (!profile) return;
+    const identity = {
+      contentId: current.meta.id,
+      contentType: current.meta.type,
+      videoId: current.video?.id || current.meta.id,
+      season: current.video?.season,
+      episode: current.video?.episode,
+    };
+    const rows = progressRef.current;
+    void pushProgress(
+      profile.profileIndex,
+      identity,
+      positionMs,
+      durationMs,
+      ended,
+      rows,
+    )
+      .then((stored) => {
+        if (!stored) return;
+        const complete = isComplete(positionMs, durationMs, ended);
+        const key = watchKey(identity.contentId, identity.season, identity.episode);
+        setProgress((currentRows) => [
+          ...currentRows.filter(
+            (row) => watchKey(row.contentId, row.season, row.episode) !== key,
+          ),
+          {
+            contentId: identity.contentId,
+            contentType: identity.contentType,
+            videoId: identity.videoId,
+            season: identity.season,
+            episode: identity.episode,
+            positionMs: complete && durationMs > 0 ? durationMs : positionMs,
+            durationMs,
+            lastWatched: Date.now(),
+            progressKey: currentRows.find(
+              (row) =>
+                watchKey(row.contentId, row.season, row.episode) === key,
+            )?.progressKey,
+          },
+        ]);
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Adds or removes a title, flipping the button before the server answers and
+   * restoring it if the write fails.
+   */
+  async function toggleLibrary(meta: Meta) {
+    if (!profile) return;
+    const present = library.some(
+      (item) => item.id === meta.id && item.type === meta.type,
+    );
+    const previous = library;
+    setLibrary((current) =>
+      present
+        ? current.filter(
+            (item) => !(item.id === meta.id && item.type === meta.type),
+          )
+        : [...current, { ...meta, addedAt: Date.now() }],
+    );
+    try {
+      if (present)
+        await removeFromLibrary(profile.profileIndex, meta.id, meta.type);
+      else await addToLibrary(profile.profileIndex, meta);
+      setMessage(present ? "Removed from your library." : "Added to your library.");
+    } catch (error) {
+      setLibrary(previous);
+      setMessage(
+        error instanceof Error ? error.message : "Could not update your library",
+      );
+    }
+  }
+
+  /**
    * Carousel items, mirroring the desktop client's selection: round-robin
    * across the hero-source catalogs so the first addon does not own every
    * slot, skipping anything with no artwork, deduped, capped at 8.
@@ -731,7 +826,13 @@ export function App() {
         /* An overlay rather than an early return: unmounting the shell to show
            the player threw away the resolved detail page, so closing it
            rebuilt home from scratch and only then re-opened details. */
-        <Player {...playback} onClose={() => setPlayback(null)} />
+        <Player
+          {...playback}
+          onClose={() => setPlayback(null)}
+          onProgress={(positionMs, durationMs, ended) =>
+            savePlaybackProgress(playback, positionMs, durationMs, ended)
+          }
+        />
       )}
       {selected && (
         <Details
@@ -743,11 +844,7 @@ export function App() {
             (item) => item.id === selected.id && item.type === selected.type,
           )}
           onClose={() => setSelected(null)}
-          onLibrary={() =>
-            setMessage(
-              "Library writes are disabled in this safety-first preview.",
-            )
-          }
+          onLibrary={toggleLibrary}
           onPlay={(stream, meta, video) => {
             const url = stream.url || stream.externalUrl;
             if (externalPlayer !== "internal" && url) {

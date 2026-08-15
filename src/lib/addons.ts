@@ -216,6 +216,7 @@ export function mapMeta(
     type: String(value.type ?? "movie"),
     name: String(value.name ?? "Untitled"),
     poster: value.poster ? String(value.poster) : undefined,
+    posterShape: value.posterShape ? String(value.posterShape) : undefined,
     background: value.background
       ? String(value.background)
       : value.banner

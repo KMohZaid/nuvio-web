@@ -534,6 +534,105 @@ export async function setWatched(
   });
 }
 
+/**
+ * Adds one title to the synced library.
+ *
+ * Field-for-field with the desktop client's `library::add`. Two details are
+ * easy to get wrong and both would write a row Nuvio reads back badly:
+ * `imdb_rating` is stored as a **number**, not the display string, and
+ * `poster_shape` is upper-cased with "POSTER" as the default.
+ */
+export async function addToLibrary(
+  profileIndex: number,
+  item: Meta,
+): Promise<void> {
+  const rating = Number.parseFloat(item.imdbRating ?? "");
+  await rpc("sync_push_library_items", {
+    p_profile_id: profileIndex,
+    p_items: [
+      {
+        content_id: item.id,
+        content_type: item.type,
+        name: item.name,
+        poster: item.poster ?? null,
+        poster_shape: (item.posterShape ?? "POSTER").toUpperCase(),
+        // Nuvio falls back to the banner when there is no backdrop.
+        background: item.background ?? item.banner ?? null,
+        description: item.description ?? null,
+        release_info: item.releaseInfo ?? null,
+        imdb_rating: Number.isFinite(rating) ? rating : null,
+        genres: item.genres ?? [],
+        addon_base_url: item.manifestUrl ?? "",
+        added_at: Date.now(),
+      },
+    ],
+    p_origin_client_id: CLIENT_ID,
+  });
+}
+
+export async function removeFromLibrary(
+  profileIndex: number,
+  contentId: string,
+  contentType: string,
+): Promise<void> {
+  await rpc("sync_delete_library_items", {
+    p_profile_id: profileIndex,
+    p_keys: [{ content_id: contentId, content_type: contentType }],
+    p_origin_client_id: CLIENT_ID,
+  });
+}
+
+/** Below this, a resume point is noise rather than a position worth keeping. */
+const PROGRESS_STORE_THRESHOLD_MS = 1000;
+const COMPLETION_THRESHOLD_FRACTION = 0.9;
+
+export const isComplete = (
+  positionMs: number,
+  durationMs: number,
+  ended: boolean,
+) =>
+  ended ||
+  (durationMs > 0 && positionMs / durationMs >= COMPLETION_THRESHOLD_FRACTION);
+
+/**
+ * Stores a resume point, mirroring the desktop client's `progress::push`.
+ *
+ * A finished row is pinned to the full duration rather than left at 9x%.
+ * Without that the other clients keep the title in Continue Watching forever
+ * and never advance to the next episode.
+ */
+export async function pushProgress(
+  profileIndex: number,
+  identity: WatchIdentity & { videoId: string },
+  positionMs: number,
+  durationMs: number,
+  ended: boolean,
+  progressRows: ProgressRow[],
+): Promise<boolean> {
+  const position = Math.max(0, Math.round(positionMs));
+  const duration = Math.max(0, Math.round(durationMs));
+  const completed = isComplete(position, duration, ended);
+  if (!completed && position < PROGRESS_STORE_THRESHOLD_MS) return false;
+  await rpc("sync_push_watch_progress", {
+    p_profile_id: profileIndex,
+    p_entries: [
+      {
+        content_id: identity.contentId,
+        content_type: identity.contentType,
+        video_id: identity.videoId,
+        season: identity.season ?? null,
+        episode: identity.episode ?? null,
+        position: completed && duration > 0 ? duration : position,
+        duration,
+        last_watched: Date.now(),
+        progress_key: resolveProgressKey(progressRows, identity),
+      },
+    ],
+    p_origin_client_id: CLIENT_ID,
+  });
+  return true;
+}
+
 export function currentSession(): Session | null {
   return activeSession;
 }
