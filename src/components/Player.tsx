@@ -1,4 +1,6 @@
 import type Hls from "hls.js";
+import { copyStreamUrl } from "../lib/externalPlayer";
+import { assessPlayback, audioIsSilent } from "../lib/playback";
 import {
   ArrowLeft,
   Copy,
@@ -12,6 +14,7 @@ import {
   Rewind,
   Volume2,
   VolumeX,
+  X,
 } from "lucide-react";
 import {
   useCallback,
@@ -61,6 +64,12 @@ export function Player({
   const [error, setError] = useState("");
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(true);
+  const [warning, setWarning] = useState("");
+  useEffect(() => {
+    if (!warning) return;
+    const timer = window.setTimeout(() => setWarning(""), 6000);
+    return () => window.clearTimeout(timer);
+  }, [warning]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(() =>
@@ -175,8 +184,9 @@ export function Player({
       window.clearTimeout(hideTimer.current);
     };
     const onWaiting = () => {
+      // No status text: the centre spinner already says this, and showing
+      // both read as two separate loading indicators stacked on each other.
       setWaiting(true);
-      setStatus("Buffering…");
     };
     const onCanPlay = () => {
       setWaiting(false);
@@ -200,6 +210,31 @@ export function Player({
     element.addEventListener("loadedmetadata", onDuration);
     element.addEventListener("volumechange", onVolume);
     element.addEventListener("error", fail);
+
+    // Refuse up front where the container simply will not open, rather than
+    // showing a black frame until the user gives up.
+    const verdict = assessPlayback(url, stream.behaviorHints?.filename);
+    if (!verdict.playable) {
+      setError(verdict.reason);
+      setWaiting(false);
+      return () => {
+        disposed = true;
+      };
+    }
+
+    // Chromium reports no error for an audio codec it cannot decode; it just
+    // plays silence. Sample the decoded-byte counters once playback is under
+    // way and say so plainly.
+    const audioWatch = window.setInterval(() => {
+      if (element.paused || element.currentTime < 1.5) return;
+      if (audioIsSilent(element)) {
+        setWarning(
+          verdict.reason ||
+            "No audio track could be decoded by this browser. Try an external player.",
+        );
+        window.clearInterval(audioWatch);
+      }
+    }, 1200);
     if (isHls && element.canPlayType("application/vnd.apple.mpegurl")) {
       element.src = url;
       element.load();
@@ -257,6 +292,7 @@ export function Player({
       element.removeEventListener("loadedmetadata", onDuration);
       element.removeEventListener("volumechange", onVolume);
       element.removeEventListener("error", fail);
+      window.clearInterval(audioWatch);
       hlsRef.current?.destroy();
       hlsRef.current = null;
       element.pause();
@@ -359,6 +395,26 @@ export function Player({
         </button>
       )}
       {status && !error && <div className="player-status">{status}</div>}
+      {warning && !error && (
+        <div className="player-warning" role="status">
+          <span>{warning}</span>
+          {externalUrl && (
+            <button
+              className="warning-action"
+              onClick={() => copyStreamUrl(externalUrl)}
+            >
+              <Copy size={15} /> Copy stream URL
+            </button>
+          )}
+          <button
+            className="notice-dismiss"
+            aria-label="Dismiss"
+            onClick={() => setWarning("")}
+          >
+            <X size={18} />
+          </button>
+        </div>
+      )}
       <div className="player-controls">
         <div className="player-timeline">
           <span>{formatTime(currentTime)}</span>

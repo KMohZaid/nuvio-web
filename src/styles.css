@@ -700,10 +700,24 @@ a {
   text-decoration: none;
 }
 .auth-screen {
+  /* 100vh on iOS measures the screen, not the visible viewport, so the page
+     ended up taller than what you can see and scrolled by exactly the browser
+     chrome. dvh tracks the real viewport; vh stays as the fallback. */
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
-  place-items: center;
-  padding: 24px;
+  /* `safe` matters once the self-hosted fields expand the card past the
+     viewport: plain centring pushes the top out of reach, because overflow in
+     a centred grid spills off both edges and only the bottom is scrollable. */
+  place-items: safe center;
+  /* Its own scroller, so the card can be taller than the screen without the
+     document itself scrolling. */
+  overflow-y: auto;
+  padding:
+    max(24px, calc(env(safe-area-inset-top) + 16px))
+    max(24px, env(safe-area-inset-right))
+    max(24px, calc(env(safe-area-inset-bottom) + 16px))
+    max(24px, env(safe-area-inset-left));
   background:
     radial-gradient(circle at 70% 20%, #213d3c 0, transparent 35%),
     radial-gradient(circle at 10% 90%, #252034 0, transparent 32%), #080a0d;
@@ -776,11 +790,19 @@ a {
   margin-top: 4px;
 }
 .text-button {
+  display: block;
   width: 100%;
   border: 0;
   background: transparent;
   color: #b7c1cb;
   padding: 10px;
+  /* Also used on an <a> now, which needs these to match the buttons. */
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+.text-button:hover {
+  color: #e6edf3;
 }
 .security-note {
   display: block;
@@ -1086,11 +1108,26 @@ a {
     font-size: 13px;
   }
   .auth-card {
-    padding: 28px 22px;
+    padding: 26px 20px;
     border-radius: 22px;
   }
   .auth-card h1 {
-    font-size: 32px;
+    font-size: 28px;
+    line-height: 1.1;
+  }
+  /* Trimmed so the card fits a phone without scrolling in its default state,
+     which is what made it look off-centre. */
+  .auth-logo {
+    width: 108px;
+  }
+  .auth-card > p {
+    font-size: 13px;
+  }
+  .auth-card form {
+    margin: 18px 0 12px;
+  }
+  .auth-card input {
+    height: 44px;
   }
   .addon-install {
     display: grid;
@@ -2293,15 +2330,341 @@ body.is-locked {
     justify-content: center;
     padding: 10px 8px;
   }
-  /* Full-width stacked pickers: three side by side would each be too narrow
-     to show a catalog name on a phone. */
+  /* Three across rather than stacked. They are narrow, but a dropdown shows
+     its full option text when open, so the closed width only has to hint. */
   .discover-filters {
     display: grid;
-    gap: 10px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .discover-filters span {
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
   }
   .discover-filters select {
     width: 100%;
     min-width: 0;
     max-width: none;
+    padding: 10px 8px;
+    font-size: 12px;
+    /* The native arrow eats most of a narrow control, so the text gets the
+       room instead. */
+    appearance: none;
+    -webkit-appearance: none;
+    text-overflow: ellipsis;
   }
+  /* A folder has a single picker, so it keeps the full width. */
+  .grid-page > .discover-filters:has(label:only-child) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- Interactive back gesture ----------------------------------------- */
+/* A shadow down the leading edge, so the panel reads as sitting above the
+   page it is being dragged off of. Only while the finger is down — a
+   permanent shadow on a full-screen panel is invisible anyway. */
+.detail-view.is-swiping {
+  box-shadow: -14px 0 40px rgba(0, 0, 0, 0.55);
+}
+/* The gesture starts at the left edge, where the back button also lives.
+   Suppressing the highlight keeps a drag from looking like a button press. */
+.detail-view.is-swiping .circle-button.back {
+  opacity: 0.55;
+}
+@media (prefers-reduced-motion: reduce) {
+  .detail-view {
+    transition: none !important;
+  }
+}
+
+/* ---- Page head --------------------------------------------------------- */
+/* The old inline "← Back" was a text link that crowded the catalog name.
+   A circle button matching the detail view sits beside the title instead. */
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+.page-head > div {
+  min-width: 0;
+}
+.page-head .circle-button {
+  flex-shrink: 0;
+  margin-top: 6px;
+}
+
+/* ---- Collection folders ------------------------------------------------ */
+.folder-tile {
+  flex: 0 0 170px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  scroll-snap-align: start;
+}
+.folder-art {
+  position: relative;
+  display: grid;
+  place-items: center;
+  /* Poster is Nuvio's default shape, so it is the base here and the wider
+     shapes override it rather than the other way round. */
+  aspect-ratio: 2/3;
+  overflow: hidden;
+  border: 1px solid #293039;
+  border-radius: 14px;
+  background: linear-gradient(145deg, #1b2027, #12161b);
+}
+.folder-tile.shape-square .folder-art {
+  aspect-ratio: 1;
+}
+.folder-tile.shape-landscape {
+  flex-basis: 268px;
+}
+.folder-tile.shape-landscape .folder-art {
+  aspect-ratio: 16/9;
+}
+.folder-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.folder-emoji {
+  font-size: 38px;
+}
+.folder-tile > strong,
+.folder-tile > small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-tile > strong {
+  margin-top: 9px;
+  font-size: 14px;
+}
+.folder-tile > small {
+  margin-top: 3px;
+  color: #77818c;
+  font-size: 12px;
+}
+
+/* ---- Catalog pagination ------------------------------------------------ */
+.grid-sentinel {
+  height: 1px;
+}
+.grid-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 26px 0 8px;
+  color: #8d97a2;
+  font-size: 13px;
+}
+.mini-spinner {
+  width: 17px;
+  height: 17px;
+  border: 2px solid rgba(255, 255, 255, 0.16);
+  border-top-color: #dfe4e9;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
+@media (max-width: 760px) {
+  .page-head {
+    gap: 12px;
+  }
+  .page-head .circle-button {
+    width: 42px;
+    height: 42px;
+    margin-top: 2px;
+  }
+  .folder-tile {
+    flex: 0 0 132px;
+  }
+  .folder-tile.shape-landscape {
+    flex-basis: 212px;
+  }
+}
+
+/* ---- Settings entry rows ---------------------------------------------- */
+/* Addons is configuration, not a browsing destination, so it opens from here
+   instead of holding a slot in the tab bar. */
+.setting-link {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  margin-top: 22px;
+  padding: 17px 18px;
+  border: 1px solid #232931;
+  border-radius: 16px;
+  background: #11151a;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s;
+}
+.setting-link:hover {
+  border-color: #333b45;
+  background: #161b21;
+}
+.setting-link > svg:first-child {
+  flex-shrink: 0;
+  color: #8d97a2;
+}
+.setting-link > span {
+  display: grid;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+.setting-link strong {
+  font-size: 15px;
+}
+.setting-link small {
+  color: #8d97a2;
+  font-size: 12px;
+}
+.setting-link > svg:last-child {
+  flex-shrink: 0;
+  color: #6d7782;
+}
+
+/* ---- Player warning ---------------------------------------------------- */
+/* A banner rather than the error panel: the video is still playing, it just
+   has no sound, so the page must stay usable. */
+.player-warning {
+  position: absolute;
+  z-index: 6;
+  top: max(78px, calc(env(safe-area-inset-top) + 74px));
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(620px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border: 1px solid #4c3a22;
+  border-radius: 13px;
+  background: rgba(38, 28, 16, 0.94);
+  color: #f0dcc0;
+  font-size: 13px;
+  line-height: 1.45;
+  transform: translateX(-50%);
+}
+.player-warning a,
+.player-warning .warning-action {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.12);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.player-warning .warning-action {
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+}
+.player-warning > button {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+@media (max-width: 760px) {
+  .player-warning {
+    flex-wrap: wrap;
+    font-size: 12px;
+  }
+}
+
+
+/* Shown in place of the grid while a catalog's first page is in flight. */
+.grid-loading {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  margin-top: 60px;
+  padding: 40px 20px;
+  color: #8d97a2;
+  font-size: 13px;
+}
+.grid-loading .mini-spinner {
+  width: 26px;
+  height: 26px;
+  border-width: 3px;
+}
+
+/* ---- Notice controls --------------------------------------------------- */
+/* An icon, not a "×" character: the glyph sits off-centre in its em box, so
+   no amount of centring the button made it look centred. */
+.notice-dismiss {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  color: #c3ccd5;
+  background: rgba(255, 255, 255, 0.09);
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.notice-dismiss:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Green bar, white button. The button has to contrast with the surface it
+   sits on, not match it — which is what the earlier green-on-green did. */
+.update-notice {
+  align-items: center;
+  gap: 14px;
+  border-color: #2f7d55;
+  background: #17663d;
+  color: #eaf6ee;
+}
+.notice-action {
+  flex-shrink: 0;
+  min-height: 38px;
+  padding: 10px 20px;
+  border: 0;
+  border-radius: 10px;
+  color: #0b0f12;
+  background: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+}
+.notice-action:hover {
+  background: #e8edf1;
+}
+.update-notice .notice-dismiss {
+  color: #d6ecdd;
+  background: rgba(255, 255, 255, 0.14);
+}
+.update-notice .notice-dismiss:hover {
+  background: rgba(255, 255, 255, 0.26);
+}
+
+.player-warning .warning-action {
+  min-height: 34px;
+  padding: 8px 13px;
+  background: rgba(255, 255, 255, 0.16);
+}
+.player-warning .warning-action:hover {
+  background: rgba(255, 255, 255, 0.26);
 }

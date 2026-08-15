@@ -1,7 +1,10 @@
+import type { HomeLayout } from "./account";
 import type {
   AddonManifest,
   AddonRow,
   CatalogSection,
+  CollectionCatalogSource,
+  CollectionFolder,
   InstalledAddon,
   ManifestCatalog,
   Meta,
@@ -282,8 +285,19 @@ export async function loadInstalledAddons(
   );
 }
 
+/**
+ * Fetches every browsable catalog across the installed addons.
+ *
+ * `onSection` fires as each batch lands so the home screen can paint rows
+ * while the rest are still in flight — waiting for all of them was what made
+ * the page sit blank on a slow connection. Batching still caps how many
+ * requests are open at once; the addons are independent hosts, so a slow one
+ * cannot hold up the rest.
+ */
 export async function loadHome(
   addons: InstalledAddon[],
+  onSection?: (section: CatalogSection) => void,
+  layout?: HomeLayout | null,
 ): Promise<{ sections: CatalogSection[]; errors: string[] }> {
   const targets = addons
     .filter((addon) => addon.enabled && addon.manifest)
@@ -292,10 +306,24 @@ export async function loadHome(
         .filter(
           (catalog) => !(catalog.extra ?? []).some((extra) => extra.isRequired),
         )
-        .slice(0, 12)
-        .map((catalog) => ({ addon, catalog })),
+        .map((catalog) => ({
+          addon,
+          catalog,
+          prefKey: `${addon.manifest!.id}:${catalog.type}:${catalog.id}`,
+        })),
     )
-    .slice(0, 24);
+    // A catalog the layout does not mention is new to this device, so it stays
+    // visible — matching how the other clients treat an unknown key.
+    .filter(({ prefKey }) => layout?.enabledOf.get(prefKey) !== false);
+
+  // Ordered before batching, so the rows the user put on top are the ones
+  // fetched first and therefore the ones that paint first.
+  if (layout)
+    targets.sort(
+      (a, b) =>
+        (layout.orderOf.get(a.prefKey) ?? Number.MAX_SAFE_INTEGER) -
+        (layout.orderOf.get(b.prefKey) ?? Number.MAX_SAFE_INTEGER),
+    );
   const sections: CatalogSection[] = [];
   const errors: string[] = [];
   for (let cursor = 0; cursor < targets.length; cursor += 4) {
@@ -324,14 +352,136 @@ export async function loadHome(
         }
       }),
     );
-    sections.push(
-      ...batch.filter(
-        (section): section is CatalogSection =>
-          section !== null && section.items.length > 0,
-      ),
+    const usable = batch.filter(
+      (section): section is CatalogSection =>
+        section !== null && section.items.length > 0,
     );
+    sections.push(...usable);
+    for (const section of usable) onSection?.(section);
   }
   return { sections, errors };
+}
+
+/** One collection source resolved against the installed addons. */
+export type CollectionSourceView = {
+  source: CollectionCatalogSource;
+  key: string;
+  label: string;
+  addonName: string;
+  supportsPagination: boolean;
+};
+
+/**
+ * A catalog's kind, appended only when its own name does not already say it.
+ * Plenty of addons name both catalogs after the service — two entries both
+ * reading "HBO Max" is unusable, while "HBO Max Movies" needs nothing added.
+ */
+export function catalogTypeSuffix(name: string, contentType: string): string {
+  const label =
+    contentType === "series"
+      ? "Series"
+      : contentType === "movie"
+        ? "Movies"
+        : contentType.charAt(0).toUpperCase() + contentType.slice(1);
+  const haystack = name.toLowerCase();
+  const spoken = [label.toLowerCase(), contentType.toLowerCase()];
+  // "Movies" should also match a name that says "Movie", and vice versa.
+  if (label === "Movies") spoken.push("movie", "film");
+  if (label === "Series") spoken.push("serie", "shows", "tv");
+  return spoken.some((word) => haystack.includes(word)) ? "" : ` ${label}`;
+}
+
+/**
+ * Labels each source the way Nuvio's folder tabs do: the catalog's own name,
+ * plus its kind and the genre when the source pins one.
+ */
+export function describeCollectionSources(
+  folder: CollectionFolder,
+  addons: InstalledAddon[],
+): CollectionSourceView[] {
+  return folder.catalogSources.flatMap((source) => {
+    const addon = addons.find(
+      (item) => item.enabled && item.manifest?.id === source.addonId,
+    );
+    const catalog = addon?.manifest?.catalogs?.find(
+      (item) => item.type === source.type && item.id === source.catalogId,
+    );
+    if (!addon?.manifest || !catalog) return [];
+    const rawName = catalog.name?.trim() || catalog.id;
+    const base = `${rawName}${catalogTypeSuffix(rawName, source.type)}`;
+    const genre = source.genre?.trim();
+    return [
+      {
+        source,
+        key: `${source.addonId}:${source.type}:${source.catalogId}:${genre ?? ""}`,
+        label: genre ? `${base} · ${genre}` : base,
+        addonName: addon.manifest.name,
+        supportsPagination: (catalog.extra ?? []).some(
+          (extra) => extra.name.toLowerCase() === "skip",
+        ),
+      },
+    ];
+  });
+}
+
+/**
+ * Fetches one page from each of the given sources in parallel and merges them.
+ *
+ * Source order is meaningful, so results are restored to it rather than left
+ * in completion order, and duplicates across sources are dropped keeping the
+ * first appearance.
+ */
+export async function loadCollectionSources(
+  sources: CollectionCatalogSource[],
+  addons: InstalledAddon[],
+  skip = 0,
+): Promise<{ items: Meta[]; errors: string[] }> {
+  const errors: string[] = [];
+  const results = await Promise.all(
+    sources.map(async (source) => {
+      const addon = addons.find(
+        (item) => item.enabled && item.manifest?.id === source.addonId,
+      );
+      if (!addon?.manifest) {
+        errors.push(`Collection addon ${source.addonId} is not installed`);
+        return [] as Meta[];
+      }
+      const extras: Record<string, string | number> = {};
+      if (source.genre?.trim()) extras.genre = source.genre.trim();
+      if (skip) extras.skip = skip;
+      try {
+        const payload = await fetchJson<{
+          metas?: Array<Record<string, unknown>>;
+        }>(
+          resourceUrl(
+            addon.url,
+            "catalog",
+            source.type,
+            source.catalogId,
+            extras,
+          ),
+        );
+        return (payload.metas ?? []).map((meta) =>
+          mapMeta(meta, addon.url, addon.manifest!.name),
+        );
+      } catch (error) {
+        errors.push(
+          `${addon.manifest.name}: ${error instanceof Error ? error.message : "catalog failed"}`,
+        );
+        return [] as Meta[];
+      }
+    }),
+  );
+  const seen = new Set<string>();
+  const items: Meta[] = [];
+  for (const batch of results)
+    for (const item of batch) {
+      const key = `${item.type}:${item.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+    }
+  return { items, errors };
 }
 
 export async function loadCatalog(

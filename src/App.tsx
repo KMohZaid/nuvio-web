@@ -1,4 +1,8 @@
 import {
+  ArrowLeft,
+  ChevronRight,
+  RefreshCw,
+  X,
   Compass,
   Home,
   Library,
@@ -13,12 +17,17 @@ import {
   useDeferredValue,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { AuthScreen } from "./components/AuthScreen";
 import { ContinueWatching } from "./components/ContinueWatching";
 import { Details } from "./components/Details";
 import { Discover } from "./components/Discover";
+import {
+  CollectionFolderView,
+  CollectionRow,
+} from "./components/Collections";
 import { Hero, MediaRow, PosterCard } from "./components/Media";
 import { Player } from "./components/Player";
 import { ProfileSwitcher } from "./components/ProfileSwitcher";
@@ -28,7 +37,11 @@ import {
   loadAvatarCatalog,
   loadLibrary,
   loadProfiles,
+  loadCollections,
+  loadHomeLayout,
   loadProgress,
+  COLLECTION_KEY_PREFIX,
+  type HomeLayout,
   loadSettingsBlob,
   loadWatchedItems,
   pushBlobBoolean,
@@ -40,13 +53,24 @@ import {
   type SettingsBlob,
 } from "./lib/account";
 import {
+  loadCatalog,
   loadHome,
   loadInstalledAddons,
   normalizeManifestUrl,
   resolveMeta,
   searchAddons,
 } from "./lib/addons";
-import { launchExternalPlayer } from "./lib/externalPlayer";
+import {
+  applyUpdate,
+  checkForUpdate,
+  subscribeUpdate,
+  updateReady,
+} from "./lib/appUpdate";
+import {
+  isAppleMobile,
+  isDesktop,
+  launchExternalPlayer,
+} from "./lib/externalPlayer";
 import {
   buildContinueWatching,
   buildWatchIndex,
@@ -57,6 +81,8 @@ import { useProgressiveList } from "./lib/useProgressiveList";
 import type {
   AddonRow,
   CatalogSection,
+  Collection,
+  CollectionFolder,
   ExternalPlayerMode,
   InstalledAddon,
   LibraryItem,
@@ -70,11 +96,12 @@ import type {
   WatchedItem,
 } from "./types";
 
+// Addons is deliberately absent: it is configuration, not a place you browse,
+// so it lives behind Settings rather than taking a slot in the tab bar.
 const nav: Array<{ key: NavKey; label: string; icon: typeof Home }> = [
   { key: "home", label: "Home", icon: Home },
   { key: "discover", label: "Discover", icon: Compass },
   { key: "library", label: "Library", icon: Library },
-  { key: "addons", label: "Addons", icon: Puzzle },
   { key: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -98,12 +125,19 @@ export function App() {
   const [watchedItems, setWatchedItems] = useState<WatchedItem[]>([]);
   const [recentMetadata, setRecentMetadata] = useState<Meta[]>([]);
   const [settingsBlob, setSettingsBlob] = useState<SettingsBlob | null>(null);
-  const [externalPlayer, setExternalPlayer] = useState<ExternalPlayerMode>(
-    () =>
-      (localStorage.getItem(
-        "nuvio-web-external-player",
-      ) as ExternalPlayerMode | null) ?? "internal",
-  );
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [homeLayout, setHomeLayout] = useState<HomeLayout | null>(null);
+  const [folder, setFolder] = useState<CollectionFolder | null>(null);
+  const [externalPlayer, setExternalPlayer] = useState<ExternalPlayerMode>(() => {
+    const stored = localStorage.getItem(
+      "nuvio-web-external-player",
+    ) as ExternalPlayerMode | null;
+    // The iOS-only schemes cannot work here, so an old choice would silently
+    // do nothing. Copying is the desktop equivalent.
+    if (isDesktop() && (stored === "vlc" || stored === "outplayer"))
+      return "copy";
+    return stored ?? "internal";
+  });
   const [active, setActive] = useState<NavKey>("home");
   // The nav highlight follows `active` immediately; the page body renders from
   // the deferred copy, so a tap paints the new tab first and the heavy list
@@ -111,6 +145,19 @@ export function App() {
   const deferredActive = useDeferredValue(active);
   const [selected, setSelected] = useState<Meta | null>(null);
   const [catalog, setCatalog] = useState<CatalogSection | null>(null);
+  // The sub-views are deferred for the same reason as the tab: leaving "See
+  // all" rebuilds every home row, and without this the tap registered nothing
+  // until that finished.
+  const deferredCatalog = useDeferredValue(catalog);
+  const deferredFolder = useDeferredValue(folder);
+
+  // Opening a catalog or folder swaps the page content without touching the
+  // document scroller, so a view entered from halfway down home opened
+  // halfway down. Keyed on the deferred values so it fires with the render
+  // that actually swaps the content, not one frame early.
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+  }, [deferredCatalog, deferredFolder, deferredActive]);
   const [playback, setPlayback] = useState<{
     stream: Stream;
     meta: Meta;
@@ -118,9 +165,23 @@ export function App() {
   } | null>(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
+  // Status notices are informational, not decisions to act on, so they clear
+  // themselves rather than sitting over the page until dismissed.
+  useEffect(() => {
+    if (!message) return;
+    const timer = window.setTimeout(() => setMessage(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [message]);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Meta[]>([]);
   const [searching, setSearching] = useState(false);
+  const [hasUpdate, setHasUpdate] = useState(updateReady);
+  useEffect(() => subscribeUpdate(() => setHasUpdate(true)), []);
+  // Ask once at startup rather than waiting for the browser's own schedule,
+  // which can be hours — long enough to keep running a build you replaced.
+  useEffect(() => {
+    void checkForUpdate();
+  }, []);
   useEffect(() => {
     restoreSession()
       .then((value) => {
@@ -167,24 +228,41 @@ export function App() {
     if (!profile) return;
     setLoading(true);
     try {
-      const [rows, nextLibrary, nextProgress, nextWatched, blob] =
-        await Promise.all([
+      const [
+        rows,
+        nextLibrary,
+        nextProgress,
+        nextWatched,
+        blob,
+        nextCollections,
+        nextLayout,
+      ] = await Promise.all([
           loadAddons(profile.profileIndex),
           loadLibrary(profile.profileIndex),
           loadProgress(profile.profileIndex),
           loadWatchedItems(profile.profileIndex).catch(() => []),
-          // A settings row that will not load must not block the catalogs.
+          // Neither of these may block the catalogs.
           loadSettingsBlob(profile.profileIndex).catch(() => null),
+          loadCollections(profile.profileIndex).catch(() => []),
+          loadHomeLayout(profile.profileIndex).catch(() => null),
         ]);
       setAddonRows(rows);
       setLibrary(nextLibrary);
       setProgress(nextProgress);
       setWatchedItems(nextWatched);
       if (blob) setSettingsBlob(blob);
+      setCollections(nextCollections);
+      setHomeLayout(nextLayout);
       const installed = await loadInstalledAddons(rows);
       setAddons(installed);
-      const home = await loadHome(installed);
-      setSections(home.sections);
+      // Rows appear as each batch lands instead of after every addon has
+      // answered, which is what left the page blank on a slow connection.
+      setSections([]);
+      const home = await loadHome(
+        installed,
+        (section) => setSections((current) => [...current, section]),
+        nextLayout,
+      );
       const known = new Map<string, Meta>();
       for (const item of [
         ...home.sections.flatMap((section) => section.items),
@@ -312,6 +390,22 @@ export function App() {
     }
   }
 
+  // Collections sit in the same ordering as catalogs, keyed `collection_<id>`.
+  const orderedCollections = useMemo(() => {
+    if (!homeLayout) return collections;
+    const visible = collections.filter(
+      (item) =>
+        homeLayout.enabledOf.get(`${COLLECTION_KEY_PREFIX}${item.id}`) !== false,
+    );
+    return [...visible].sort(
+      (a, b) =>
+        (homeLayout.orderOf.get(`${COLLECTION_KEY_PREFIX}${a.id}`) ??
+          Number.MAX_SAFE_INTEGER) -
+        (homeLayout.orderOf.get(`${COLLECTION_KEY_PREFIX}${b.id}`) ??
+          Number.MAX_SAFE_INTEGER),
+    );
+  }, [collections, homeLayout]);
+
   const hero = sections[0]?.items[0];
   const watchIndex = useMemo(
     () => buildWatchIndex(progress, watchedItems),
@@ -391,8 +485,6 @@ export function App() {
       </div>
     );
   if (!session) return <AuthScreen onSession={setSession} />;
-  if (playback)
-    return <Player {...playback} onClose={() => setPlayback(null)} />;
   return (
     <div className="app-shell">
       <aside className="rail">
@@ -405,6 +497,7 @@ export function App() {
             onClick={() => {
               setActive(item.key);
               setCatalog(null);
+              setFolder(null);
             }}
           >
             <item.icon />
@@ -443,13 +536,37 @@ export function App() {
         />
       </header>
       <main className="content">
+        {hasUpdate && (
+          <div className="notice update-notice">
+            <span>A new version of Nuvio Web is ready.</span>
+            <button className="notice-action" onClick={() => applyUpdate()}>
+              Reload
+            </button>
+            <button
+              className="notice-dismiss"
+              aria-label="Dismiss"
+              onClick={() => setHasUpdate(false)}
+            >
+              <X size={18} />
+            </button>
+          </div>
+        )}
         {message && (
           <div className="notice">
             <span>{message}</span>
-            <button onClick={() => setMessage("")}>×</button>
+            <button
+              className="notice-dismiss"
+              aria-label="Dismiss"
+              onClick={() => setMessage("")}
+            >
+              <X size={18} />
+            </button>
           </div>
         )}
-        {(loading || deferredActive !== active) && (
+        {(loading ||
+          deferredActive !== active ||
+          deferredCatalog !== catalog ||
+          deferredFolder !== folder) && (
           <>
             {/* Veil and spinner are siblings, never nested: iOS rasterises a
                 backdrop-filter element's own children through the same filter,
@@ -460,9 +577,17 @@ export function App() {
             </div>
           </>
         )}
-        {catalog ? (
+        {deferredFolder ? (
+          <CollectionFolderView
+            folder={deferredFolder}
+            addons={addons}
+            index={watchIndex}
+            onBack={() => setFolder(null)}
+            onOpen={setSelected}
+          />
+        ) : deferredCatalog ? (
           <CatalogView
-            section={catalog}
+            section={deferredCatalog}
             index={watchIndex}
             onBack={() => setCatalog(null)}
             onOpen={setSelected}
@@ -471,10 +596,12 @@ export function App() {
           <HomeView
             hero={hero}
             sections={sections}
+            collections={orderedCollections}
             continueItems={continueItems}
             index={watchIndex}
             onOpen={setSelected}
             onSeeAll={setCatalog}
+            onOpenFolder={setFolder}
           />
         ) : deferredActive === "discover" ? (
           <Discover
@@ -492,6 +619,7 @@ export function App() {
           />
         ) : deferredActive === "addons" ? (
           <AddonsPage
+            onBack={() => setActive("settings")}
             addons={addons}
             rows={addonRows}
             onToggle={(index) =>
@@ -506,6 +634,7 @@ export function App() {
           />
         ) : (
           <SettingsPage
+            onAddons={() => setActive("addons")}
             session={session}
             profile={profile}
             amoled={amoled}
@@ -531,6 +660,7 @@ export function App() {
             onClick={() => {
               setActive(item.key);
               setCatalog(null);
+              setFolder(null);
             }}
           >
             <item.icon />
@@ -538,6 +668,12 @@ export function App() {
           </button>
         ))}
       </nav>
+      {playback && (
+        /* An overlay rather than an early return: unmounting the shell to show
+           the player threw away the resolved detail page, so closing it
+           rebuilt home from scratch and only then re-opened details. */
+        <Player {...playback} onClose={() => setPlayback(null)} />
+      )}
       {selected && (
         <Details
           seed={selected}
@@ -562,11 +698,14 @@ export function App() {
                 video?.title || meta.name,
               );
               setMessage(
-                externalPlayer === "m3u"
-                  ? "Playlist downloaded. Open it with your preferred player."
-                  : `Opening ${externalPlayer === "vlc" ? "VLC" : "Outplayer"}…`,
+                externalPlayer === "copy"
+                  ? "Stream URL copied. Paste it into VLC or your media player to watch."
+                  : externalPlayer === "m3u"
+                    ? "Playlist downloaded. Open it with your preferred player."
+                    : `Opening ${externalPlayer === "vlc" ? "VLC" : "Outplayer"}…`,
               );
-              setSelected(null);
+              // Details stays open: the stream opened elsewhere, so this page
+              // is exactly where you want to be when you come back.
               return;
             }
             setPlayback({ stream, meta, video });
@@ -585,25 +724,54 @@ export function App() {
 function HomeView({
   hero,
   sections,
+  collections,
   continueItems,
   index,
   onOpen,
   onSeeAll,
+  onOpenFolder,
 }: {
   hero?: Meta;
   sections: CatalogSection[];
+  collections: Collection[];
   continueItems: ReturnType<typeof buildContinueWatching>;
   index: WatchIndex;
   onOpen(item: Meta): void;
   onSeeAll(section: CatalogSection): void;
+  onOpenFolder(folder: CollectionFolder): void;
 }) {
-  const { visible } = useProgressiveList(sections);
+  // Each row is ~24 poster cards, so a few rows is already a screenful.
+  // Using the card defaults here committed every row at once, which is what
+  // made returning from "See all" stall.
+  const { visible } = useProgressiveList(sections, {
+    resetKey: "home",
+    first: 3,
+    chunk: 2,
+  });
+  // Nuvio honours `pinToTop`; the rest keep their stored order below the
+  // continue row and above the catalogs.
+  const pinned = collections.filter((item) => item.pinToTop);
+  const rest = collections.filter((item) => !item.pinToTop);
   return (
     <>
       {hero && <Hero item={hero} onOpen={() => onOpen(hero)} />}
+      {pinned.map((collection) => (
+        <CollectionRow
+          key={collection.id}
+          collection={collection}
+          onOpenFolder={onOpenFolder}
+        />
+      ))}
       {continueItems.length > 0 && (
         <ContinueWatching cards={continueItems} onOpen={onOpen} />
       )}
+      {rest.map((collection) => (
+        <CollectionRow
+          key={collection.id}
+          collection={collection}
+          onOpenFolder={onOpenFolder}
+        />
+      ))}
       {visible.map((section) => (
         <MediaRow
           key={section.key}
@@ -644,7 +812,7 @@ function LibraryView({
     () => (tab === "all" ? items : items.filter((item) => item.type === tab)),
     [items, tab],
   );
-  const { visible } = useProgressiveList(filtered);
+  const { visible } = useProgressiveList(filtered, { resetKey: tab });
   const tabs = [
     { key: "all", label: "All", count: counts.all },
     { key: "movie", label: "Movies", count: counts.movie },
@@ -705,38 +873,110 @@ function CatalogView({
   onBack(): void;
   onOpen(item: Meta): void;
 }) {
-  const { visible, complete } = useProgressiveList(section.items);
+  const [items, setItems] = useState<Meta[]>(section.items);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [exhausted, setExhausted] = useState(false);
+  const [error, setError] = useState("");
+  const sentinel = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setItems(section.items);
+    setExhausted(false);
+    setError("");
+  }, [section]);
+
+  const more = useCallback(async () => {
+    if (loadingMore || exhausted) return;
+    setLoadingMore(true);
+    try {
+      const next = await loadCatalog(section, items.length);
+      // Addons that ignore `skip` return the same page forever, so anything
+      // that adds no new ids ends the run rather than looping.
+      const known = new Set(items.map((item) => `${item.type}:${item.id}`));
+      const additions = next.filter(
+        (item) => !known.has(`${item.type}:${item.id}`),
+      );
+      if (additions.length === 0) setExhausted(true);
+      else setItems((current) => [...current, ...additions]);
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : "Could not load more",
+      );
+      setExhausted(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [exhausted, items, loadingMore, section]);
+
+  // Infinite scroll rather than a button: the sentinel sits below the grid and
+  // fetches the next page as it comes into view.
+  useEffect(() => {
+    const node = sentinel.current;
+    if (!node || exhausted) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) more();
+      },
+      { rootMargin: "600px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [more, exhausted]);
+
+  const { visible } = useProgressiveList(items, { resetKey: section.key });
   return (
     <section className="grid-page">
-      <button className="back-inline" onClick={onBack}>
-        ← Back
-      </button>
-      <span className="eyebrow">{section.addonName}</span>
-      <h1>{section.name}</h1>
-      <p>{section.type === "series" ? "Series" : "Movies"}</p>
+      <div className="page-head">
+        <button
+          className="circle-button"
+          aria-label="Back"
+          title="Back"
+          onClick={onBack}
+        >
+          <ArrowLeft />
+        </button>
+        <div>
+          <span className="eyebrow">{section.addonName}</span>
+          <h1>{section.name}</h1>
+          <p>
+            {section.type === "series" ? "Series" : "Movies"} · {items.length}{" "}
+            titles
+          </p>
+        </div>
+      </div>
+      {error && <div className="notice error">{error}</div>}
       <div className="poster-grid">
         {visible.map((item) => (
           <PosterCard
-            key={item.id}
+            key={`${item.type}:${item.id}`}
             item={item}
             index={index}
             onOpen={onOpen}
           />
         ))}
       </div>
-      {!complete && <div className="grid-filling" aria-hidden="true" />}
+      {!exhausted && <div ref={sentinel} className="grid-sentinel" />}
+      {loadingMore && (
+        <div className="grid-more" role="status">
+          <i className="mini-spinner" />
+          Loading more…
+        </div>
+      )}
     </section>
   );
 }
+
 function AddonsPage({
   addons,
   rows,
+  onBack,
   onToggle,
   onAdd,
   onRefresh,
 }: {
   addons: InstalledAddon[];
   rows: AddonRow[];
+  onBack(): void;
   onToggle(index: number): void;
   onAdd(url: string): Promise<void>;
   onRefresh(): void;
@@ -745,12 +985,24 @@ function AddonsPage({
   const [error, setError] = useState("");
   return (
     <section className="settings-page">
-      <span className="eyebrow">CONTENT</span>
-      <h1>Addons</h1>
-      <p>
-        These are synced with the selected Nuvio profile. Catalog requests go
-        straight from this device to each addon.
-      </p>
+      <div className="page-head">
+        <button
+          className="circle-button"
+          aria-label="Back to settings"
+          title="Back to settings"
+          onClick={onBack}
+        >
+          <ArrowLeft />
+        </button>
+        <div>
+          <span className="eyebrow">CONTENT</span>
+          <h1>Addons</h1>
+          <p>
+            These are synced with the selected Nuvio profile. Catalog requests
+            go straight from this device to each addon.
+          </p>
+        </div>
+      </div>
       <form
         className="addon-install"
         onSubmit={async (event) => {
@@ -817,7 +1069,53 @@ function AddonsPage({
     </section>
   );
 }
+/**
+ * Manual update check. The worker only polls on its own schedule, which can be
+ * hours; this asks immediately. A found update raises the usual reload prompt
+ * rather than restarting the app from under you.
+ */
+function UpdateRow() {
+  const [state, setState] = useState<"idle" | "checking" | "current" | "pending">(
+    "idle",
+  );
+  return (
+    <>
+      <div className="theme-row">
+        <span>
+          <strong>Check for updates</strong>
+          <small>
+            {state === "checking"
+              ? "Checking…"
+              : state === "current"
+                ? "You are on the latest version."
+                : state === "pending"
+                  ? "An update is ready — use the Reload bar at the top."
+                  : `Build ${new Date(__APP_BUILD__).toLocaleString()}`}
+          </small>
+        </span>
+        <button
+          className="secondary"
+          disabled={state === "checking"}
+          onClick={async () => {
+            setState("checking");
+            const result = await checkForUpdate();
+            setState(result === "pending" ? "pending" : "current");
+          }}
+        >
+          <RefreshCw size={16} /> Check
+        </button>
+      </div>
+      {state === "pending" && (
+        <button className="primary wide" onClick={() => applyUpdate()}>
+          Reload now
+        </button>
+      )}
+    </>
+  );
+}
+
 function SettingsPage({
+  onAddons,
   session,
   profile,
   amoled,
@@ -827,6 +1125,7 @@ function SettingsPage({
   onExternalPlayer,
   onSignOut,
 }: {
+  onAddons(): void;
   session: Session;
   profile: Profile | null;
   amoled: boolean;
@@ -844,6 +1143,14 @@ function SettingsPage({
         This preview keeps media traffic off the Nuvio host and uses the browser
         whenever possible.
       </p>
+      <button className="setting-link" onClick={onAddons}>
+        <Puzzle />
+        <span>
+          <strong>Addons</strong>
+          <small>Install, reorder and disable your Stremio addons</small>
+        </span>
+        <ChevronRight />
+      </button>
       <div className="setting-card">
         <header>
           <h2>Appearance</h2>
@@ -901,8 +1208,9 @@ function SettingsPage({
           <span>
             <strong>Default player</strong>
             <small>
-              VLC and Outplayer use their iOS/iPadOS URL schemes. M3U works on
-              desktop too.
+              {isDesktop()
+                ? "Desktop browsers cannot launch a local player, so Nuvio copies the stream URL for you to paste into VLC. For proper desktop playback, use the Nuvio desktop app."
+                : "VLC and Outplayer open through their iOS URL schemes."}
             </small>
           </span>
           <select
@@ -912,8 +1220,14 @@ function SettingsPage({
             }
           >
             <option value="internal">Nuvio web player</option>
-            <option value="vlc">VLC (iOS/iPadOS)</option>
-            <option value="outplayer">Outplayer (iOS/iPadOS)</option>
+            {isDesktop() ? (
+              <option value="copy">Copy link for an external player</option>
+            ) : (
+              <>
+                <option value="vlc">VLC</option>
+                <option value="outplayer">Outplayer (iOS/iPadOS)</option>
+              </>
+            )}
             <option value="m3u">Download M3U playlist</option>
           </select>
         </label>
@@ -923,6 +1237,12 @@ function SettingsPage({
           unsupported HEVC, TrueHD, EAC3, or DTS audio still need an external
           player or a future local companion service.
         </p>
+      </div>
+      <div className="setting-card">
+        <header>
+          <h2>App version</h2>
+        </header>
+        <UpdateRow />
       </div>
       <div className="setting-card">
         <header>

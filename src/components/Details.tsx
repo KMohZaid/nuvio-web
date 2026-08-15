@@ -10,9 +10,11 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { loadStreams, resolveMeta } from "../lib/addons";
+import { assessPlayback } from "../lib/playback";
 import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
 import { useLongPress } from "../lib/useLongPress";
 import { useScrollLock } from "../lib/useScrollLock";
+import { useSwipeBack } from "../lib/useSwipeBack";
 import type { InstalledAddon, Meta, Stream, Video } from "../types";
 import { ContextMenu } from "./ContextMenu";
 
@@ -39,6 +41,7 @@ export function Details({
     null,
   );
   useScrollLock();
+  const swipeRef = useSwipeBack<HTMLDivElement>(onClose);
   const [meta, setMeta] = useState(seed);
   const [busy, setBusy] = useState(true);
   const [sourceOpen, setSourceOpen] = useState(false);
@@ -86,7 +89,7 @@ export function Details({
     }
   }
   return (
-    <div className="detail-view">
+    <div className="detail-view" ref={swipeRef}>
       <button className="circle-button back" onClick={onClose}>
         <ArrowLeft />
       </button>
@@ -346,9 +349,20 @@ export function Details({
                         </p>
                         <small>
                           {stream.addonName}
-                          {stream.behaviorHints?.notWebReady
-                            ? " · External player recommended"
-                            : ""}
+                          {(() => {
+                            // Warn before the user commits to a source, not
+                            // after it opens silent or black.
+                            const verdict = assessPlayback(
+                              stream.url || stream.externalUrl || "",
+                              stream.behaviorHints?.filename,
+                            );
+                            if (!verdict.playable)
+                              return " · Needs an external player";
+                            if (verdict.audioRisk) return " · Audio may not play";
+                            return stream.behaviorHints?.notWebReady
+                              ? " · External player recommended"
+                              : "";
+                          })()}
                         </small>
                       </div>
                     </button>

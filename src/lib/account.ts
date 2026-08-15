@@ -1,4 +1,6 @@
 import type {
+  Collection,
+  CollectionFolder,
   AddonRow,
   AvatarCatalogItem,
   BackendConfig,
@@ -134,18 +136,6 @@ export async function signIn(
     },
   );
   return installToken(backend, payload);
-}
-
-export async function signUp(
-  backend: BackendConfig,
-  email: string,
-  password: string,
-): Promise<Session | null> {
-  const payload = await request<TokenPayload>(backend, "/auth/v1/signup", {
-    method: "POST",
-    body: JSON.stringify({ email, password }),
-  });
-  return payload.access_token ? installToken(backend, payload) : null;
 }
 
 export async function restoreSession(): Promise<Session | null> {
@@ -546,4 +536,156 @@ export async function setWatched(
 
 export function currentSession(): Session | null {
   return activeSession;
+}
+
+/**
+ * Collections for the home screen.
+ *
+ * The row stores its payload in `collections_json`, which the backend may hand
+ * back either as a JSON string or as an already-parsed object depending on the
+ * column type — the desktop client handles both, so this does too.
+ */
+export async function loadCollections(
+  profileIndex: number,
+): Promise<Collection[]> {
+  const rows = await rpc<Array<Record<string, unknown>>>(
+    "sync_pull_collections",
+    { p_profile_id: profileIndex },
+  );
+  const raw = rows?.[0]?.collections_json;
+  if (raw == null) return [];
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((entry) => {
+      const value = entry as Record<string, unknown>;
+      const folders = Array.isArray(value.folders) ? value.folders : [];
+      return {
+        id: String(value.id ?? ""),
+        title: String(value.title ?? "Collection"),
+        backdropImageUrl: value.backdropImageUrl
+          ? String(value.backdropImageUrl)
+          : undefined,
+        pinToTop: !!value.pinToTop,
+        folders: folders.map((item) => {
+          const folder = item as Record<string, unknown>;
+          const sources = Array.isArray(folder.catalogSources)
+            ? folder.catalogSources
+            : [];
+          return {
+            id: String(folder.id ?? ""),
+            title: String(folder.title ?? "Folder"),
+            coverImageUrl: folder.coverImageUrl
+              ? String(folder.coverImageUrl)
+              : undefined,
+            coverEmoji: folder.coverEmoji
+              ? String(folder.coverEmoji)
+              : undefined,
+            tileShape: folder.tileShape ? String(folder.tileShape) : undefined,
+            hideTitle: !!folder.hideTitle,
+            catalogSources: sources.map((source) => {
+              const entry = source as Record<string, unknown>;
+              return {
+                addonId: String(entry.addonId ?? ""),
+                type: String(entry.type ?? ""),
+                catalogId: String(entry.catalogId ?? ""),
+                genre: entry.genre ? String(entry.genre) : undefined,
+              };
+            }),
+          } satisfies CollectionFolder;
+        }),
+      } satisfies Collection;
+    })
+    .filter((collection) => collection.id);
+}
+
+/**
+ * The home layout: which catalogs and collections are shown, and in what
+ * order. Read-only here — this client never pushes it, so it cannot rewrite
+ * what another device saved.
+ *
+ * Nuvio keeps this in a `home_catalog_shared` row, with `mobile` and `tv` rows
+ * left over from before it was shared. The shared row wins; the legacy ones
+ * only fill in when it is absent.
+ */
+const HOME_LAYOUT_PLATFORMS = ["home_catalog_shared", "mobile", "tv"] as const;
+export const COLLECTION_KEY_PREFIX = "collection_";
+
+export type HomeLayoutItem = {
+  key: string;
+  enabled: boolean;
+  order: number;
+  isCollection: boolean;
+  customTitle: string;
+};
+export type HomeLayout = {
+  items: HomeLayoutItem[];
+  /** Ordering position by preference key, for a stable sort. */
+  orderOf: Map<string, number>;
+  enabledOf: Map<string, boolean>;
+};
+
+/**
+ * Mirrors Kotlin's `SyncCatalogItem.preferenceKey()`. The explicit `key` wins,
+ * because addon ids can themselves contain colons — which makes rebuilding the
+ * three-part form ambiguous.
+ */
+function preferenceKey(item: Record<string, unknown>): string {
+  const explicit = String(item.key ?? "").trim();
+  if (explicit) return explicit;
+  if (item.is_collection)
+    return `${COLLECTION_KEY_PREFIX}${String(item.collection_id ?? "")}`;
+  return `${String(item.addon_id ?? "")}:${String(item.type ?? "")}:${String(item.catalog_id ?? "")}`;
+}
+
+export async function loadHomeLayout(
+  profileIndex: number,
+): Promise<HomeLayout | null> {
+  for (const platform of HOME_LAYOUT_PLATFORMS) {
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = await rpc<Array<Record<string, unknown>>>(
+        "sync_pull_home_catalog_settings",
+        { p_profile_id: profileIndex, p_platform: platform },
+      );
+    } catch {
+      // A network failure is not "no layout" — fall through and try the next
+      // platform rather than treating it as an empty result.
+      continue;
+    }
+    const raw = rows?.[0]?.settings_json;
+    if (raw == null) continue;
+    let parsed: unknown = raw;
+    if (typeof raw === "string") {
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+    }
+    const payload = parsed as { items?: Array<Record<string, unknown>> };
+    if (!Array.isArray(payload?.items) || payload.items.length === 0) continue;
+
+    const items: HomeLayoutItem[] = payload.items.map((item) => ({
+      key: preferenceKey(item),
+      enabled: item.enabled !== false,
+      order: Number(item.order ?? 0),
+      isCollection: !!item.is_collection,
+      customTitle: String(item.custom_title ?? ""),
+    }));
+    items.sort((a, b) => a.order - b.order);
+    return {
+      items,
+      orderOf: new Map(items.map((item, index) => [item.key, index])),
+      enabledOf: new Map(items.map((item) => [item.key, item.enabled])),
+    };
+  }
+  return null;
 }

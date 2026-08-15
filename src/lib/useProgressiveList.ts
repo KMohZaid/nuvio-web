@@ -1,38 +1,38 @@
 import { useEffect, useState } from "react";
 
 /**
- * Renders a long list in growing slices so a tab switch paints immediately.
+ * Renders a long list in growing slices so a view paints immediately.
  *
- * The catalog pages hold hundreds of poster cards. Committing them all in the
- * click handler's render blocks paint for as long as it takes, which is what
- * made the nav feel like it was loading something — the data was already in
- * memory, React was just busy building DOM. Showing a first screenful and
- * growing on subsequent frames keeps the tab switch instant.
+ * Committing several hundred cards inside a click handler blocks paint for as
+ * long as it takes, which reads as the app loading something when the data is
+ * already in memory. Showing a first screenful and growing on later frames
+ * keeps the switch instant.
+ *
+ * `resetKey` is what identifies "a different list". It must not be the array
+ * itself: appending a page of results produces a new array, and resetting on
+ * that collapsed the grid back to one screenful mid-scroll, which yanked the
+ * scroll position every time a page loaded.
  */
-const FIRST_PAINT = 36;
-const CHUNK = 60;
+export function useProgressiveList<T>(
+  items: T[],
+  options: { resetKey?: unknown; first?: number; chunk?: number } = {},
+): { visible: T[]; complete: boolean } {
+  const { resetKey, first = 36, chunk = 60 } = options;
+  const [limit, setLimit] = useState(first);
 
-export function useProgressiveList<T>(items: T[]): {
-  visible: T[];
-  complete: boolean;
-} {
-  const [limit, setLimit] = useState(FIRST_PAINT);
-
-  // Any new list starts over, so switching tabs never inherits a large limit
-  // and pays the full cost up front again.
   useEffect(() => {
-    setLimit(FIRST_PAINT);
-  }, [items]);
+    setLimit(first);
+  }, [resetKey, first]);
 
   useEffect(() => {
     if (limit >= items.length) return;
-    // rAF rather than a timer: this yields to paint but still fills the list
-    // within a few frames, so a scroll never outruns it.
+    // rAF rather than a timer: yields to paint but still fills within a few
+    // frames, so scrolling never outruns it.
     const handle = requestAnimationFrame(() =>
-      setLimit((current) => current + CHUNK),
+      setLimit((current) => current + chunk),
     );
     return () => cancelAnimationFrame(handle);
-  }, [limit, items.length]);
+  }, [limit, items.length, chunk]);
 
   return {
     visible: limit >= items.length ? items : items.slice(0, limit),

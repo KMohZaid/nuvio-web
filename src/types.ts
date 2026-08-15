@@ -153,5 +153,34 @@ export type WatchedItem = {
   episode?: number;
   watchedAt: number;
 };
-export type ExternalPlayerMode = "internal" | "vlc" | "outplayer" | "m3u";
+export type ExternalPlayerMode =
+  | "internal"
+  | "copy"
+  | "vlc"
+  | "outplayer"
+  | "m3u";
 export type NavKey = "home" | "discover" | "library" | "addons" | "settings";
+
+/** One catalog feeding a collection folder. */
+export type CollectionCatalogSource = {
+  addonId: string;
+  type: string;
+  catalogId: string;
+  genre?: string;
+};
+export type CollectionFolder = {
+  id: string;
+  title: string;
+  coverImageUrl?: string;
+  coverEmoji?: string;
+  tileShape?: string;
+  hideTitle?: boolean;
+  catalogSources: CollectionCatalogSource[];
+};
+export type Collection = {
+  id: string;
+  title: string;
+  backdropImageUrl?: string;
+  pinToTop: boolean;
+  folders: CollectionFolder[];
+};

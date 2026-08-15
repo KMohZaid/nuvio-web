@@ -6,6 +6,9 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
   return {
     define: {
+      // Changes every build, so Settings can show which one is running — the
+      // quickest way to confirm an update actually applied.
+      __APP_BUILD__: JSON.stringify(new Date().toISOString()),
       "import.meta.env.VITE_NUVIO_SUPABASE_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_URL || env.NUVIO_SUPABASE_URL || ""),
       "import.meta.env.VITE_NUVIO_SUPABASE_FALLBACK_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_FALLBACK_URL || env.NUVIO_SUPABASE_FALLBACK_URL || ""),
       "import.meta.env.VITE_NUVIO_SUPABASE_ANON_KEY": JSON.stringify(env.VITE_NUVIO_SUPABASE_ANON_KEY || env.NUVIO_SUPABASE_ANON_KEY || ""),
@@ -13,7 +16,9 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       VitePWA({
-        registerType: "autoUpdate",
+        // "prompt", not "autoUpdate": autoUpdate reloads the page as soon as a
+        // new worker takes control, which restarted the app mid-boot.
+        registerType: "prompt",
         includeAssets: [
           "app-icon-1024.png",
           "Nuvio-icon.png",

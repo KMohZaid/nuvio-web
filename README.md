@@ -15,14 +15,21 @@ on the sign-in screen and enter a URL and publishable key on the device.
 
 ## Current scope
 
-- Persistent sign-in and session refresh
-- Synced profiles, installed addons, library, and read-only watch progress
+- Persistent sign-in and session refresh. Account creation is delegated to
+  nuvio.tv; this client only signs in.
+- Synced profiles, installed addons, library, watch progress and collections
+- Home ordering and per-catalog visibility read from Nuvio's synced home layout
 - Direct addon manifest/catalog/meta/stream calls
-- Responsive home, discover, library, addons, and settings views
-- Series episodes and source selection
-- Native video/HLS.js playback with external handoff
-- Installable PWA shell and cached application assets
+- Responsive home, discover, library and settings views (addons live inside
+  settings), with paginated catalogs and collection folders
+- Series episodes, source selection, and marking episodes watched via a
+  right-click menu or a touch hold
+- Native video/HLS.js playback with external handoff, plus codec diagnostics
+  for Matroska audio the browser cannot decode
+- Installable PWA shell with a prompted update flow
 
-Playback progress writes are intentionally disabled in this first test build.
+Watched and progress writes mirror the desktop client's sync payloads. The home
+layout is read-only here: this client never pushes it, so it cannot overwrite
+what another device saved.
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design and limitations.
 

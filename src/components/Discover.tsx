@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   discoverCatalogs,
   loadDiscoverCatalog,
@@ -42,7 +42,10 @@ export function Discover({
   const [genre, setGenre] = useState(ALL_GENRES);
   const [items, setItems] = useState<Meta[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [exhausted, setExhausted] = useState(false);
   const [error, setError] = useState("");
+  const sentinel = useRef<HTMLDivElement | null>(null);
 
   const types = useMemo(
     // Set preserves first-seen order, which is addon priority then manifest
@@ -70,13 +73,18 @@ export function Discover({
     if (!catalog) return;
     setLoading(true);
     setError("");
+    setExhausted(false);
     setItems([]);
     try {
-      setItems(await loadDiscoverCatalog(catalog, effectiveGenre));
+      const first = await loadDiscoverCatalog(catalog, effectiveGenre);
+      setItems(first);
+      // A catalog whose manifest never advertises `skip` has exactly one page.
+      if (!catalog.supportsPagination || first.length === 0) setExhausted(true);
     } catch (reason) {
       setError(
         reason instanceof Error ? reason.message : "Could not load catalog",
       );
+      setExhausted(true);
     } finally {
       setLoading(false);
     }
@@ -86,9 +94,52 @@ export function Discover({
     load();
   }, [load]);
 
+  const more = useCallback(async () => {
+    if (!catalog || loading || loadingMore || exhausted || items.length === 0)
+      return;
+    setLoadingMore(true);
+    try {
+      const next = await loadDiscoverCatalog(
+        catalog,
+        effectiveGenre,
+        items.length,
+      );
+      const known = new Set(items.map((item) => `${item.type}:${item.id}`));
+      const additions = next.filter(
+        (item) => !known.has(`${item.type}:${item.id}`),
+      );
+      // Addons that ignore `skip` repeat the first page forever, so a page
+      // that adds nothing new ends the run rather than looping.
+      if (additions.length === 0) setExhausted(true);
+      else setItems((current) => [...current, ...additions]);
+    } catch {
+      setExhausted(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [catalog, effectiveGenre, exhausted, items, loading, loadingMore]);
+
+  useEffect(() => {
+    const node = sentinel.current;
+    if (!node || exhausted || searchingRef.current) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) more();
+      },
+      { rootMargin: "600px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [more, exhausted]);
+
   const searching = query.trim().length > 0;
+  // Read inside the observer effect, which must not re-subscribe per render.
+  const searchingRef = useRef(searching);
+  searchingRef.current = searching;
   const shown = searching ? results : items;
-  const { visible } = useProgressiveList(shown);
+  const { visible } = useProgressiveList(shown, {
+    resetKey: searching ? query : `${catalog?.key}:${effectiveGenre ?? ""}`,
+  });
 
   return (
     <section className="grid-page">
@@ -160,7 +211,14 @@ export function Discover({
 
       {error && <div className="notice error">{error}</div>}
 
-      {!loading && shown.length === 0 && !error ? (
+      {loading ? (
+        /* The grid was rendered empty while a catalog loaded, so the page just
+           went black until results arrived. */
+        <div className="grid-loading" role="status">
+          <i className="mini-spinner" />
+          <span>Loading {catalog?.catalogName ?? "catalog"}…</span>
+        </div>
+      ) : shown.length === 0 && !error ? (
         <div className="empty-state">
           <strong>Nothing returned</strong>
           <span>
@@ -179,6 +237,15 @@ export function Discover({
               onOpen={onOpen}
             />
           ))}
+        </div>
+      )}
+      {!exhausted && !searching && (
+        <div ref={sentinel} className="grid-sentinel" />
+      )}
+      {loadingMore && (
+        <div className="grid-more" role="status">
+          <i className="mini-spinner" />
+          Loading more…
         </div>
       )}
     </section>

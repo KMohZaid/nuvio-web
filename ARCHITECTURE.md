@@ -75,11 +75,13 @@ than putting transcoding load on the public web host.
 1. **Browser proof of concept (this folder):** account login, profiles, addons,
    catalogs, metadata, episodes, sources, internal HLS/native playback, and
    external fallback.
-2. **Account parity:** library mutations, watched/progress writes, settings,
-   collections, and profile management with contract tests against Nuvio.
+2. **Account parity:** *(largely done)* watched writes, theme settings,
+   collections and the synced home layout. Still open: library mutations and
+   profile management, both still read-only here.
 3. **Playback hardening:** subtitles, audio selection where exposed, skip
-   segments, external-player templates, AirPlay/Chromecast, and better codec
-   diagnostics.
+   segments, AirPlay/Chromecast. Codec diagnostics are in place; desktop has no
+   way to launch a local player, so it copies the stream URL instead — VLC
+   registers no URL scheme on Windows.
 4. **Optional companion/gateway:** local torrent/transmux service and tightly
    scoped edge CORS relay.
 5. **Production:** CSP/security headers, telemetry opt-in, deployment, update
