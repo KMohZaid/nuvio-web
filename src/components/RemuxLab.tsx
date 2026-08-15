@@ -60,6 +60,25 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
   const [stream, setStream] = useState<StreamerStatus | null>(null);
   const streamerRef = useRef<RemuxStreamer | null>(null);
 
+  /**
+   * Drops the cached build outright.
+   *
+   * The update toast is the polite path, but it is easy to miss and a stale
+   * worker makes every later measurement a lie. Unregistering and clearing the
+   * caches guarantees the next load is the build that was just deployed.
+   */
+  const forceUpdate = async () => {
+    try {
+      const registrations = await navigator.serviceWorker?.getRegistrations?.();
+      await Promise.all((registrations ?? []).map((one) => one.unregister()));
+      const names = await caches?.keys?.();
+      await Promise.all((names ?? []).map((name) => caches.delete(name)));
+    } catch {
+      // Best effort: a reload without the cache cleared is still worth doing.
+    }
+    window.location.reload();
+  };
+
   const startStream = () => {
     const element = videoRef.current;
     if (!element || !url.trim()) return;
@@ -309,6 +328,21 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
             <strong>Media Source</strong>
             <small>{mediaSourceSupport()}</small>
           </span>
+        </div>
+        {/*
+          The service worker registers as "prompt", so a phone keeps serving
+          the build it already has until the update is accepted. Three rounds
+          of debugging once produced byte-identical results because of it, so
+          the running build is stated here and can be replaced on the spot.
+        */}
+        <div className="info-row">
+          <span>
+            <strong>Running build</strong>
+            <small>{__APP_BUILD__}</small>
+          </span>
+          <button className="secondary" onClick={() => void forceUpdate()}>
+            Force update
+          </button>
         </div>
       </div>
 

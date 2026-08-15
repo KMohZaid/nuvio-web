@@ -1,6 +1,16 @@
+import { execSync } from "node:child_process";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
+
+/** Short commit, or "unknown" where git is not available (a CI tarball). */
+function commit() {
+  try {
+    return execSync("git rev-parse --short HEAD", { encoding: "utf8" }).trim();
+  } catch {
+    return "unknown";
+  }
+}
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
@@ -12,8 +22,11 @@ export default defineConfig(({ mode }) => {
     base,
     define: {
       // Changes every build, so Settings can show which one is running — the
-      // quickest way to confirm an update actually applied.
-      __APP_BUILD__: JSON.stringify(new Date().toISOString()),
+      // quickest way to confirm an update actually applied. The commit is in
+      // there too, so a report from a phone names the code it came from.
+      __APP_BUILD__: JSON.stringify(
+        `${new Date().toISOString().slice(0, 16).replace("T", " ")} · ${commit()}`,
+      ),
       "import.meta.env.VITE_NUVIO_SUPABASE_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_URL || env.NUVIO_SUPABASE_URL || ""),
       "import.meta.env.VITE_NUVIO_SUPABASE_FALLBACK_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_FALLBACK_URL || env.NUVIO_SUPABASE_FALLBACK_URL || ""),
       "import.meta.env.VITE_NUVIO_SUPABASE_ANON_KEY": JSON.stringify(env.VITE_NUVIO_SUPABASE_ANON_KEY || env.NUVIO_SUPABASE_ANON_KEY || ""),
