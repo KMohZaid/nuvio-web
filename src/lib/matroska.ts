@@ -286,3 +286,60 @@ export function mediaSourceSupport(): string {
   if (plain) return "MediaSource";
   return "none — remuxing cannot work in this browser";
 }
+
+export type RemuxPlan = {
+  video?: MatroskaTrack;
+  audio?: MatroskaTrack;
+  /** Text subtitles convertible to WebVTT. Bitmap ones are dropped. */
+  subtitles: MatroskaTrack[];
+  needsAudioTranscode: boolean;
+  droppedBitmapSubtitles: number;
+  summary: string;
+};
+
+/**
+ * Chooses which streams a remuxer would actually carry.
+ *
+ * The important part is that a file with an undecodable default audio track is
+ * not necessarily a problem: releases routinely ship TrueHD alongside E-AC-3,
+ * and picking the playable one avoids transcoding altogether. Preferring the
+ * first track — which is what a naive remuxer does — would land on TrueHD and
+ * force a WASM decoder that was never needed.
+ */
+export function planRemux(tracks: MatroskaTrack[]): RemuxPlan {
+  const playable = (track: MatroskaTrack) => verdictFor(track).status === "ok";
+  const video = tracks.filter((track) => track.kind === "video");
+  const audio = tracks.filter((track) => track.kind === "audio");
+  const subtitles = tracks.filter((track) => track.kind === "subtitle");
+
+  // Among decodable audio, more channels is the better track.
+  const chosenAudio =
+    audio
+      .filter(playable)
+      .sort((left, right) => (right.channels ?? 0) - (left.channels ?? 0))[0] ??
+    audio[0];
+  const chosenVideo = video.find(playable) ?? video[0];
+  const text = subtitles.filter((track) =>
+    track.codecId.toUpperCase().startsWith("S_TEXT"),
+  );
+
+  const needsAudioTranscode = !!chosenAudio && !playable(chosenAudio);
+  const parts: string[] = [];
+  if (!chosenVideo) parts.push("no video track");
+  else if (!playable(chosenVideo))
+    parts.push(`${verdictFor(chosenVideo).label} video cannot be decoded here`);
+  if (!chosenAudio) parts.push("no audio track");
+  else if (needsAudioTranscode)
+    parts.push(`${verdictFor(chosenAudio).label} audio would need transcoding`);
+
+  return {
+    video: chosenVideo,
+    audio: chosenAudio,
+    subtitles: text,
+    needsAudioTranscode,
+    droppedBitmapSubtitles: subtitles.length - text.length,
+    summary: parts.length
+      ? parts.join("; ")
+      : "Remux only — every chosen stream decodes here as-is.",
+  };
+}

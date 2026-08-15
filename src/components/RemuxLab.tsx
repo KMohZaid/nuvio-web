@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   mediaSourceSupport,
+  planRemux,
   probeMatroska,
   verdictFor,
   type ProbeResult,
@@ -115,6 +116,38 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
               </small>
             </span>
           </div>
+          {(() => {
+            const plan = planRemux(result.tracks);
+            return (
+              <div className="info-row">
+                <span>
+                  <strong>
+                    {plan.needsAudioTranscode
+                      ? "Needs an audio transcode"
+                      : "Remuxable as-is"}
+                  </strong>
+                  <small
+                    className={
+                      plan.needsAudioTranscode ? "probe-transcode" : "probe-ok"
+                    }
+                  >
+                    {plan.summary} Would carry{" "}
+                    {verdictFor(plan.video ?? { kind: "video", codecId: "" }).label}
+                    {plan.audio
+                      ? ` + ${verdictFor(plan.audio).label}${plan.audio.channels ? ` ${plan.audio.channels}ch` : ""}`
+                      : ""}
+                    {plan.subtitles.length
+                      ? `, ${plan.subtitles.length} text subtitle${plan.subtitles.length === 1 ? "" : "s"}`
+                      : ""}
+                    {plan.droppedBitmapSubtitles
+                      ? `, dropping ${plan.droppedBitmapSubtitles} bitmap subtitle${plan.droppedBitmapSubtitles === 1 ? "" : "s"}`
+                      : ""}
+                    .
+                  </small>
+                </span>
+              </div>
+            );
+          })()}
           {result.tracks.map((track, index) => {
             const verdict = verdictFor(track);
             return (
