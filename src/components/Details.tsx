@@ -6,6 +6,7 @@ import {
   EyeOff,
   ExternalLink,
   Play,
+  Plus,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -43,6 +44,7 @@ export function Details({
   useScrollLock();
   const swipeRef = useSwipeBack<HTMLDivElement>(onClose);
   const [meta, setMeta] = useState(seed);
+  const movieWatched = watchIndex.watched.has(watchKey(meta.id));
   const [busy, setBusy] = useState(true);
   const [sourceOpen, setSourceOpen] = useState(false);
   const [streams, setStreams] = useState<Stream[]>([]);
@@ -154,10 +156,28 @@ export function Details({
               <Play size={18} fill="currentColor" />{" "}
               {meta.type === "series" ? "Choose episode" : "Watch now"}
             </button>
-            <button className="secondary" onClick={() => onLibrary(meta)}>
-              {inLibrary ? <Check size={18} /> : "+"}{" "}
-              {inLibrary ? "In library" : "Add to library"}
+            <button
+              className={inLibrary ? "icon-pill active" : "icon-pill"}
+              aria-pressed={inLibrary}
+              title={inLibrary ? "In your library" : "Add to library"}
+              aria-label={inLibrary ? "In your library" : "Add to library"}
+              onClick={() => onLibrary(meta)}
+            >
+              {inLibrary ? <Check size={20} /> : <Plus size={20} />}
             </button>
+            {/* Series are marked per episode from the list below, so the
+                title-level toggle is only meaningful for a movie. */}
+            {meta.type !== "series" && (
+              <button
+                className={movieWatched ? "icon-pill active" : "icon-pill"}
+                aria-pressed={movieWatched}
+                title={movieWatched ? "Mark as unwatched" : "Mark as watched"}
+                aria-label={movieWatched ? "Mark as unwatched" : "Mark as watched"}
+                onClick={() => onSetWatched(meta, undefined, !movieWatched)}
+              >
+                {movieWatched ? <EyeOff size={20} /> : <Eye size={20} />}
+              </button>
+            )}
           </div>
           {busy && <small>Loading metadata…</small>}
         </div>

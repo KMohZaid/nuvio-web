@@ -2769,3 +2769,41 @@ body.is-locked {
 .continue-row.is-dragging img {
   pointer-events: none;
 }
+
+/* ---- Detail action glyphs ---------------------------------------------- */
+/* Library and watched are single-purpose toggles, so they read better as
+   circular glyphs beside the Play pill than as labelled buttons. */
+.icon-pill {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 1px solid #343b43;
+  border-radius: 50%;
+  background: #20252b;
+  color: #e4e9ee;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s, color 0.14s;
+}
+.icon-pill:hover {
+  border-color: #4c5661;
+  background: #272d34;
+}
+.icon-pill.active {
+  border-color: #d8dde2;
+  background: #eef2f5;
+  color: #0b0f12;
+}
+/* Without this the active glyph turns white-on-white on hover. */
+.icon-pill.active:hover {
+  background: #fff;
+  color: #0b0f12;
+}
+@media (max-width: 760px) {
+  .icon-pill {
+    width: 44px;
+    height: 44px;
+  }
+}
