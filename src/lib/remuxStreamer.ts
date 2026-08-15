@@ -71,7 +71,11 @@ export class RemuxStreamer {
       this.resolvedUrl = head.url || this.url;
       const range = head.headers.get("content-range");
       const total = range?.split("/")?.[1];
-      this.totalBytes = total && total !== "*" ? Number(total) : null;
+      const parsed = total && total !== "*" ? Number(total) : NaN;
+      // A bad or absent total is worse than none: it ends the stream early.
+      // Treat anything implausible as unknown and let the reads decide.
+      this.totalBytes =
+        Number.isFinite(parsed) && parsed > CHUNK_BYTES ? parsed : null;
       await head.body?.cancel().catch(() => undefined);
     } catch (error) {
       this.onStatus({
@@ -188,7 +192,7 @@ export class RemuxStreamer {
       );
       this.onStatus({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
-        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
+        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} of ${this.totalBytes ? (this.totalBytes / 1024 / 1024 / 1024).toFixed(2) + " GB" : "unknown"} · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
       });
@@ -204,7 +208,10 @@ export class RemuxStreamer {
     { bytes: Uint8Array } | { done: true; reason: string }
   > {
     if (this.totalBytes != null && this.nextByte >= this.totalBytes)
-      return { done: true, reason: "Reached the end of the file." };
+      return {
+        done: true,
+        reason: `Reached the end of the file (${this.nextByte} of ${this.totalBytes} bytes).`,
+      };
     this.fetching = true;
     try {
       const end = this.nextByte + CHUNK_BYTES - 1;
@@ -217,10 +224,37 @@ export class RemuxStreamer {
           done: true,
           reason: `Host refused a range at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB (HTTP ${response.status}). The link may have expired or be rate limited.`,
         };
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength === 0)
+      // Capped read, not arrayBuffer(): a host that ignores the range answers
+      // with the whole file, and buffering that is an out-of-memory kill.
+      const reader = response.body?.getReader();
+      if (!reader)
+        return { done: true, reason: "No readable stream from the host." };
+      const parts: Uint8Array[] = [];
+      let read = 0;
+      while (read < CHUNK_BYTES) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        parts.push(value);
+        read += value.byteLength;
+      }
+      await reader.cancel().catch(() => undefined);
+      if (read === 0)
         return { done: true, reason: "Host returned an empty range." };
+      const bytes = new Uint8Array(Math.min(read, CHUNK_BYTES));
+      let offset = 0;
+      for (const part of parts) {
+        if (offset >= bytes.byteLength) break;
+        bytes.set(part.subarray(0, bytes.byteLength - offset), offset);
+        offset += part.byteLength;
+      }
+      // Advance by what was kept, not by what arrived: a 200 response would
+      // otherwise skip the byte counter past the end of the file in one go.
       this.nextByte += bytes.byteLength;
+      if (response.status !== 206 && this.nextByte > bytes.byteLength)
+        return {
+          done: true,
+          reason: `Host stopped honouring ranges at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB (HTTP ${response.status}).`,
+        };
       return { bytes };
     } catch (error) {
       return {
