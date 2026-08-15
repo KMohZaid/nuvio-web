@@ -240,31 +240,45 @@ export function App() {
     if (!profile) return;
     setLoading(true);
     try {
-      const [
-        rows,
-        nextLibrary,
-        nextProgress,
-        nextWatched,
-        blob,
-        nextCollections,
-        nextLayout,
-      ] = await Promise.all([
-          loadAddons(profile.profileIndex),
-          loadLibrary(profile.profileIndex),
-          // Snapshot once, then deltas — see lib/watchSync.
-          syncProgress(profile.profileIndex),
-          syncWatched(profile.profileIndex).catch(() => []),
-          // Neither of these may block the catalogs.
-          loadSettingsBlob(profile.profileIndex).catch(() => null),
-          loadCollections(profile.profileIndex).catch(() => []),
-          loadHomeLayout(profile.profileIndex).catch(() => null),
-        ]);
+      const profileIndex = profile.profileIndex;
+
+      // Everything the catalogs do not depend on runs on its own and lands
+      // when it lands. Gathering all seven into one Promise.all meant the
+      // slowest request — usually the watched history — held up the rows.
+      const libraryTask = loadLibrary(profileIndex)
+        .then((items) => {
+          setLibrary(items);
+          return items;
+        })
+        .catch(() => [] as LibraryItem[]);
+      // Snapshot once, then deltas — see lib/watchSync.
+      const progressTask = syncProgress(profileIndex)
+        .then((rows) => {
+          setProgress(rows);
+          return rows;
+        })
+        .catch(() => [] as ProgressRow[]);
+      const watchedTask = syncWatched(profileIndex)
+        .then((items) => {
+          setWatchedItems(items);
+          return items;
+        })
+        .catch(() => [] as WatchedItem[]);
+      void loadSettingsBlob(profileIndex)
+        .then((blob) => blob && setSettingsBlob(blob))
+        .catch(() => undefined);
+      void loadCollections(profileIndex)
+        .then(setCollections)
+        .catch(() => undefined);
+
+      // The critical path: addons and the layout that orders them. The layout
+      // is one small request and decides which catalogs are fetched at all, so
+      // it is worth waiting for rather than reordering afterwards.
+      const [rows, nextLayout] = await Promise.all([
+        loadAddons(profileIndex),
+        loadHomeLayout(profileIndex).catch(() => null),
+      ]);
       setAddonRows(rows);
-      setLibrary(nextLibrary);
-      setProgress(nextProgress);
-      setWatchedItems(nextWatched);
-      if (blob) setSettingsBlob(blob);
-      setCollections(nextCollections);
       setHomeLayout(nextLayout);
       const installed = await loadInstalledAddons(rows);
       setAddons(installed);
@@ -276,14 +290,21 @@ export function App() {
         (section) => {
           setSections((current) => [...current, section]);
           // The first row on screen is the end of "loading". Everything after
-          // this — the rest of the catalogs, and the Continue Watching
-          // metadata — fills in behind a page you can already use.
+          // this fills in behind a page you can already use.
           setLoading(false);
         },
         nextLayout,
       );
       // No catalog returned anything, so nothing will clear it above.
       setLoading(false);
+
+      // Continue Watching needs all three, so it resolves last — by which
+      // point the catalogs are already on screen.
+      const [nextLibrary, nextProgress, nextWatched] = await Promise.all([
+        libraryTask,
+        progressTask,
+        watchedTask,
+      ]);
       const known = new Map<string, Meta>();
       for (const item of [
         ...home.sections.flatMap((section) => section.items),
