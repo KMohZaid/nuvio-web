@@ -61,6 +61,9 @@ export class RemuxStreamer {
   private resolvedUrl = "";
   private stopped = false;
   private fetching = false;
+  /** Bytes read while the buffer failed to grow, which means something is wrong. */
+  private bytesSinceProgress = 0;
+  private lastBufferedEnd = 0;
   /** Bytes appended and seconds they represent, for the bitrate estimate. */
   private appendedBytes = 0;
   private appendedSeconds = 0;
@@ -188,7 +191,13 @@ export class RemuxStreamer {
   private async pump0() {
     while (!this.stopped) {
       const ahead = this.bufferedAhead();
-      if (ahead > this.targetAhead() || this.fetching) {
+      // Resident bytes throttle independently of the time measure. If the
+      // playhead sits outside every buffered range, bufferedAhead reports zero
+      // and the time check never holds it back — which is how a stalled
+      // player ends up downloading hundreds of megabytes until the host
+      // refuses to serve any more.
+      const overBudget = this.appendedBytes > BUFFER_BUDGET_BYTES;
+      if (ahead > this.targetAhead() || overBudget || this.fetching) {
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         this.evict();
         this.onStatus({
@@ -215,6 +224,26 @@ export class RemuxStreamer {
       }
       this.absorb(this.demuxer.push(chunk.bytes));
       this.flush(false);
+
+      // Reading without the buffer advancing means the data is being fetched
+      // and discarded — a parse that produces no frames, or appends that never
+      // land. Downloading forever hides that, so it is called out.
+      const end = this.bufferedEnd();
+      if (end > this.lastBufferedEnd + 0.1) {
+        this.lastBufferedEnd = end;
+        this.bytesSinceProgress = 0;
+      } else {
+        this.bytesSinceProgress += chunk.bytes.byteLength;
+        if (this.bytesSinceProgress > 48 * 1024 * 1024) {
+          this.onStatus({
+            state: "error",
+            message: `Read 48 MB without the buffer advancing — segments are not landing. Buffered end stuck at ${end.toFixed(1)}s.`,
+            ranges: this.describeRanges(),
+            fetchedBytes: this.nextByte,
+          });
+          return;
+        }
+      }
       const held = [...this.pending.values()].reduce(
         (sum, frames) => sum + frames.length,
         0,
@@ -494,6 +523,12 @@ export class RemuxStreamer {
     return `${parts.join(", ")} @ ${this.element.currentTime.toFixed(1)}`;
   }
 
+  private bufferedEnd() {
+    const buffer = this.buffer;
+    if (!buffer?.buffered.length) return 0;
+    return buffer.buffered.end(buffer.buffered.length - 1);
+  }
+
   private bufferedAhead() {
     const buffer = this.buffer;
     if (!buffer?.buffered.length) return 0;
@@ -501,7 +536,11 @@ export class RemuxStreamer {
     for (let index = 0; index < buffer.buffered.length; index += 1)
       if (time >= buffer.buffered.start(index) - 0.5 && time <= buffer.buffered.end(index))
         return buffer.buffered.end(index) - time;
-    return 0;
+    // Outside every range — before the first, or in a gap. Report what is
+    // ready beyond the playhead so the loop still throttles rather than
+    // treating it as an empty buffer.
+    const end = this.bufferedEnd();
+    return Math.max(0, end - time);
   }
 
   private evict(aggressive = false) {
