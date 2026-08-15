@@ -554,6 +554,9 @@ a {
   position: fixed;
   z-index: 10;
   inset: 0;
+  /* The backdrop is not a scroller, so a wheel over it would otherwise reach
+     the detail view underneath. */
+  overscroll-behavior: contain;
   background: #000a;
   display: flex;
   align-items: flex-end;
@@ -562,7 +565,10 @@ a {
 .source-sheet {
   width: min(980px, 100%);
   max-height: 90vh;
-  overflow: auto;
+  overflow-y: auto;
+  /* Without this, reaching the end of the source list hands the scroll to the
+     detail page behind it. */
+  overscroll-behavior: contain;
   background: #111417;
   border: 1px solid #30363d;
   border-radius: 24px 24px 0 0;
@@ -2806,4 +2812,10 @@ body.is-locked {
     width: 44px;
     height: 44px;
   }
+}
+
+/* The detail view is its own scroller, so body-level locking does not reach
+   it — it has to be frozen directly while a sheet is open. */
+.detail-view.has-sheet {
+  overflow: hidden;
 }

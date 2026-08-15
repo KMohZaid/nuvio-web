@@ -91,7 +91,10 @@ export function Details({
     }
   }
   return (
-    <div className="detail-view" ref={swipeRef}>
+    <div
+      className={sourceOpen ? "detail-view has-sheet" : "detail-view"}
+      ref={swipeRef}
+    >
       <button className="circle-button back" onClick={onClose}>
         <ArrowLeft />
       </button>
