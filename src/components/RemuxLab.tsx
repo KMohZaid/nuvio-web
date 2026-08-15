@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   mediaSourceSupport,
   planRemux,
@@ -7,6 +7,7 @@ import {
   type ProbeResult,
 } from "../lib/matroska";
 import { scanBlocks, type BlockScan } from "../lib/matroskaBlocks";
+import { buildSegments, describeTrack } from "../lib/remux";
 
 /**
  * Step one of the remux spike: can this device read a real debrid file and
@@ -53,6 +54,82 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
   const [elapsed, setElapsed] = useState(0);
   const [scan, setScan] = useState<BlockScan | null>(null);
   const [copied, setCopied] = useState(false);
+  const [playState, setPlayState] = useState("");
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  /**
+   * Feeds one remuxed fragment to the video element.
+   *
+   * MSE reports configuration problems by rejecting the append rather than by
+   * playing badly, so a failure here is specific and worth surfacing verbatim.
+   */
+  const attempt = async () => {
+    if (!result || !scan) return;
+    setPlayState("Preparing…");
+    const video = scan.tracks.find((track) => track.kind === "video");
+    if (!video) {
+      setPlayState("No video track in this range.");
+      return;
+    }
+    const meta = result.tracks.find((track) => track.kind === "video");
+    const described = describeTrack(video, meta?.width, meta?.height);
+    if ("reason" in described) {
+      setPlayState(described.reason);
+      return;
+    }
+
+    const { init, media, sampleCount } = buildSegments(
+      scan,
+      result.buffer,
+      described,
+    );
+    const codec =
+      described.sampleEntry === "av01"
+        ? "av01.0.08M.10"
+        : described.sampleEntry === "hvc1"
+          ? "hvc1.1.6.L93.B0"
+          : "avc1.640028";
+    const mime = `video/mp4; codecs="${codec}"`;
+    const Source =
+      (window as unknown as { ManagedMediaSource?: typeof MediaSource })
+        .ManagedMediaSource ?? window.MediaSource;
+    if (!Source?.isTypeSupported(mime)) {
+      setPlayState(`This browser rejects ${mime}.`);
+      return;
+    }
+
+    const source = new Source();
+    const element = videoRef.current;
+    if (!element) return;
+    // ManagedMediaSource needs the element to advertise it wants the data.
+    element.disableRemotePlayback = true;
+    element.src = URL.createObjectURL(source as unknown as MediaSource);
+    source.addEventListener("sourceopen", () => {
+      try {
+        const buffer = (source as MediaSource).addSourceBuffer(mime);
+        buffer.addEventListener("error", () =>
+          setPlayState("SourceBuffer rejected the media segment."),
+        );
+        buffer.addEventListener("updateend", () => {
+          if ((source as MediaSource).readyState === "open" && buffer.buffered.length)
+            setPlayState(
+              `Buffered ${buffer.buffered.end(0).toFixed(2)}s from ${sampleCount} samples — press play.`,
+            );
+        });
+        buffer.appendBuffer(init as unknown as BufferSource);
+        buffer.addEventListener(
+          "updateend",
+          () => buffer.appendBuffer(media as unknown as BufferSource),
+          { once: true },
+        );
+      } catch (error) {
+        setPlayState(
+          error instanceof Error ? error.message : "Could not open a buffer.",
+        );
+      }
+    });
+    setPlayState(`Appending ${sampleCount} samples as ${codec}…`);
+  };
 
   /**
    * A plain-text summary to paste somewhere. The URL is reduced to its host on
@@ -188,6 +265,25 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
       </form>
 
       {error && <div className="notice error">{error}</div>}
+
+      {scan && (
+        <div className="setting-card">
+          <header>
+            <h2>Playback attempt</h2>
+            <button className="secondary" onClick={() => void attempt()}>
+              Try remux
+            </button>
+          </header>
+          {playState && (
+            <div className="info-row">
+              <span>
+                <small>{playState}</small>
+              </span>
+            </div>
+          )}
+          <video ref={videoRef} className="remux-video" controls playsInline />
+        </div>
+      )}
 
       {result && !result.acceptsRanges && result.redirected && (
         <div className="notice">

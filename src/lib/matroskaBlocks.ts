@@ -43,6 +43,8 @@ export type Frame = {
   timeMs: number;
   keyframe: boolean;
   size: number;
+  /** Where the payload starts in the scanned buffer, for the muxer to slice. */
+  offset: number;
 };
 
 export type BlockScan = {
@@ -280,6 +282,7 @@ export function scanBlocks(buffer: Uint8Array, frameLimit = 20_000): BlockScan {
     const header = readBlockHeader(view, start);
     if (!header || header.headerEnd > end) return;
     scan.frames.push({
+      offset: header.headerEnd,
       track: header.track,
       timeMs:
         ((clusterBase + header.relative) * scan.timestampScaleNs) / 1_000_000,

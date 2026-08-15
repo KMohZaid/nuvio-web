@@ -2962,3 +2962,11 @@ body.is-locked {
   border-color: #2f7d55;
   background: #14201a;
 }
+
+.remux-video {
+  width: 100%;
+  margin-top: 14px;
+  border-radius: 12px;
+  background: #000;
+  aspect-ratio: 16/9;
+}
