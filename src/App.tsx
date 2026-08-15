@@ -33,6 +33,7 @@ import { Player } from "./components/Player";
 import { ProfileSwitcher } from "./components/ProfileSwitcher";
 import {
   blobBoolean,
+  blobRawBoolean,
   loadAddons,
   loadAvatarCatalog,
   loadLibrary,
@@ -46,6 +47,7 @@ import {
   loadSettingsBlob,
   loadWatchedItems,
   pushBlobBoolean,
+  pushBlobRawBoolean,
   pushProgress,
   isComplete,
   restoreSession,
@@ -75,6 +77,7 @@ import {
   isDesktop,
   launchExternalPlayer,
 } from "./lib/externalPlayer";
+import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
   buildContinueWatching,
   buildWatchIndex,
@@ -248,8 +251,9 @@ export function App() {
       ] = await Promise.all([
           loadAddons(profile.profileIndex),
           loadLibrary(profile.profileIndex),
-          loadProgress(profile.profileIndex),
-          loadWatchedItems(profile.profileIndex).catch(() => []),
+          // Snapshot once, then deltas — see lib/watchSync.
+          syncProgress(profile.profileIndex),
+          syncWatched(profile.profileIndex).catch(() => []),
           // Neither of these may block the catalogs.
           loadSettingsBlob(profile.profileIndex).catch(() => null),
           loadCollections(profile.profileIndex).catch(() => []),
@@ -364,6 +368,34 @@ export function App() {
     ]);
   }
   const amoled = blobBoolean(settingsBlob, "theme_settings", "amoled_enabled", false);
+  const releaseAlerts = blobRawBoolean(
+    settingsBlob,
+    "notifications_settings",
+    "episode_release_alerts_enabled",
+    false,
+  );
+
+  /** Raw boolean, not the typed wrapper — see pushBlobRawBoolean. */
+  async function updateReleaseAlerts(next: boolean) {
+    if (!profile || !settingsBlob) return;
+    const previous = settingsBlob;
+    try {
+      setSettingsBlob(
+        await pushBlobRawBoolean(
+          profile.profileIndex,
+          previous,
+          "notifications_settings",
+          "episode_release_alerts_enabled",
+          next,
+        ),
+      );
+    } catch (error) {
+      setSettingsBlob(previous);
+      setMessage(
+        error instanceof Error ? error.message : "Could not save notifications",
+      );
+    }
+  }
   useEffect(() => {
     document.documentElement.dataset.theme = amoled ? "amoled" : "default";
     localStorage.setItem(AMOLED_CACHE_KEY, String(amoled));
@@ -795,6 +827,8 @@ export function App() {
             session={session}
             profile={profile}
             amoled={amoled}
+            releaseAlerts={releaseAlerts}
+            onReleaseAlerts={updateReleaseAlerts}
             amoledReady={settingsBlob != null}
             onAmoled={updateAmoled}
             externalPlayer={externalPlayer}
@@ -1282,6 +1316,8 @@ function SettingsPage({
   amoled,
   amoledReady,
   onAmoled,
+  releaseAlerts,
+  onReleaseAlerts,
   externalPlayer,
   onExternalPlayer,
   onSignOut,
@@ -1292,6 +1328,8 @@ function SettingsPage({
   amoled: boolean;
   amoledReady: boolean;
   onAmoled(next: boolean): void;
+  releaseAlerts: boolean;
+  onReleaseAlerts(next: boolean): void;
   externalPlayer: ExternalPlayerMode;
   onExternalPlayer(mode: ExternalPlayerMode): void;
   onSignOut(): void;
@@ -1330,6 +1368,29 @@ function SettingsPage({
               checked={amoled}
               disabled={!amoledReady}
               onChange={(event) => onAmoled(event.target.checked)}
+            />
+            <i />
+          </label>
+        </div>
+      </div>
+      <div className="setting-card">
+        <header>
+          <h2>Notifications</h2>
+        </header>
+        <div className="theme-row">
+          <span>
+            <strong>Episode release alerts</strong>
+            <small>
+              Tells Nuvio to alert you when a new episode of a followed series
+              is released. Synced with your profile.
+            </small>
+          </span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={releaseAlerts}
+              disabled={!amoledReady}
+              onChange={(event) => onReleaseAlerts(event.target.checked)}
             />
             <i />
           </label>

@@ -446,6 +446,45 @@ export async function pushBlobBoolean(
   return next;
 }
 
+/**
+ * Episode release alerts are stored as a **raw** boolean, not the typed
+ * `{type,value}` wrapper every other setting uses — Nuvio decodes
+ * `notifications_settings` into a plain payload struct. Writing it typed would
+ * make the other clients read it as false.
+ */
+export function blobRawBoolean(
+  blob: SettingsBlob | null,
+  feature: string,
+  key: string,
+  fallback: boolean,
+): boolean {
+  const value = (blob?.features?.[feature] as Record<string, unknown> | undefined)?.[key];
+  return typeof value === "boolean" ? value : fallback;
+}
+
+export async function pushBlobRawBoolean(
+  profileIndex: number,
+  blob: SettingsBlob,
+  feature: string,
+  key: string,
+  value: boolean,
+): Promise<SettingsBlob> {
+  const next: SettingsBlob = {
+    version: blob.version ?? 3,
+    features: {
+      ...blob.features,
+      [feature]: { ...(blob.features?.[feature] ?? {}), [key]: value },
+    },
+  } as SettingsBlob;
+  await rpc("sync_push_profile_settings_blob", {
+    p_profile_id: profileIndex,
+    p_platform: settingsPlatform(),
+    p_settings_json: next,
+    p_origin_client_id: CLIENT_ID,
+  });
+  return next;
+}
+
 /** Identifies one watchable thing: a movie, or one episode of a series. */
 export type WatchIdentity = {
   contentId: string;
@@ -812,4 +851,124 @@ export async function loadHomeLayout(
     };
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Delta sync
+//
+// Pulling every progress and watched row on each load does not scale with a
+// long history. The backend keeps an append-only event log per table, so a
+// client snapshots once and then asks only for what changed.
+//
+// The ordering below is load-bearing and mirrors Nuvio's own client: read the
+// cursor BEFORE taking the snapshot. A write landing mid-snapshot is then
+// replayed as a delta rather than lost between the two calls.
+// ---------------------------------------------------------------------------
+
+const DELTA_PAGE_SIZE = 900;
+
+export type DeltaOperation = "upsert" | "delete";
+
+async function deltaCursor(rpcName: string, profileIndex: number) {
+  const value = await rpc<number | null>(rpcName, { p_profile_id: profileIndex });
+  return typeof value === "number" ? value : null;
+}
+
+/**
+ * Walks the event log from `since`, applying each page via `apply`.
+ * Returns the new cursor. A short page means the log is caught up.
+ */
+async function drainDelta(
+  rpcName: string,
+  profileIndex: number,
+  since: number,
+  apply: (events: Array<Record<string, unknown>>) => void,
+): Promise<number> {
+  let cursor = since;
+  for (;;) {
+    const events = await rpc<Array<Record<string, unknown>>>(rpcName, {
+      p_profile_id: profileIndex,
+      p_since_event_id: cursor,
+      p_limit: DELTA_PAGE_SIZE,
+    });
+    if (!events?.length) break;
+    apply(events);
+    cursor = events.reduce(
+      (highest, event) => Math.max(highest, Number(event.event_id ?? 0)),
+      cursor,
+    );
+    if (events.length < DELTA_PAGE_SIZE) break;
+  }
+  return cursor;
+}
+
+export const progressDeltaCursor = (profileIndex: number) =>
+  deltaCursor("sync_get_watch_progress_delta_cursor", profileIndex);
+export const watchedDeltaCursor = (profileIndex: number) =>
+  deltaCursor("sync_get_watched_items_delta_cursor", profileIndex);
+
+/** Applies progress events onto a snapshot, keyed the way the server keys them. */
+export async function pullProgressDelta(
+  profileIndex: number,
+  since: number,
+  rows: ProgressRow[],
+): Promise<{ rows: ProgressRow[]; cursor: number }> {
+  const byKey = new Map(rows.map((row) => [row.progressKey ?? "", row]));
+  const cursor = await drainDelta(
+    "sync_pull_watch_progress_delta",
+    profileIndex,
+    since,
+    (events) => {
+      for (const event of events) {
+        const key = String(event.progress_key ?? "");
+        if (String(event.operation ?? "").toLowerCase() === "delete") {
+          byKey.delete(key);
+          continue;
+        }
+        byKey.set(key, {
+          contentId: String(event.content_id ?? ""),
+          contentType: String(event.content_type ?? ""),
+          videoId: String(event.video_id ?? ""),
+          season: event.season == null ? undefined : Number(event.season),
+          episode: event.episode == null ? undefined : Number(event.episode),
+          positionMs: Number(event.position ?? 0),
+          durationMs: Number(event.duration ?? 0),
+          lastWatched: Number(event.last_watched ?? 0),
+          progressKey: key,
+        });
+      }
+    },
+  );
+  return { rows: [...byKey.values()].filter((row) => row.contentId), cursor };
+}
+
+export async function pullWatchedDelta(
+  profileIndex: number,
+  since: number,
+  items: WatchedItem[],
+): Promise<{ items: WatchedItem[]; cursor: number }> {
+  const key = (item: { contentId: string; season?: number; episode?: number }) =>
+    `${item.contentId}:${item.season ?? ""}:${item.episode ?? ""}`;
+  const byKey = new Map(items.map((item) => [key(item), item]));
+  const cursor = await drainDelta(
+    "sync_pull_watched_items_delta",
+    profileIndex,
+    since,
+    (events) => {
+      for (const event of events) {
+        const entry: WatchedItem = {
+          contentId: String(event.content_id ?? ""),
+          contentType: String(event.content_type ?? ""),
+          title: String(event.title ?? ""),
+          season: event.season == null ? undefined : Number(event.season),
+          episode: event.episode == null ? undefined : Number(event.episode),
+          watchedAt: Number(event.watched_at ?? 0),
+        };
+        if (String(event.operation ?? "").toLowerCase() === "delete")
+          byKey.delete(key(entry));
+        else byKey.set(key(entry), entry);
+      }
+    },
+  );
+  return { items: [...byKey.values()].filter((item) => item.contentId), cursor };
 }
