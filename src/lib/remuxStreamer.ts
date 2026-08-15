@@ -22,10 +22,20 @@ import type { TrackHeader } from "./matroskaBlocks";
 const CHUNK_BYTES = 8 * 1024 * 1024;
 /** A refused range is usually transient: back off and try again. */
 const FETCH_ATTEMPTS = 3;
-/** How far ahead of the playhead to stay. */
-const TARGET_AHEAD_SECONDS = 30;
+/**
+ * Buffer targets are in bytes, not seconds.
+ *
+ * Thirty seconds means something completely different at 4 Mbps and at 60:
+ * for a 4K stream it is roughly 200 MB resident in the SourceBuffer, which is
+ * far past what iOS allows and shows up as unrelated-looking network failures
+ * once the tab is under memory pressure. So the time target is derived from an
+ * observed bitrate against a byte budget.
+ */
+const BUFFER_BUDGET_BYTES = 40 * 1024 * 1024;
+const MAX_AHEAD_SECONDS = 30;
+const MIN_AHEAD_SECONDS = 6;
 /** How much history to keep before evicting; MSE throws when the quota goes. */
-const KEEP_BEHIND_SECONDS = 20;
+const KEEP_BEHIND_SECONDS = 10;
 /** Frames are batched into fragments of about this length. */
 const FRAGMENT_SECONDS = 2;
 
@@ -51,6 +61,9 @@ export class RemuxStreamer {
   private resolvedUrl = "";
   private stopped = false;
   private fetching = false;
+  /** Bytes appended and seconds they represent, for the bitrate estimate. */
+  private appendedBytes = 0;
+  private appendedSeconds = 0;
 
   constructor(
     private readonly url: string,
@@ -175,12 +188,12 @@ export class RemuxStreamer {
   private async pump0() {
     while (!this.stopped) {
       const ahead = this.bufferedAhead();
-      if (ahead > TARGET_AHEAD_SECONDS || this.fetching) {
+      if (ahead > this.targetAhead() || this.fetching) {
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         this.evict();
         this.onStatus({
           state: "ready",
-          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · readyState ${this.element.readyState}`,
+          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB · readyState ${this.element.readyState}`,
           bufferedSeconds: ahead,
           fetchedBytes: this.nextByte,
           ranges: this.describeRanges(),
@@ -208,7 +221,7 @@ export class RemuxStreamer {
       );
       this.onStatus({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
-        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} of ${this.totalBytes ? (this.totalBytes / 1024 / 1024 / 1024).toFixed(2) + " GB" : "unknown"} · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
+        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
         ranges: this.describeRanges(),
@@ -413,14 +426,19 @@ export class RemuxStreamer {
           keyframe: frame.keyframe,
         };
       });
-      this.enqueue(
-        buildMediaSegment(
-          this.sequence++,
-          trackNumber,
-          Math.round(usable[0]!.timeMs),
-          samples,
-        ),
+      const segment = buildMediaSegment(
+        this.sequence++,
+        trackNumber,
+        Math.round(usable[0]!.timeMs),
+        samples,
       );
+      // Only the video track is measured: audio is a rounding error next to it
+      // and counting both would double-count the same wall-clock seconds.
+      if (track.kind === "video") {
+        this.appendedBytes += segment.byteLength;
+        this.appendedSeconds += span / 1000;
+      }
+      this.enqueue(segment);
       this.pending.set(trackNumber, final ? [] : frames.slice(usable.length));
     }
   }
@@ -452,6 +470,18 @@ export class RemuxStreamer {
     }
   }
 
+  /**
+   * How many seconds to stay ahead, given how heavy this file turns out to be.
+   * Falls back to the maximum until enough has been appended to judge.
+   */
+  private targetAhead() {
+    if (this.appendedSeconds < 2 || this.appendedBytes === 0)
+      return MAX_AHEAD_SECONDS;
+    const bytesPerSecond = this.appendedBytes / this.appendedSeconds;
+    const affordable = BUFFER_BUDGET_BYTES / bytesPerSecond;
+    return Math.max(MIN_AHEAD_SECONDS, Math.min(MAX_AHEAD_SECONDS, affordable));
+  }
+
   /** Human-readable buffered ranges, with the playhead marked. */
   private describeRanges() {
     const buffer = this.buffer;
@@ -477,11 +507,18 @@ export class RemuxStreamer {
   private evict(aggressive = false) {
     const buffer = this.buffer;
     if (!buffer || buffer.updating || !buffer.buffered.length) return;
-    const keep = aggressive ? 5 : KEEP_BEHIND_SECONDS;
+    const keep = aggressive ? 2 : KEEP_BEHIND_SECONDS;
     const cutoff = this.element.currentTime - keep;
-    if (cutoff <= buffer.buffered.start(0)) return;
+    if (cutoff <= buffer.buffered.start(0) + 0.1) return;
     try {
       buffer.remove(buffer.buffered.start(0), cutoff);
+      // The estimate tracks what is resident, so removal has to reduce it.
+      const removed = cutoff - buffer.buffered.start(0);
+      const rate = this.appendedSeconds
+        ? this.appendedBytes / this.appendedSeconds
+        : 0;
+      this.appendedBytes = Math.max(0, this.appendedBytes - removed * rate);
+      this.appendedSeconds = Math.max(0, this.appendedSeconds - removed);
     } catch {
       // Removal is best effort; the next pass will try again.
     }
