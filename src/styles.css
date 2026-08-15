@@ -466,8 +466,14 @@ a {
 }
 .episodes header {
   display: flex;
-  justify-content: space-between;
+  /* The picker sits next to the title rather than being flung to the far edge
+     of a full-width row. */
+  justify-content: flex-start;
   align-items: end;
+  gap: 24px;
+}
+.episodes header select {
+  margin-bottom: 18px;
 }
 .episodes h2,
 .cast h2 {
@@ -2001,6 +2007,13 @@ body,
 .episode-row {
   -webkit-touch-callout: none;
   user-select: none;
+}
+/* A grid item defaults to min-width: auto, so the 1fr text column grew to fit
+   the un-wrapped overview instead of clamping it — the ellipsis never engaged
+   and the row pushed the page into a horizontal scroll. */
+.episode-row > span:not(.episode-thumb) {
+  min-width: 0;
+  overflow: hidden;
 }
 
 /* ---- Context menu ----------------------------------------------------- */
