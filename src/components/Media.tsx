@@ -1,6 +1,7 @@
 import { Check, Play } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { watchKey, type WatchIndex } from "../lib/progress";
+import { useDragScroll } from "../lib/useDragScroll";
 import type { CatalogSection, Meta } from "../types";
 
 /**
@@ -69,6 +70,7 @@ export function MediaRow({
   onOpen(item: Meta): void;
   onSeeAll(): void;
 }) {
+  const rowRef = useDragScroll<HTMLDivElement>();
   return (
     <section className="media-section">
       <header>
@@ -78,7 +80,7 @@ export function MediaRow({
         </div>
         <button onClick={onSeeAll}>See all</button>
       </header>
-      <div className="media-row">
+      <div className="media-row" ref={rowRef}>
         {section.items.map((item) => (
           <PosterCard
             key={`${item.type}:${item.id}`}

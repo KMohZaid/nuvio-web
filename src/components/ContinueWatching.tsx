@@ -1,5 +1,6 @@
 import type { ContinueCard } from "../lib/progress";
 import { progressPercent, remainingLabel } from "../lib/progress";
+import { useDragScroll } from "../lib/useDragScroll";
 
 export function ContinueWatching({
   cards,
@@ -8,6 +9,7 @@ export function ContinueWatching({
   cards: ContinueCard[];
   onOpen(item: ContinueCard["item"]): void;
 }) {
+  const rowRef = useDragScroll<HTMLDivElement>();
   return (
     <section className="media-section continue-section">
       <header>
@@ -16,7 +18,7 @@ export function ContinueWatching({
           <span>Synced from Nuvio</span>
         </div>
       </header>
-      <div className="continue-row">
+      <div className="continue-row" ref={rowRef}>
         {cards.map((card) => {
           const artwork =
             card.video?.thumbnail ||

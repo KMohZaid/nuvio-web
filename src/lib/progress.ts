@@ -105,7 +105,9 @@ export function buildContinueWatching(
     if (next)
       cards.push({ item, video: next, nextUp: true, lastWatched: seed.at });
   }
-  return cards.sort((a, b) => b.lastWatched - a.lastWatched).slice(0, 20);
+  // Deliberately generous: the row scrolls, so a longer list costs nothing,
+  // and truncating it is what made titles look like they had gone missing.
+  return cards.sort((a, b) => b.lastWatched - a.lastWatched).slice(0, 40);
 }
 
 /** Stable identity for one episode (or a movie, with no season/episode). */

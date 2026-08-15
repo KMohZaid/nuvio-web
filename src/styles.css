@@ -2721,3 +2721,22 @@ body.is-locked {
     animation: none;
   }
 }
+
+/* ---- Drag-to-scroll rows ---------------------------------------------- */
+/* Desktop has no way to pan a horizontal row without a trackpad, so the
+   carousels are draggable. Touch already pans natively and is left alone. */
+.media-row,
+.continue-row {
+  cursor: grab;
+}
+.media-row.is-dragging,
+.continue-row.is-dragging {
+  cursor: grabbing;
+  /* Snap fights a drag, and text selection turns it into a highlight. */
+  scroll-snap-type: none;
+  user-select: none;
+}
+.media-row.is-dragging img,
+.continue-row.is-dragging img {
+  pointer-events: none;
+}

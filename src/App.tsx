@@ -298,28 +298,45 @@ export function App() {
       for (const item of identities)
         if (!unique.has(item.id))
           unique.set(item.id, { type: item.type, at: item.at });
-      const resolved = await Promise.all(
-        [...unique].slice(0, 20).map(async ([id, identity]) => {
-          const existing = known.get(id);
-          if (existing?.videos.length) return existing;
-          const seed: Meta = {
-            id,
-            type: identity.type,
-            name: watchedTitles.get(id) || existing?.name || "Recently watched",
-            genres: [],
-            cast: [],
-            director: [],
-            writer: [],
-            trailers: [],
-            externalRatings: [],
-            videos: [],
-            manifestUrl: existing?.manifestUrl || "",
-            addonName: existing?.addonName || "",
-          };
-          return resolveMeta(seed, installed).catch(() => existing ?? seed);
-        }),
-      );
-      setRecentMetadata(resolved);
+      // A title with no metadata is dropped from Continue Watching entirely,
+      // so this cap is really a cap on how much of the list is shown. Twenty
+      // was hiding rows for anyone with more in flight than that.
+      const RESOLVE_LIMIT = 60;
+      const RESOLVE_CONCURRENCY = 6;
+      const pending = [...unique].slice(0, RESOLVE_LIMIT);
+      const resolved: Meta[] = [];
+      // Batched rather than one Promise.all over the whole set: sixty parallel
+      // requests to a handful of addon hosts is how you get rate-limited.
+      for (let cursor = 0; cursor < pending.length; cursor += RESOLVE_CONCURRENCY) {
+        const batch = await Promise.all(
+          pending
+            .slice(cursor, cursor + RESOLVE_CONCURRENCY)
+            .map(async ([id, identity]) => {
+              const existing = known.get(id);
+              if (existing?.videos.length) return existing;
+              const seed: Meta = {
+                id,
+                type: identity.type,
+                name:
+                  watchedTitles.get(id) || existing?.name || "Recently watched",
+                genres: [],
+                cast: [],
+                director: [],
+                writer: [],
+                trailers: [],
+                externalRatings: [],
+                videos: [],
+                manifestUrl: existing?.manifestUrl || "",
+                addonName: existing?.addonName || "",
+              };
+              return resolveMeta(seed, installed).catch(() => existing ?? seed);
+            }),
+        );
+        resolved.push(...batch);
+        // Publish each batch so the row fills in rather than appearing whole
+        // at the end.
+        setRecentMetadata([...resolved]);
+      }
       if (home.errors.length)
         setMessage(
           `${home.errors.length} addon request${home.errors.length === 1 ? "" : "s"} could not load in this browser.`,

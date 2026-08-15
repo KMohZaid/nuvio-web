@@ -5,6 +5,7 @@ import {
   loadCollectionSources,
 } from "../lib/addons";
 import type { WatchIndex } from "../lib/progress";
+import { useDragScroll } from "../lib/useDragScroll";
 import { useProgressiveList } from "../lib/useProgressiveList";
 import type {
   Collection,
@@ -33,6 +34,7 @@ export function CollectionRow({
   collection: Collection;
   onOpenFolder(folder: CollectionFolder): void;
 }) {
+  const rowRef = useDragScroll<HTMLDivElement>();
   if (collection.folders.length === 0) return null;
   return (
     <section className="media-section">
@@ -42,7 +44,7 @@ export function CollectionRow({
           <span>Collection</span>
         </div>
       </header>
-      <div className="media-row folder-row">
+      <div className="media-row folder-row" ref={rowRef}>
         {collection.folders.map((folder) => (
           <button
             key={folder.id}
