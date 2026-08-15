@@ -167,6 +167,12 @@ export type ProbeResult = {
   acceptsRanges: boolean;
   totalBytes: number | null;
   tracks: MatroskaTrack[];
+  /** Set when the request was redirected — the usual reason Range is lost,
+   *  since debrid links bounce to a storage node that may not forward it. */
+  redirected: boolean;
+  finalUrl: string;
+  status: number;
+  acceptRangesHeader: string | null;
 };
 
 /**
@@ -225,6 +231,10 @@ export async function probeMatroska(
       acceptsRanges: response.status === 206,
       totalBytes: total && total !== "*" ? Number(total) : null,
       tracks: findTracks(view, 0, buffer.byteLength) ?? [],
+      redirected: response.redirected,
+      finalUrl: response.url,
+      status: response.status,
+      acceptRangesHeader: response.headers.get("accept-ranges"),
     };
   } finally {
     window.clearTimeout(timer);

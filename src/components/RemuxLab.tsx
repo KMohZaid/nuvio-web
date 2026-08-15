@@ -95,6 +95,25 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
 
       {error && <div className="notice error">{error}</div>}
 
+      {result && !result.acceptsRanges && result.redirected && (
+        <div className="notice">
+          <span>
+            The request was redirected and the range was lost on the way. Try
+            the resolved URL directly — if that returns 206, seeking works and
+            only the redirect needs following first.
+          </span>
+          <button
+            className="notice-action"
+            onClick={() => {
+              setUrl(result.finalUrl);
+              setResult(null);
+            }}
+          >
+            Use resolved URL
+          </button>
+        </div>
+      )}
+
       {result && (
         <div className="setting-card">
           <header>
@@ -108,7 +127,12 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
                   : "No 206 — the host ignored the range, read was capped"}
               </strong>
               <small>
-                Read {(result.bytesRead / 1024).toFixed(0)} KB
+                HTTP {result.status}
+                {result.acceptRangesHeader
+                  ? ` · accept-ranges: ${result.acceptRangesHeader}`
+                  : " · no accept-ranges header"}
+                {result.redirected ? " · redirected" : ""} · read{" "}
+                {(result.bytesRead / 1024).toFixed(0)} KB
                 {result.totalBytes
                   ? ` of ${(result.totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB`
                   : ""}{" "}
