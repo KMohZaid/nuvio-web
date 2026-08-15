@@ -189,13 +189,28 @@ export async function probeMatroska(
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), 20_000);
   try {
-    const response = await fetch(url, {
+    let response = await fetch(url, {
       headers: { Range: `bytes=0-${bytes - 1}` },
       signal: controller.signal,
       // The service worker has no business touching a multi-gigabyte media
       // request, and on iOS its handling of Range is not dependable.
       cache: "no-store",
     });
+    // A debrid link bounces to a storage node, and the Range header does not
+    // always survive the hop — the first request comes back 200 with the whole
+    // file. Retrying against the resolved URL gets a proper 206, so resolve
+    // once and stream from there.
+    if (response.status !== 206 && response.redirected) {
+      const resolved = await fetch(response.url, {
+        headers: { Range: `bytes=0-${bytes - 1}` },
+        signal: controller.signal,
+        cache: "no-store",
+      });
+      if (resolved.status === 206) {
+        await response.body?.cancel().catch(() => undefined);
+        response = resolved;
+      }
+    }
     if (!response.ok && response.status !== 206)
       throw new Error(`Server refused the range request (${response.status}).`);
 
