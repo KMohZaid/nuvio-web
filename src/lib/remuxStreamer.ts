@@ -38,6 +38,12 @@ const MIN_AHEAD_SECONDS = 6;
 const KEEP_BEHIND_SECONDS = 6;
 /** Frames are batched into fragments of about this length. */
 const FRAGMENT_SECONDS = 2;
+/**
+ * A video fragment is cut at a keyframe, so it can run longer than the target
+ * while waiting for one. Past this it is emitted regardless: a long GOP is
+ * worth a non-conforming fragment less than it is worth a stall.
+ */
+const MAX_FRAGMENT_SECONDS = 12;
 
 export type StreamerStatus = {
   state: "idle" | "starting" | "buffering" | "ready" | "ended" | "error";
@@ -70,6 +76,8 @@ export class RemuxStreamer {
   /** Last thing the element said about itself, so "won't play" has a reason. */
   private mediaNote = "";
   private triedPlay = false;
+  /** What was handed to the SourceBuffer most recently. */
+  private lastSegment = "";
 
   constructor(
     private readonly url: string,
@@ -173,7 +181,12 @@ export class RemuxStreamer {
       this.buffer = buffer;
       buffer.addEventListener("updateend", () => this.pump());
       buffer.addEventListener("error", () =>
-        this.onStatus({ state: "error", message: "SourceBuffer rejected a segment." }),
+        this.onStatus({
+          state: "error",
+          message: `SourceBuffer rejected a segment — ${this.lastSegment || "no segment recorded"} · element error ${this.element.error?.message || this.element.error?.code || "none"} · source ${this.source?.readyState ?? "none"}`,
+          ranges: this.describeRanges(),
+          fetchedBytes: this.nextByte,
+        }),
       );
       // Best effort: a rejected duration costs a seek bar, not playback.
       try {
@@ -507,9 +520,25 @@ export class RemuxStreamer {
     for (const [trackNumber, frames] of this.pending) {
       const track = this.muxTracks.get(trackNumber);
       if (!track || frames.length < 2) continue;
-      const usable = final ? frames : frames.slice(0, -1);
-      const span = usable.at(-1)!.timeMs - usable[0]!.timeMs;
+      let usable = final ? frames : frames.slice(0, -1);
+      let span = usable.at(-1)!.timeMs - usable[0]!.timeMs;
       if (!final && span < FRAGMENT_SECONDS * 1000) continue;
+
+      // Video fragments are cut at a keyframe so every one of them opens on a
+      // sync sample. Cutting mid-GOP leaves a fragment whose first sample
+      // depends on frames in the previous one, which Safari is entitled to
+      // reject outright — and which makes seeking impossible later regardless.
+      if (track.kind === "video" && !final) {
+        let cut = -1;
+        for (let index = usable.length - 1; index > 0; index -= 1)
+          if (usable[index]!.keyframe) {
+            cut = index;
+            break;
+          }
+        if (cut > 0) usable = usable.slice(0, cut);
+        else if (span < MAX_FRAGMENT_SECONDS * 1000) continue;
+        span = usable.at(-1)!.timeMs - usable[0]!.timeMs;
+      }
 
       const samples = usable.map((frame, index) => {
         const next = usable[index + 1] ?? frames[index + 1];
@@ -531,6 +560,9 @@ export class RemuxStreamer {
         Math.round(usable[0]!.timeMs),
         samples,
       );
+      // The SourceBuffer error event says nothing about what it rejected, so
+      // the last thing handed to it is worth remembering.
+      this.lastSegment = `track ${trackNumber} ${track.kind} · ${samples.length} samples · ${(usable[0]!.timeMs / 1000).toFixed(2)}-${(usable.at(-1)!.timeMs / 1000).toFixed(2)}s · ${usable[0]!.keyframe ? "opens on keyframe" : "MID-GOP"} · ${(segment.byteLength / 1024).toFixed(0)} KB`;
       // Only the video track is measured: audio is a rounding error next to it
       // and counting both would double-count the same wall-clock seconds.
       if (track.kind === "video") {
