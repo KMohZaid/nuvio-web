@@ -163,6 +163,8 @@ function findTracks(
 }
 
 export type ProbeResult = {
+  /** Kept so a block scan can run over the same bytes without refetching. */
+  buffer: Uint8Array;
   bytesRead: number;
   acceptsRanges: boolean;
   totalBytes: number | null;
@@ -242,6 +244,7 @@ export async function probeMatroska(
     const total = contentRange?.split("/")?.[1];
     const view = new DataView(buffer.buffer, 0, buffer.byteLength);
     return {
+      buffer,
       bytesRead: buffer.byteLength,
       acceptsRanges: response.status === 206,
       totalBytes: total && total !== "*" ? Number(total) : null,

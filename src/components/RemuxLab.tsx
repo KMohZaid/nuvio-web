@@ -6,6 +6,7 @@ import {
   verdictFor,
   type ProbeResult,
 } from "../lib/matroska";
+import { scanBlocks, type BlockScan } from "../lib/matroskaBlocks";
 
 /**
  * Step one of the remux spike: can this device read a real debrid file and
@@ -26,10 +27,14 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
     setBusy(true);
     setError("");
     setResult(null);
+    setScan(null);
     const started = performance.now();
     try {
       const probe = await probeMatroska(url.trim());
       setResult(probe);
+      // Same bytes, no second request: proves frames can be located, not just
+      // that the header parses.
+      setScan(scanBlocks(probe.buffer));
       if (probe.tracks.length === 0)
         setError(
           "No tracks found in the first 2 MB. The file may put Tracks behind a SeekHead, which needs a second range request to resolve.",
@@ -46,6 +51,7 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
     }
   };
   const [elapsed, setElapsed] = useState(0);
+  const [scan, setScan] = useState<BlockScan | null>(null);
 
   return (
     <section className="settings-page">
@@ -172,6 +178,30 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
               </div>
             );
           })()}
+          {scan && (
+            <div className="info-row">
+              <span>
+                <strong>
+                  {scan.frames.length} frames across {scan.clusters} cluster
+                  {scan.clusters === 1 ? "" : "s"}
+                </strong>
+                <small className={scan.frames.length ? "probe-ok" : "probe-blocked"}>
+                  {scan.frames.length === 0
+                    ? "No frames located — the demuxer cannot read this layout."
+                    : (() => {
+                        const keys = scan.frames.filter((frame) => frame.keyframe);
+                        const times = scan.frames.map((frame) => frame.timeMs);
+                        const span = Math.max(...times) - Math.min(...times);
+                        const config = scan.tracks.filter(
+                          (track) => track.codecPrivate?.length,
+                        ).length;
+                        return `${keys.length} keyframes · ${(span / 1000).toFixed(2)}s spanned · ${config} track${config === 1 ? "" : "s"} carry decoder config · scale ${scan.timestampScaleNs / 1000}µs`;
+                      })()}
+                  {scan.truncated ? " · buffer ended mid-element" : ""}
+                </small>
+              </span>
+            </div>
+          )}
           {result.tracks.map((track, index) => {
             const verdict = verdictFor(track);
             return (
