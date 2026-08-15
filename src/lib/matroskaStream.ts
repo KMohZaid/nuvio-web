@@ -33,6 +33,7 @@ const ID_CLUSTER_TIMESTAMP = 0xe7;
 const ID_SIMPLE_BLOCK = 0xa3;
 const ID_BLOCK_GROUP = 0xa0;
 const ID_BLOCK = 0xa1;
+const ID_REFERENCE_BLOCK = 0xfb;
 
 /** Descended into rather than buffered whole. */
 const CONTAINERS = new Set([ID_SEGMENT, ID_CLUSTER, ID_BLOCK_GROUP]);
@@ -66,6 +67,13 @@ export class MatroskaStream {
   private stack: Frame[] = [];
   private skipRemaining = 0;
   private clusterTimeMs = 0;
+  /**
+   * A Block inside a BlockGroup cannot be classified when it is read: it is a
+   * keyframe exactly when the group carries no ReferenceBlock, and that sibling
+   * arrives afterwards. So the frame waits for its group to close.
+   */
+  private groupFrame: StreamFrame | null = null;
+  private groupReferenced = false;
 
   timestampScaleNs = 1_000_000;
   durationSeconds: number | null = null;
@@ -134,9 +142,12 @@ export class MatroskaStream {
 
   private drain(frames: StreamFrame[]) {
     for (;;) {
-      // Close any container whose declared end has been reached.
-      while (this.stack.length && this.origin >= this.stack.at(-1)!.end)
-        this.stack.pop();
+      // Close any container whose declared end has been reached. A closing
+      // BlockGroup is where its Block finally becomes classifiable.
+      while (this.stack.length && this.origin >= this.stack.at(-1)!.end) {
+        const closed = this.stack.pop()!;
+        if (closed.id === ID_BLOCK_GROUP) this.closeGroup(frames);
+      }
 
       if (this.skipRemaining > 0) {
         const step = Math.min(this.skipRemaining, this.pending.byteLength);
@@ -157,6 +168,11 @@ export class MatroskaStream {
       if (CONTAINERS.has(id.value)) {
         this.stack.push({ id: id.value, end });
         if (id.value === ID_CLUSTER) this.clusterTimeMs = 0;
+        if (id.value === ID_BLOCK_GROUP) {
+          // A group left open by a malformed size must not leak into the next.
+          this.closeGroup(frames);
+          this.groupReferenced = false;
+        }
         this.consume(headerLength);
         continue;
       }
@@ -181,9 +197,20 @@ export class MatroskaStream {
       id === ID_CLUSTER_TIMESTAMP ||
       id === ID_SIMPLE_BLOCK ||
       id === ID_BLOCK ||
+      id === ID_REFERENCE_BLOCK ||
       id === ID_TIMESTAMP_SCALE ||
       id === ID_DURATION
     );
+  }
+
+  /** Emits the held Block, now that its group's ReferenceBlock is known. */
+  private closeGroup(frames: StreamFrame[]) {
+    const frame = this.groupFrame;
+    this.groupFrame = null;
+    if (!frame) return;
+    frame.keyframe = !this.groupReferenced;
+    this.groupReferenced = false;
+    frames.push(frame);
   }
 
   private handle(
@@ -225,9 +252,17 @@ export class MatroskaStream {
     } else if (id === ID_CLUSTER_TIMESTAMP) {
       this.clusterTimeMs =
         (readUint(view, body, size) * this.timestampScaleNs) / 1_000_000;
+    } else if (id === ID_REFERENCE_BLOCK) {
+      // Its presence is the whole signal: this group depends on another frame.
+      this.groupReferenced = true;
     } else if (id === ID_SIMPLE_BLOCK || id === ID_BLOCK) {
-      const frame = this.readBlock(body, body + size, id === ID_SIMPLE_BLOCK);
-      if (frame) frames.push(frame);
+      const simple = id === ID_SIMPLE_BLOCK;
+      const frame = this.readBlock(body, body + size, simple);
+      if (!frame) return;
+      // A SimpleBlock carries its own flag and can be emitted immediately; a
+      // Block has to wait for its group to close.
+      if (simple) frames.push(frame);
+      else this.groupFrame = frame;
     }
   }
 
@@ -309,8 +344,8 @@ export class MatroskaStream {
       track: track.value,
       timeMs:
         this.clusterTimeMs + (relative * this.timestampScaleNs) / 1_000_000,
-      // Only a SimpleBlock carries the flag; a Block is keyed by the absence of
-      // a ReferenceBlock, which is not read here, so it reports conservatively.
+      // A SimpleBlock says so directly. A Block is decided by its group, which
+      // overwrites this once the ReferenceBlock question is settled.
       keyframe: simple ? (flags & 0x80) !== 0 : false,
       // Copied: the pending buffer is trimmed as soon as this returns.
       data: this.pending.slice(headerEnd, end),

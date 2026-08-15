@@ -538,7 +538,9 @@ export class RemuxStreamer {
       const track = this.muxTracks.get(trackNumber);
       if (!track || frames.length < 2) continue;
       let usable = final ? frames : frames.slice(0, -1);
-      let span = usable.at(-1)!.timeMs - usable[0]!.timeMs;
+      // Reordered video arrives out of presentation order, so the span is the
+      // spread of the timestamps rather than the difference across the ends.
+      let span = spanOf(usable);
       if (!final && span < FRAGMENT_SECONDS * 1000) continue;
 
       // Video fragments are cut at a keyframe so every one of them opens on a
@@ -554,32 +556,38 @@ export class RemuxStreamer {
           }
         if (cut > 0) usable = usable.slice(0, cut);
         else if (span < MAX_FRAGMENT_SECONDS * 1000) continue;
-        span = usable.at(-1)!.timeMs - usable[0]!.timeMs;
+        span = spanOf(usable);
       }
 
+      // Matroska stores frames in decode order and stamps them with their
+      // presentation time; MP4 wants decode times in tfdt and trun, with the
+      // difference carried as a composition offset. Sorting the presentation
+      // times recovers the decode timeline: the set is the same, only the
+      // order differs, so the nth frame to be decoded is due at the nth
+      // smallest timestamp. Without this a B-frame's negative gap became a
+      // one-tick duration and the timeline collapsed.
+      const decodeTimes = usable.map((frame) => frame.timeMs).sort((a, b) => a - b);
       const samples = usable.map((frame, index) => {
-        const next = usable[index + 1] ?? frames[index + 1];
-        const previous = usable[index - 1];
-        const duration = next
-          ? next.timeMs - frame.timeMs
-          : previous
-            ? frame.timeMs - previous.timeMs
-            : 40;
+        const decode = decodeTimes[index]!;
+        const next = decodeTimes[index + 1];
+        const duration = next != null ? next - decode : lastGap(decodeTimes);
         return {
           data: frame.data,
           durationTicks: Math.max(1, Math.round(duration)),
           keyframe: frame.keyframe,
+          compositionOffsetTicks: Math.round(frame.timeMs - decode),
         };
       });
       const segment = buildMediaSegment(
         this.sequence++,
         trackNumber,
-        Math.round(usable[0]!.timeMs),
+        Math.round(decodeTimes[0]!),
         samples,
       );
       // The SourceBuffer error event says nothing about what it rejected, so
       // the last thing handed to it is worth remembering.
-      this.lastSegment = `track ${trackNumber} ${track.kind} · ${samples.length} samples · ${(usable[0]!.timeMs / 1000).toFixed(2)}-${(usable.at(-1)!.timeMs / 1000).toFixed(2)}s · ${usable[0]!.keyframe ? "opens on keyframe" : "MID-GOP"} · ${(segment.byteLength / 1024).toFixed(0)} KB`;
+      const reordered = samples.some((sample) => sample.compositionOffsetTicks !== 0);
+      this.lastSegment = `track ${trackNumber} ${track.kind} · ${samples.length} samples · ${(decodeTimes[0]! / 1000).toFixed(2)}-${(decodeTimes.at(-1)! / 1000).toFixed(2)}s · ${usable[0]!.keyframe ? "opens on keyframe" : "MID-GOP"}${reordered ? " · reordered" : ""} · ${(segment.byteLength / 1024).toFixed(0)} KB`;
       // Only the video track is measured: audio is a rounding error next to it
       // and counting both would double-count the same wall-clock seconds.
       if (track.kind === "video") {
@@ -729,6 +737,23 @@ export class RemuxStreamer {
       return false;
     }
   }
+}
+
+/** Spread of presentation times, which is not the gap across the ends. */
+function spanOf(frames: StreamFrame[]) {
+  let low = Infinity;
+  let high = -Infinity;
+  for (const frame of frames) {
+    if (frame.timeMs < low) low = frame.timeMs;
+    if (frame.timeMs > high) high = frame.timeMs;
+  }
+  return high - low;
+}
+
+/** The final sample has no successor, so it inherits the preceding gap. */
+function lastGap(times: number[]) {
+  if (times.length < 2) return 40;
+  return Math.max(1, times.at(-1)! - times.at(-2)!);
 }
 
 /**

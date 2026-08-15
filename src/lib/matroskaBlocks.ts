@@ -27,6 +27,7 @@ const ID_CLUSTER_TIMESTAMP = 0xe7;
 const ID_SIMPLE_BLOCK = 0xa3;
 const ID_BLOCK_GROUP = 0xa0;
 const ID_BLOCK = 0xa1;
+const ID_REFERENCE_BLOCK = 0xfb;
 
 export type TrackHeader = {
   number: number;
@@ -225,18 +226,7 @@ export function scanBlocks(buffer: Uint8Array, frameLimit = 20_000): BlockScan {
       } else if (id === ID_SIMPLE_BLOCK && insideCluster != null) {
         pushFrame(body, limit, insideCluster, true);
       } else if (id === ID_BLOCK_GROUP && insideCluster != null) {
-        const inner: Cursor = { view, offset: body };
-        while (inner.offset < limit) {
-          const innerPrevious = inner.offset;
-          const blockId = readVint(inner, true);
-          const blockSize = readVint(inner, false);
-          if (blockId == null || blockSize == null) break;
-          const blockBody = inner.offset;
-          if (blockId === ID_BLOCK)
-            pushFrame(blockBody, Math.min(blockBody + blockSize, limit), insideCluster, false);
-          inner.offset = blockBody + blockSize;
-          if (inner.offset <= innerPrevious) break;
-        }
+        walkBlockGroup(body, limit, insideCluster);
       }
 
       cursor.offset = isUnknownSize(size) ? limit : body + size;
@@ -254,23 +244,35 @@ export function scanBlocks(buffer: Uint8Array, frameLimit = 20_000): BlockScan {
       const body = cursor.offset;
       const limit = Math.min(body + size, end);
       if (id === ID_SIMPLE_BLOCK) pushFrame(body, limit, base, true);
-      else if (id === ID_BLOCK_GROUP) {
-        const inner: Cursor = { view, offset: body };
-        while (inner.offset < limit) {
-          const innerPrevious = inner.offset;
-          const blockId = readVint(inner, true);
-          const blockSize = readVint(inner, false);
-          if (blockId == null || blockSize == null) break;
-          const blockBody = inner.offset;
-          if (blockId === ID_BLOCK)
-            pushFrame(blockBody, Math.min(blockBody + blockSize, limit), base, false);
-          inner.offset = blockBody + blockSize;
-          if (inner.offset <= innerPrevious) break;
-        }
-      }
+      else if (id === ID_BLOCK_GROUP) walkBlockGroup(body, limit, base);
       cursor.offset = body + size;
       if (cursor.offset <= previous) return;
     }
+  };
+
+  /**
+   * A Block is a keyframe exactly when its group carries no ReferenceBlock,
+   * and that sibling can sit either side of the Block — so the group is read
+   * through before the frame is classified. Reporting every Block as a
+   * non-keyframe, as this used to, leaves a stream with no sync sample at all,
+   * which nothing can start decoding from.
+   */
+  const walkBlockGroup = (start: number, end: number, base: number) => {
+    let referenced = false;
+    let block: { start: number; end: number } | null = null;
+    const inner: Cursor = { view, offset: start };
+    while (inner.offset < end) {
+      const previous = inner.offset;
+      const id = readVint(inner, true);
+      const size = readVint(inner, false);
+      if (id == null || size == null) break;
+      const body = inner.offset;
+      if (id === ID_BLOCK) block = { start: body, end: Math.min(body + size, end) };
+      else if (id === ID_REFERENCE_BLOCK) referenced = true;
+      inner.offset = body + size;
+      if (inner.offset <= previous) break;
+    }
+    if (block) pushFrame(block.start, block.end, base, false, !referenced);
   };
 
   const pushFrame = (
@@ -278,6 +280,8 @@ export function scanBlocks(buffer: Uint8Array, frameLimit = 20_000): BlockScan {
     end: number,
     clusterBase: number,
     simple: boolean,
+    /** Decided by the enclosing BlockGroup, which the block itself cannot see. */
+    groupKeyframe = false,
   ) => {
     const header = readBlockHeader(view, start);
     if (!header || header.headerEnd > end) return;
@@ -286,10 +290,9 @@ export function scanBlocks(buffer: Uint8Array, frameLimit = 20_000): BlockScan {
       track: header.track,
       timeMs:
         ((clusterBase + header.relative) * scan.timestampScaleNs) / 1_000_000,
-      // Only a SimpleBlock carries the keyframe flag; a Block inside a
-      // BlockGroup is a keyframe when it has no ReferenceBlock, which this
-      // scan does not read — so it is reported conservatively.
-      keyframe: simple ? (header.flags & 0x80) !== 0 : false,
+      // A SimpleBlock carries the flag itself; a Block was decided by its
+      // group's ReferenceBlock.
+      keyframe: simple ? (header.flags & 0x80) !== 0 : groupKeyframe,
       size: end - header.headerEnd,
     });
   };

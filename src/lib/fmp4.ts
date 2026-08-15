@@ -82,6 +82,12 @@ export type MuxSample = {
   data: Uint8Array;
   durationTicks: number;
   keyframe: boolean;
+  /**
+   * Presentation time minus decode time. Zero for anything without frame
+   * reordering; signed and often negative for H.264 or HEVC with B-frames,
+   * where the two orders genuinely disagree.
+   */
+  compositionOffsetTicks?: number;
 };
 
 // A 3x3 unity matrix, required in tkhd and mvhd.
@@ -316,12 +322,19 @@ export function buildMediaSegment(
   baseMediaDecodeTime: number,
   samples: MuxSample[],
 ): Uint8Array {
+  // Composition offsets are only written when they carry information. Their
+  // signed form needs trun version 1, which older parsers handle worse, so a
+  // stream without reordering should not pay for it.
+  const reordered = samples.some((sample) => (sample.compositionOffsetTicks ?? 0) !== 0);
   const trunEntries = concat(
     ...samples.map((sample) =>
       concat(
         u32(sample.durationTicks),
         u32(sample.data.byteLength),
         u32(sampleFlags(sample.keyframe)),
+        // u32 writes the two's-complement form, which is what a signed
+        // composition offset is.
+        ...(reordered ? [u32(sample.compositionOffsetTicks ?? 0)] : []),
       ),
     ),
   );
@@ -340,8 +353,10 @@ export function buildMediaSegment(
         fullBox("tfdt", 1, 0, u64(baseMediaDecodeTime)),
         fullBox(
           "trun",
-          0,
-          0x000701, // data offset + duration + size + flags per sample
+          reordered ? 1 : 0,
+          // data offset + duration + size + flags per sample, and the
+          // composition offset when the samples need one.
+          reordered ? 0x000f01 : 0x000701,
           u32(samples.length),
           u32(dataOffset),
           trunEntries,
