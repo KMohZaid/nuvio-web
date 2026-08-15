@@ -24,6 +24,14 @@ const CHUNK_BYTES = 8 * 1024 * 1024;
 /** A refused range is usually transient: back off and try again. */
 const FETCH_ATTEMPTS = 3;
 /**
+ * A stalled fetch used to hang the whole loop with no way to tell: fetch has
+ * no timeout of its own, so a host that accepts a connection and then stops
+ * sending blocks forever and the last status line stands as the final word.
+ */
+const FETCH_TIMEOUT_MS = 30_000;
+/** How long a single phase may last before it is reported as stuck. */
+const STUCK_AFTER_MS = 12_000;
+/**
  * Buffer targets are in bytes, not seconds.
  *
  * Thirty seconds means something completely different at 4 Mbps and at 60:
@@ -79,6 +87,12 @@ export class RemuxStreamer {
   private triedPlay = false;
   /** What was handed to the SourceBuffer most recently. */
   private lastSegment = "";
+  /** What the streamer is doing, and since when, so a hang names itself. */
+  private phase = "idle";
+  private phaseSince = Date.now();
+  /** Why the last pump declined to append, which was previously invisible. */
+  private pumpNote = "";
+  private watchdog = 0;
   /** The MIME actually negotiated, worth seeing when a decoder refuses. */
   private mime = "";
   /**
@@ -88,6 +102,31 @@ export class RemuxStreamer {
    */
   private failed = false;
   private closedWaits = 0;
+
+  private enter(phase: string) {
+    this.phase = phase;
+    this.phaseSince = Date.now();
+  }
+
+  /**
+   * Reports a phase that has outlasted anything reasonable. Every stall so far
+   * has looked the same from outside — a status line that simply stops — and
+   * this is what tells a blocked fetch apart from a blocked append.
+   */
+  private startWatchdog() {
+    if (this.watchdog) return;
+    this.watchdog = window.setInterval(() => {
+      if (this.stopped || this.failed) return;
+      const held = Date.now() - this.phaseSince;
+      if (held < STUCK_AFTER_MS) return;
+      this.report({
+        state: "error",
+        message: `Stuck in "${this.phase}" for ${(held / 1000).toFixed(0)}s at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB · queue ${this.queue.length}${this.pumpNote ? ` · ${this.pumpNote}` : ""} · buffer ${this.buffer?.updating ? "updating" : "idle"} · source ${this.source?.readyState ?? "none"} · last segment ${this.lastSegment || "none"} · build ${__APP_BUILD__}`,
+        ranges: this.describeRanges(),
+        fetchedBytes: this.nextByte,
+      });
+    }, 2000);
+  }
 
   private report(status: StreamerStatus) {
     if (this.failed && status.state !== "error") return;
@@ -103,6 +142,8 @@ export class RemuxStreamer {
 
   stop() {
     this.stopped = true;
+    if (this.watchdog) window.clearInterval(this.watchdog);
+    this.watchdog = 0;
     this.queue = [];
     try {
       if (this.source?.readyState === "open") this.source.endOfStream();
@@ -221,6 +262,7 @@ export class RemuxStreamer {
       return;
     }
 
+    this.startWatchdog();
     void this.loop();
   }
 
@@ -296,6 +338,7 @@ export class RemuxStreamer {
       const overBudget =
         ahead >= MIN_AHEAD_SECONDS && this.appendedBytes > this.budgetBytes();
       if (ahead > this.targetAhead() || overBudget || this.fetching) {
+        this.enter("holding");
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         this.evict();
         this.tryPlay();
@@ -321,8 +364,10 @@ export class RemuxStreamer {
         });
         return;
       }
+      this.enter("demuxing");
       this.absorb(this.demuxer.push(chunk.bytes));
       this.flush(false);
+      this.enter("waiting on the buffer");
 
       // Reading without the buffer advancing means the data is being fetched
       // and discarded — a parse that produces no frames, or appends that never
@@ -350,7 +395,7 @@ export class RemuxStreamer {
       this.tryPlay();
       this.report({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
-        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held · ${this.mime}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
+        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held · ${this.mime} · ${__APP_BUILD__}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
         ranges: this.describeRanges(),
@@ -372,6 +417,7 @@ export class RemuxStreamer {
         reason: `Reached the end of the file (${this.nextByte} of ${this.totalBytes} bytes).`,
       };
     this.fetching = true;
+    this.enter(`fetching ${(this.nextByte / 1024 / 1024).toFixed(0)}-${((this.nextByte + CHUNK_BYTES) / 1024 / 1024).toFixed(0)} MB`);
     try {
       return await this.fetchWithRetry();
     } finally {
@@ -417,11 +463,22 @@ export class RemuxStreamer {
   private async fetchOnce(): Promise<
     { bytes: Uint8Array } | { done: true; reason: string } | { retry: true; reason: string }
   > {
+    // fetch waits forever by default, so a host that accepts the connection and
+    // then goes quiet hangs the loop with nothing to show for it. The deadline
+    // is on silence, not on the transfer: an 8 MB chunk is allowed to take as
+    // long as it needs provided it keeps arriving.
+    const abort = new AbortController();
+    let idle = window.setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
+    const keepAlive = () => {
+      window.clearTimeout(idle);
+      idle = window.setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
+    };
     try {
       const end = this.nextByte + CHUNK_BYTES - 1;
       const response = await fetch(this.resolvedUrl || this.url, {
         headers: { Range: `bytes=${this.nextByte}-${end}` },
         cache: "no-store",
+        signal: abort.signal,
       });
       if (!response.ok && response.status !== 206)
         return {
@@ -438,6 +495,7 @@ export class RemuxStreamer {
       while (read < CHUNK_BYTES) {
         const { done, value } = await reader.read();
         if (done || !value) break;
+        keepAlive();
         parts.push(value);
         read += value.byteLength;
       }
@@ -460,10 +518,15 @@ export class RemuxStreamer {
         };
       return { bytes };
     } catch (error) {
+      const timedOut = error instanceof DOMException && error.name === "AbortError";
       return {
         retry: true,
-        reason: `Range request failed: ${error instanceof Error ? error.message : "unknown"}.`,
+        reason: timedOut
+          ? `Host went quiet for ${FETCH_TIMEOUT_MS / 1000}s at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB.`
+          : `Range request failed: ${describeError(error)}.`,
       };
+    } finally {
+      window.clearTimeout(idle);
     }
   }
 
@@ -607,13 +670,24 @@ export class RemuxStreamer {
   /** Appends serially: a SourceBuffer rejects overlapping updates. */
   private pump() {
     const buffer = this.buffer;
-    if (!buffer || buffer.updating || this.stopped) return;
+    if (!buffer) {
+      this.pumpNote = "no buffer yet";
+      return;
+    }
+    if (this.stopped) return;
+    if (buffer.updating) {
+      // Normal between appends; only a lasting one matters, and the watchdog
+      // is what decides that.
+      this.pumpNote = "buffer busy";
+      return;
+    }
     // Every MSE call throws InvalidStateError once the MediaSource stops being
     // open, and the exception does not say which object it meant. Checking
     // first turns that into a state we can report — and a closed source is
     // worth waiting on, because a ManagedMediaSource detaches under memory
     // pressure and can be reattached rather than being a dead end.
     if (this.source?.readyState !== "open") {
+      this.pumpNote = `source ${this.source?.readyState ?? "detached"}`;
       this.closedWaits += 1;
       // Waiting forever would turn a dead source into a silent hang, which is
       // exactly the failure this guard was added to make visible.
@@ -631,8 +705,12 @@ export class RemuxStreamer {
     }
     this.closedWaits = 0;
     const next = this.queue.shift();
-    if (!next) return;
+    if (!next) {
+      this.pumpNote = "queue empty";
+      return;
+    }
     try {
+      this.pumpNote = `appending ${(next.byteLength / 1024).toFixed(0)} KB`;
       buffer.appendBuffer(next as unknown as BufferSource);
     } catch (error) {
       // A quota error means eviction has to happen before this can retry.
@@ -642,6 +720,7 @@ export class RemuxStreamer {
         // Eviction drives the retry through updateend. When it frees nothing —
         // the playhead is still near the start, so there is no history to drop
         // — nothing fires and the queue never drains again. Retry on a timer.
+        this.pumpNote = `quota exceeded on ${(next.byteLength / 1024).toFixed(0)} KB, ${freed ? "evicting" : "nothing to evict"}`;
         if (!freed) window.setTimeout(() => this.pump(), 500);
         return;
       }
