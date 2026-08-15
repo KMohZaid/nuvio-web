@@ -2819,3 +2819,15 @@ body.is-locked {
 .detail-view.has-sheet {
   overflow: hidden;
 }
+
+/* Everything below the hero arrives together rather than popping in section
+   by section as the metadata resolves. */
+.detail-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 320px;
+  color: #8d97a2;
+  font-size: 14px;
+}

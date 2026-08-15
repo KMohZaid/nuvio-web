@@ -46,6 +46,9 @@ export function Details({
   const [meta, setMeta] = useState(seed);
   const movieWatched = watchIndex.watched.has(watchKey(meta.id));
   const [busy, setBusy] = useState(true);
+  // Only hold back content we do not already have: a seed that arrived with
+  // episodes would otherwise flicker into a spinner.
+  const pending = busy && meta.videos.length === 0 && meta.cast.length === 0;
   const [sourceOpen, setSourceOpen] = useState(false);
   const [streams, setStreams] = useState<Stream[]>([]);
   const [sourceBusy, setSourceBusy] = useState(false);
@@ -182,9 +185,17 @@ export function Details({
               </button>
             )}
           </div>
-          {busy && <small>Loading metadata…</small>}
         </div>
       </div>
+      {pending ? (
+        <div className="detail-loading" role="status">
+          <i className="mini-spinner" />
+          <span>
+            {meta.type === "series" ? "Loading episodes…" : "Loading details…"}
+          </span>
+        </div>
+      ) : (
+        <>
       {(meta.director.length > 0 ||
         meta.writer.length > 0 ||
         meta.language) && (
@@ -302,6 +313,8 @@ export function Details({
             })}
           </div>
         </section>
+      )}
+        </>
       )}
       {menu &&
         (() => {
