@@ -35,7 +35,7 @@ const BUFFER_BUDGET_BYTES = 40 * 1024 * 1024;
 const MAX_AHEAD_SECONDS = 30;
 const MIN_AHEAD_SECONDS = 6;
 /** How much history to keep before evicting; MSE throws when the quota goes. */
-const KEEP_BEHIND_SECONDS = 10;
+const KEEP_BEHIND_SECONDS = 6;
 /** Frames are batched into fragments of about this length. */
 const FRAGMENT_SECONDS = 2;
 
@@ -67,6 +67,9 @@ export class RemuxStreamer {
   /** Bytes appended and seconds they represent, for the bitrate estimate. */
   private appendedBytes = 0;
   private appendedSeconds = 0;
+  /** Last thing the element said about itself, so "won't play" has a reason. */
+  private mediaNote = "";
+  private triedPlay = false;
 
   constructor(
     private readonly url: string,
@@ -147,6 +150,7 @@ export class RemuxStreamer {
 
     const source = new Source();
     this.source = source as MediaSource;
+    this.watchElement();
     this.element.disableRemotePlayback = true;
     this.element.src = URL.createObjectURL(source as unknown as MediaSource);
 
@@ -176,6 +180,48 @@ export class RemuxStreamer {
     void this.loop();
   }
 
+  /**
+   * Records what the element is doing.
+   *
+   * "It won't play" covers a decode failure, a stall waiting for data and a
+   * blocked autoplay, which need different answers. The element knows which;
+   * it just has no way to say so unless someone is listening.
+   */
+  private watchElement() {
+    const note = (text: string) => {
+      this.mediaNote = text;
+    };
+    for (const event of ["waiting", "stalled", "playing", "pause", "seeking"])
+      this.element.addEventListener(event, () => note(event));
+    this.element.addEventListener("error", () => {
+      const error = this.element.error;
+      note(`element error ${error?.code ?? "?"}: ${error?.message || "no detail"}`);
+      this.onStatus({
+        state: "error",
+        message: `The video element rejected the stream — ${error?.message || `code ${error?.code}`}.`,
+        ranges: this.describeRanges(),
+        fetchedBytes: this.nextByte,
+      });
+    });
+  }
+
+  /**
+   * Starts playback once there is something to play. The Stream button is a
+   * user gesture, but it is spent by the time the first fragment lands, so a
+   * refusal here is expected on iOS and is reported rather than treated as a
+   * failure.
+   */
+  private tryPlay() {
+    if (this.triedPlay || this.bufferedAhead() < 1) return;
+    this.triedPlay = true;
+    void this.element.play().catch((error: unknown) => {
+      this.mediaNote =
+        error instanceof DOMException && error.name === "NotAllowedError"
+          ? "autoplay blocked — press play"
+          : `play() refused: ${error instanceof Error ? error.message : "unknown"}`;
+    });
+  }
+
   /** Keeps fetching while the buffer runs short of the playhead. */
   private async loop() {
     try {
@@ -196,13 +242,20 @@ export class RemuxStreamer {
       // and the time check never holds it back — which is how a stalled
       // player ends up downloading hundreds of megabytes until the host
       // refuses to serve any more.
-      const overBudget = this.appendedBytes > BUFFER_BUDGET_BYTES;
+      //
+      // The budget never applies below the minimum, though. Eviction can only
+      // free what is behind the playhead, so a budget smaller than the minimum
+      // costs deadlocks: holding at four seconds with the playhead at zero,
+      // nothing old enough to evict, and no way back under.
+      const overBudget =
+        ahead >= MIN_AHEAD_SECONDS && this.appendedBytes > this.budgetBytes();
       if (ahead > this.targetAhead() || overBudget || this.fetching) {
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         this.evict();
+        this.tryPlay();
         this.onStatus({
           state: "ready",
-          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB · readyState ${this.element.readyState}`,
+          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · readyState ${this.element.readyState}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
           bufferedSeconds: ahead,
           fetchedBytes: this.nextByte,
           ranges: this.describeRanges(),
@@ -248,9 +301,10 @@ export class RemuxStreamer {
         (sum, frames) => sum + frames.length,
         0,
       );
+      this.tryPlay();
       this.onStatus({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
-        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
+        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · queue ${this.queue.length} · ${held} frames held${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
         ranges: this.describeRanges(),
@@ -489,7 +543,11 @@ export class RemuxStreamer {
       // A quota error means eviction has to happen before this can retry.
       if (error instanceof DOMException && error.name === "QuotaExceededError") {
         this.queue.unshift(next);
-        this.evict(true);
+        const freed = this.evict(true);
+        // Eviction drives the retry through updateend. When it frees nothing —
+        // the playhead is still near the start, so there is no history to drop
+        // — nothing fires and the queue never drains again. Retry on a timer.
+        if (!freed) window.setTimeout(() => this.pump(), 500);
         return;
       }
       this.onStatus({
@@ -506,9 +564,27 @@ export class RemuxStreamer {
   private targetAhead() {
     if (this.appendedSeconds < 2 || this.appendedBytes === 0)
       return MAX_AHEAD_SECONDS;
-    const bytesPerSecond = this.appendedBytes / this.appendedSeconds;
-    const affordable = BUFFER_BUDGET_BYTES / bytesPerSecond;
+    const affordable = this.budgetBytes() / this.bytesPerSecond();
     return Math.max(MIN_AHEAD_SECONDS, Math.min(MAX_AHEAD_SECONDS, affordable));
+  }
+
+  private bytesPerSecond() {
+    if (this.appendedSeconds < 0.5 || this.appendedBytes === 0) return 0;
+    return this.appendedBytes / this.appendedSeconds;
+  }
+
+  /**
+   * The budget floor is a guess; what the file actually costs is not. A 90 Mbps
+   * stream needs the minimum lead plus the history eviction keeps before it can
+   * free anything, so the budget has to be at least that or it forbids the only
+   * state from which it can recover. Past that, MSE is the authority: a quota
+   * error is a real limit, an invented byte count is not.
+   */
+  private budgetBytes() {
+    const rate = this.bytesPerSecond();
+    if (!rate) return BUFFER_BUDGET_BYTES;
+    const required = rate * (MIN_AHEAD_SECONDS + KEEP_BEHIND_SECONDS + 2);
+    return Math.max(BUFFER_BUDGET_BYTES, required);
   }
 
   /** Human-readable buffered ranges, with the playhead marked. */
@@ -543,23 +619,24 @@ export class RemuxStreamer {
     return Math.max(0, end - time);
   }
 
+  /** Returns whether anything was actually dropped. */
   private evict(aggressive = false) {
     const buffer = this.buffer;
-    if (!buffer || buffer.updating || !buffer.buffered.length) return;
+    if (!buffer || buffer.updating || !buffer.buffered.length) return false;
     const keep = aggressive ? 2 : KEEP_BEHIND_SECONDS;
     const cutoff = this.element.currentTime - keep;
-    if (cutoff <= buffer.buffered.start(0) + 0.1) return;
+    if (cutoff <= buffer.buffered.start(0) + 0.1) return false;
     try {
+      const removed = cutoff - buffer.buffered.start(0);
       buffer.remove(buffer.buffered.start(0), cutoff);
       // The estimate tracks what is resident, so removal has to reduce it.
-      const removed = cutoff - buffer.buffered.start(0);
-      const rate = this.appendedSeconds
-        ? this.appendedBytes / this.appendedSeconds
-        : 0;
+      const rate = this.bytesPerSecond();
       this.appendedBytes = Math.max(0, this.appendedBytes - removed * rate);
       this.appendedSeconds = Math.max(0, this.appendedSeconds - removed);
+      return true;
     } catch {
       // Removal is best effort; the next pass will try again.
+      return false;
     }
   }
 }
