@@ -1,4 +1,4 @@
-import type { HomeLayout } from "./account";
+import { mediaTypeLabel, type HomeLayout } from "./account";
 import type {
   AddonManifest,
   AddonRow,
@@ -333,9 +333,17 @@ export async function loadHome(
           const payload = await fetchJson<{
             metas?: Array<Record<string, unknown>>;
           }>(resourceUrl(addon.url, "catalog", catalog.type, catalog.id));
+          const prefKey = `${addon.manifest!.id}:${catalog.type}:${catalog.id}`;
+          const base = catalog.name || catalog.id;
           return {
-            key: `${addon.manifest!.id}:${catalog.type}:${catalog.id}`,
-            name: catalog.name || catalog.id,
+            key: prefKey,
+            // A row renamed in Nuvio wins outright; otherwise the type suffix
+            // disambiguates the several catalogs all called "Popular".
+            name:
+              layout?.customTitleOf.get(prefKey) ??
+              (layout?.showCatalogType !== false
+                ? `${base} - ${mediaTypeLabel(catalog.type)}`
+                : base),
             type: catalog.type,
             manifestUrl: addon.url,
             addonName: addon.manifest!.name,

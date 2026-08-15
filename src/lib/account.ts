@@ -630,7 +630,22 @@ export type HomeLayout = {
   /** Ordering position by preference key, for a stable sort. */
   orderOf: Map<string, number>;
   enabledOf: Map<string, boolean>;
+  /** A row renamed in Nuvio wins over the generated title. */
+  customTitleOf: Map<string, string>;
+  /** Appends " - Movies"/" - Series" to catalog rows. Defaults on. */
+  showCatalogType: boolean;
 };
+
+/** Mirrors the desktop client's `media_type_label`. */
+export function mediaTypeLabel(contentType: string): string {
+  const value = contentType.trim().toLowerCase();
+  if (value === "movie") return "Movies";
+  if (value === "series") return "Series";
+  if (value === "anime") return "Anime";
+  if (value === "channel") return "Channels";
+  if (value === "tv") return "TV";
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : "";
+}
 
 /**
  * Mirrors Kotlin's `SyncCatalogItem.preferenceKey()`. The explicit `key` wins,
@@ -670,7 +685,10 @@ export async function loadHomeLayout(
         continue;
       }
     }
-    const payload = parsed as { items?: Array<Record<string, unknown>> };
+    const payload = parsed as {
+      items?: Array<Record<string, unknown>>;
+      show_catalog_type?: boolean;
+    };
     if (!Array.isArray(payload?.items) || payload.items.length === 0) continue;
 
     const items: HomeLayoutItem[] = payload.items.map((item) => ({
@@ -685,6 +703,13 @@ export async function loadHomeLayout(
       items,
       orderOf: new Map(items.map((item, index) => [item.key, index])),
       enabledOf: new Map(items.map((item) => [item.key, item.enabled])),
+      customTitleOf: new Map(
+        items
+          .filter((item) => item.customTitle.trim())
+          .map((item) => [item.key, item.customTitle.trim()]),
+      ),
+      // Absent means older payload; the other clients default this on.
+      showCatalogType: payload.show_catalog_type !== false,
     };
   }
   return null;

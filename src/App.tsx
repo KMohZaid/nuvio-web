@@ -390,21 +390,49 @@ export function App() {
     }
   }
 
-  // Collections sit in the same ordering as catalogs, keyed `collection_<id>`.
-  const orderedCollections = useMemo(() => {
-    if (!homeLayout) return collections;
-    const visible = collections.filter(
-      (item) =>
-        homeLayout.enabledOf.get(`${COLLECTION_KEY_PREFIX}${item.id}`) !== false,
-    );
-    return [...visible].sort(
-      (a, b) =>
-        (homeLayout.orderOf.get(`${COLLECTION_KEY_PREFIX}${a.id}`) ??
-          Number.MAX_SAFE_INTEGER) -
-        (homeLayout.orderOf.get(`${COLLECTION_KEY_PREFIX}${b.id}`) ??
-          Number.MAX_SAFE_INTEGER),
-    );
-  }, [collections, homeLayout]);
+  /**
+   * Catalogs and collections in one list, ordered the way Nuvio stores them.
+   *
+   * They share a single ordering — collections keyed `collection_<id>`,
+   * catalogs `<addon>:<type>:<catalog>` — so rendering all collections before
+   * all catalogs ignored it entirely. That is why rows set to the bottom
+   * appeared at the top.
+   */
+  const homeRows = useMemo(() => {
+    type Row =
+      | { key: string; kind: "catalog"; section: CatalogSection }
+      | { key: string; kind: "collection"; collection: Collection };
+    const rows: Row[] = [
+      ...sections.map(
+        (section) =>
+          ({ key: section.key, kind: "catalog", section }) satisfies Row,
+      ),
+      ...collections
+        .filter(
+          (collection) =>
+            homeLayout?.enabledOf.get(
+              `${COLLECTION_KEY_PREFIX}${collection.id}`,
+            ) !== false,
+        )
+        .map(
+          (collection) =>
+            ({
+              key: `${COLLECTION_KEY_PREFIX}${collection.id}`,
+              kind: "collection",
+              collection,
+            }) satisfies Row,
+        ),
+    ];
+    if (!homeLayout) return rows;
+    // Pinned collections are forced above everything, matching the desktop
+    // client's `enforce_pinned_collections_at_top`. An unknown key sorts last:
+    // it is new to this device rather than deliberately placed.
+    const rank = (row: Row) =>
+      row.kind === "collection" && row.collection.pinToTop
+        ? -1
+        : (homeLayout.orderOf.get(row.key) ?? Number.MAX_SAFE_INTEGER);
+    return [...rows].sort((a, b) => rank(a) - rank(b));
+  }, [collections, homeLayout, sections]);
 
   const hero = sections[0]?.items[0];
   const watchIndex = useMemo(
@@ -595,8 +623,7 @@ export function App() {
         ) : deferredActive === "home" ? (
           <HomeView
             hero={hero}
-            sections={sections}
-            collections={orderedCollections}
+            rows={homeRows}
             continueItems={continueItems}
             index={watchIndex}
             onOpen={setSelected}
@@ -721,10 +748,17 @@ export function App() {
  * dozen catalog rows of twenty posters each is several hundred cards, and
  * committing them all at once is what delayed the tab switch.
  */
+type HomeRow =
+  | { key: string; kind: "catalog"; section: CatalogSection }
+  | { key: string; kind: "collection"; collection: Collection };
+
+/**
+ * Home renders progressively: each row is ~24 poster cards, so committing them
+ * all at once is what delayed the tab switch.
+ */
 function HomeView({
   hero,
-  sections,
-  collections,
+  rows,
   continueItems,
   index,
   onOpen,
@@ -732,63 +766,45 @@ function HomeView({
   onOpenFolder,
 }: {
   hero?: Meta;
-  sections: CatalogSection[];
-  collections: Collection[];
+  rows: HomeRow[];
   continueItems: ReturnType<typeof buildContinueWatching>;
   index: WatchIndex;
   onOpen(item: Meta): void;
   onSeeAll(section: CatalogSection): void;
   onOpenFolder(folder: CollectionFolder): void;
 }) {
-  // Each row is ~24 poster cards, so a few rows is already a screenful.
-  // Using the card defaults here committed every row at once, which is what
-  // made returning from "See all" stall.
-  const { visible } = useProgressiveList(sections, {
+  const { visible } = useProgressiveList(rows, {
     resetKey: "home",
     first: 3,
     chunk: 2,
   });
-  // Nuvio honours `pinToTop`; the rest keep their stored order below the
-  // continue row and above the catalogs.
-  const pinned = collections.filter((item) => item.pinToTop);
-  const rest = collections.filter((item) => !item.pinToTop);
   return (
     <>
       {hero && <Hero item={hero} onOpen={() => onOpen(hero)} />}
-      {pinned.map((collection) => (
-        <CollectionRow
-          key={collection.id}
-          collection={collection}
-          onOpenFolder={onOpenFolder}
-        />
-      ))}
       {continueItems.length > 0 && (
         <ContinueWatching cards={continueItems} onOpen={onOpen} />
       )}
-      {rest.map((collection) => (
-        <CollectionRow
-          key={collection.id}
-          collection={collection}
-          onOpenFolder={onOpenFolder}
-        />
-      ))}
-      {visible.map((section) => (
-        <MediaRow
-          key={section.key}
-          section={section}
-          index={index}
-          onOpen={onOpen}
-          onSeeAll={() => onSeeAll(section)}
-        />
-      ))}
+      {visible.map((row) =>
+        row.kind === "collection" ? (
+          <CollectionRow
+            key={row.key}
+            collection={row.collection}
+            onOpenFolder={onOpenFolder}
+          />
+        ) : (
+          <MediaRow
+            key={row.key}
+            section={row.section}
+            index={index}
+            onOpen={onOpen}
+            onSeeAll={() => onSeeAll(row.section)}
+          />
+        ),
+      )}
     </>
   );
 }
 
-/**
- * The synced library split by kind. Counts come from the whole set rather
- * than the filtered view so an empty tab still says so plainly.
- */
 function LibraryView({
   items,
   index,
