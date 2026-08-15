@@ -434,7 +434,39 @@ export function App() {
     return [...rows].sort((a, b) => rank(a) - rank(b));
   }, [collections, homeLayout, sections]);
 
-  const hero = sections[0]?.items[0];
+  /**
+   * Carousel items, mirroring the desktop client's selection: round-robin
+   * across the hero-source catalogs so the first addon does not own every
+   * slot, skipping anything with no artwork, deduped, capped at 8.
+   *
+   * Which catalogs count as hero sources is a local preference on the other
+   * clients, not part of the sync payload, so this uses their default — the
+   * first two catalogs in the configured order.
+   */
+  const heroItems = useMemo(() => {
+    const HERO_SOURCE_LIMIT = 2;
+    const HERO_ITEM_LIMIT = 8;
+    const sources = homeRows
+      .filter((row) => row.kind === "catalog")
+      .slice(0, HERO_SOURCE_LIMIT)
+      .map((row) => (row.kind === "catalog" ? row.section : null))
+      .filter((section): section is CatalogSection => section !== null);
+    const seen = new Set<string>();
+    const picked: Meta[] = [];
+    const deepest = Math.max(0, ...sources.map((section) => section.items.length));
+    for (let slot = 0; slot < deepest && picked.length < HERO_ITEM_LIMIT; slot += 1)
+      for (const section of sources) {
+        const item = section.items[slot];
+        if (!item) continue;
+        const identity = `${item.type}:${item.id}`;
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+        if (!item.background && !item.banner && !item.poster) continue;
+        picked.push(item);
+        if (picked.length === HERO_ITEM_LIMIT) break;
+      }
+    return picked;
+  }, [homeRows]);
   const watchIndex = useMemo(
     () => buildWatchIndex(progress, watchedItems),
     [progress, watchedItems],
@@ -622,7 +654,7 @@ export function App() {
           />
         ) : deferredActive === "home" ? (
           <HomeView
-            hero={hero}
+            heroItems={heroItems}
             rows={homeRows}
             continueItems={continueItems}
             index={watchIndex}
@@ -757,7 +789,7 @@ type HomeRow =
  * all at once is what delayed the tab switch.
  */
 function HomeView({
-  hero,
+  heroItems,
   rows,
   continueItems,
   index,
@@ -765,7 +797,7 @@ function HomeView({
   onSeeAll,
   onOpenFolder,
 }: {
-  hero?: Meta;
+  heroItems: Meta[];
   rows: HomeRow[];
   continueItems: ReturnType<typeof buildContinueWatching>;
   index: WatchIndex;
@@ -780,7 +812,7 @@ function HomeView({
   });
   return (
     <>
-      {hero && <Hero item={hero} onOpen={() => onOpen(hero)} />}
+      <Hero items={heroItems} onOpen={onOpen} />
       {continueItems.length > 0 && (
         <ContinueWatching cards={continueItems} onOpen={onOpen} />
       )}

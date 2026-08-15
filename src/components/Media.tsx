@@ -1,5 +1,5 @@
 import { Check, Play } from "lucide-react";
-import { memo } from "react";
+import { memo, useEffect, useState } from "react";
 import { watchKey, type WatchIndex } from "../lib/progress";
 import type { CatalogSection, Meta } from "../types";
 
@@ -92,34 +92,88 @@ export function MediaRow({
   );
 }
 
-export function Hero({ item, onOpen }: { item: Meta; onOpen(): void }) {
+const HERO_ROTATE_MS = 9000;
+
+/**
+ * Rotating hero carousel.
+ *
+ * Nine seconds between slides, matching the desktop client. Rotation pauses
+ * while the pointer is over it, so it cannot slide out from under a click, and
+ * stops entirely for anyone who has asked for reduced motion.
+ */
+export function Hero({
+  items,
+  onOpen,
+}: {
+  items: Meta[];
+  onOpen(item: Meta): void;
+}) {
+  const [index, setIndex] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const active = items[index % Math.max(items.length, 1)];
+
+  useEffect(() => {
+    if (index >= items.length) setIndex(0);
+  }, [index, items.length]);
+
+  useEffect(() => {
+    if (items.length < 2 || paused) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const timer = window.setInterval(
+      () => setIndex((current) => (current + 1) % items.length),
+      HERO_ROTATE_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [items.length, paused]);
+
+  if (!active) return null;
+  const artwork = active.background || active.banner || active.poster;
   return (
     <section
+      // Keyed so a slide change restarts the fade rather than cross-fading
+      // two backgrounds into mud.
+      key={`${active.type}:${active.id}`}
       className="hero"
+      onPointerEnter={() => setPaused(true)}
+      onPointerLeave={() => setPaused(false)}
       style={
-        item.background
+        artwork
           ? {
-              backgroundImage: `linear-gradient(90deg, rgba(5,7,9,.98) 0%, rgba(5,7,9,.67) 46%, rgba(5,7,9,.12) 100%), linear-gradient(0deg, #080a0d 0%, transparent 55%), url("${item.background.replace(/"/g, "%22")}")`,
+              backgroundImage: `linear-gradient(90deg, rgba(5,7,9,.98) 0%, rgba(5,7,9,.67) 46%, rgba(5,7,9,.12) 100%), linear-gradient(0deg, #080a0d 0%, transparent 55%), url("${artwork.replace(/"/g, "%22")}")`,
             }
           : undefined
       }
     >
       <div className="hero-copy">
-        {item.logo ? (
-          <img src={item.logo} className="title-logo" alt={item.name} />
+        {active.logo ? (
+          <img src={active.logo} className="title-logo" alt={active.name} />
         ) : (
-          <h1>{item.name}</h1>
+          <h1>{active.name}</h1>
         )}
         <div className="hero-meta">
-          <span>{item.releaseInfo}</span>
-          {item.imdbRating && <span>★ {item.imdbRating}</span>}
-          <span>{item.type === "series" ? "Series" : "Movie"}</span>
+          <span>{active.releaseInfo}</span>
+          {active.imdbRating && <span>★ {active.imdbRating}</span>}
+          <span>{active.type === "series" ? "Series" : "Movie"}</span>
         </div>
-        <p>{item.description}</p>
-        <button className="primary" onClick={onOpen}>
+        <p>{active.description}</p>
+        <button className="primary" onClick={() => onOpen(active)}>
           <Play size={18} fill="currentColor" /> View details
         </button>
       </div>
+      {items.length > 1 && (
+        <div className="hero-dots" role="tablist" aria-label="Featured titles">
+          {items.map((item, dot) => (
+            <button
+              key={`${item.type}:${item.id}`}
+              role="tab"
+              aria-selected={dot === index}
+              aria-label={item.name}
+              className={dot === index ? "active" : undefined}
+              onClick={() => setIndex(dot)}
+            />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
