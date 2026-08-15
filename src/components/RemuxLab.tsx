@@ -363,8 +363,9 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
                 >
                   {stream.message}
                   {stream.bufferedSeconds != null
-                    ? ` · ${stream.bufferedSeconds.toFixed(1)}s buffered ahead`
+                    ? ` · ${stream.bufferedSeconds.toFixed(1)}s ahead`
                     : ""}
+                  {stream.ranges ? ` · ranges ${stream.ranges}` : ""}
                 </small>
               </span>
             </div>

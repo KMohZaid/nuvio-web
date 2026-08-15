@@ -34,6 +34,8 @@ export type StreamerStatus = {
   message: string;
   bufferedSeconds?: number;
   fetchedBytes?: number;
+  /** Rendered verbatim: a gap between ranges is the thing to look for. */
+  ranges?: string;
 };
 
 export class RemuxStreamer {
@@ -176,6 +178,13 @@ export class RemuxStreamer {
       if (ahead > TARGET_AHEAD_SECONDS || this.fetching) {
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         this.evict();
+        this.onStatus({
+          state: "ready",
+          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · readyState ${this.element.readyState}`,
+          bufferedSeconds: ahead,
+          fetchedBytes: this.nextByte,
+          ranges: this.describeRanges(),
+        });
         continue;
       }
       const chunk = await this.fetchNext();
@@ -202,6 +211,7 @@ export class RemuxStreamer {
         message: `${(this.nextByte / 1024 / 1024).toFixed(1)} of ${this.totalBytes ? (this.totalBytes / 1024 / 1024 / 1024).toFixed(2) + " GB" : "unknown"} · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
+        ranges: this.describeRanges(),
       });
     }
   }
@@ -440,6 +450,18 @@ export class RemuxStreamer {
         message: error instanceof Error ? error.message : "Append failed.",
       });
     }
+  }
+
+  /** Human-readable buffered ranges, with the playhead marked. */
+  private describeRanges() {
+    const buffer = this.buffer;
+    if (!buffer?.buffered.length) return "none";
+    const parts: string[] = [];
+    for (let index = 0; index < buffer.buffered.length; index += 1)
+      parts.push(
+        `${buffer.buffered.start(index).toFixed(1)}-${buffer.buffered.end(index).toFixed(1)}`,
+      );
+    return `${parts.join(", ")} @ ${this.element.currentTime.toFixed(1)}`;
   }
 
   private bufferedAhead() {
