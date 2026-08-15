@@ -2936,3 +2936,29 @@ body.is-locked {
   opacity: 0.6;
   font-size: 11px;
 }
+
+/* ---- Source playability ------------------------------------------------ */
+.source-sheet-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.probe-state-playable {
+  color: #7fd9a3;
+}
+.probe-state-partial {
+  color: #e0c07f;
+}
+.probe-state-unplayable {
+  color: #e58b8b;
+}
+.probe-state-checking,
+.probe-state-unknown {
+  color: #8d97a2;
+}
+/* The whole row lifts when a probe confirmed it plays — the point is to make
+   the usable source findable without reading every line. */
+.source-list article:has(.probe-state-playable) {
+  border-color: #2f7d55;
+  background: #14201a;
+}

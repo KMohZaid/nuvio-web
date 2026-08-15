@@ -12,6 +12,12 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { loadStreams, resolveMeta } from "../lib/addons";
 import { assessPlayback } from "../lib/playback";
+import {
+  needsProbe,
+  probeSources,
+  statusFor,
+  subscribeSourceProbes,
+} from "../lib/sourceProbe";
 import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
 import { useLongPress } from "../lib/useLongPress";
 import { useScrollLock } from "../lib/useScrollLock";
@@ -53,6 +59,12 @@ export function Details({
   const [streams, setStreams] = useState<Stream[]>([]);
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceVideo, setSourceVideo] = useState<Video | undefined>();
+  // Probe results live in a module cache, so this only forces a re-render.
+  const [, setProbeTick] = useState(0);
+  useEffect(
+    () => subscribeSourceProbes(() => setProbeTick((tick) => tick + 1)),
+    [],
+  );
   const seasons = useMemo(
     () =>
       [...new Set(meta.videos.map((video) => video.season ?? 0))].sort(
@@ -351,12 +363,34 @@ export function Details({
                 <span className="eyebrow">PLAYBACK</span>
                 <h2>Choose a source</h2>
               </div>
-              <button
-                className="circle-button"
-                onClick={() => setSourceOpen(false)}
-              >
-                <X />
-              </button>
+              <div className="source-sheet-tools">
+                <button
+                  className="secondary"
+                  onClick={() =>
+                    void probeSources(
+                      streams
+                        .map((item) => item.url || item.externalUrl || "")
+                        .filter((target) =>
+                          needsProbe(
+                            target,
+                            streams.find(
+                              (item) =>
+                                (item.url || item.externalUrl) === target,
+                            )?.behaviorHints?.filename,
+                          ),
+                        ),
+                    )
+                  }
+                >
+                  Check playability
+                </button>
+                <button
+                  className="circle-button"
+                  onClick={() => setSourceOpen(false)}
+                >
+                  <X />
+                </button>
+              </div>
             </header>
             {sourceBusy ? (
               <div className="sheet-loading">Fetching addon sources…</div>
@@ -386,10 +420,23 @@ export function Details({
                         <small>
                           {stream.addonName}
                           {(() => {
-                            // Warn before the user commits to a source, not
-                            // after it opens silent or black.
+                            const target =
+                              stream.url || stream.externalUrl || "";
+                            const probed = statusFor(target);
+                            // A probe read the container, so it outranks any
+                            // guess made from the file name.
+                            if (probed)
+                              return (
+                                <>
+                                  {" · "}
+                                  <b className={`probe-state-${probed.state}`}>
+                                    {probed.label}
+                                  </b>
+                                  {` · ${probed.detail}`}
+                                </>
+                              );
                             const verdict = assessPlayback(
-                              stream.url || stream.externalUrl || "",
+                              target,
                               stream.behaviorHints?.filename,
                             );
                             if (!verdict.playable)
