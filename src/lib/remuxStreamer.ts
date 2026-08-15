@@ -315,8 +315,22 @@ export class RemuxStreamer {
     }
   }
 
+  /**
+   * Keeps only what will be muxed.
+   *
+   * A file carries tracks we deliberately ignore — the TrueHD alongside the
+   * E-AC-3, three subtitle tracks — and TrueHD alone emits about 1200 frames a
+   * second. Holding those accumulates tens of megabytes of slices that are
+   * never used, and on a phone the memory pressure stops playback long before
+   * anything else fails.
+   *
+   * Before the track choice is made everything is kept, because choosing the
+   * audio track needs a frame to read its configuration from.
+   */
   private absorb(frames: StreamFrame[]) {
+    const chosen = this.muxTracks.size > 0;
     for (const frame of frames) {
+      if (chosen && !this.muxTracks.has(frame.track)) continue;
       const list = this.pending.get(frame.track) ?? [];
       list.push(frame);
       this.pending.set(frame.track, list);
@@ -352,6 +366,10 @@ export class RemuxStreamer {
     }
     if (audio && !("reason" in audio)) wanted.push(audio);
     for (const track of wanted) this.muxTracks.set(track.id, track);
+    // Discard what the priming phase collected for tracks now known to be
+    // unused; without this the first seconds of TrueHD stay resident forever.
+    for (const trackNumber of [...this.pending.keys()])
+      if (!this.muxTracks.has(trackNumber)) this.pending.delete(trackNumber);
     return wanted;
   }
 
