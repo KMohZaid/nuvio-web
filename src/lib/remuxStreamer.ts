@@ -83,10 +83,14 @@ export class RemuxStreamer {
 
     // Read until the demuxer has the track headers, which is what the init
     // segment is built from.
-    while (!this.demuxer.headerComplete && !this.stopped) {
+    // Read past the headers into the first cluster: choosing an audio track
+    // needs a frame in hand, because AC-3 config is read from the bitstream.
+    let primed = 0;
+    while (!this.stopped && (!this.demuxer.headerComplete || primed < 2)) {
       const chunk = await this.fetchNext();
-      if (!chunk) break;
-      this.absorb(this.demuxer.push(chunk));
+      if ("done" in chunk) break;
+      this.absorb(this.demuxer.push(chunk.bytes));
+      if (this.demuxer.headerComplete) primed += 1;
     }
     if (this.stopped) return;
     if (!this.demuxer.headerComplete) {
@@ -145,6 +149,17 @@ export class RemuxStreamer {
 
   /** Keeps fetching while the buffer runs short of the playhead. */
   private async loop() {
+    try {
+      await this.pump0();
+    } catch (error) {
+      this.onStatus({
+        state: "error",
+        message: `Streaming stopped: ${error instanceof Error ? error.message : "unknown"}.`,
+      });
+    }
+  }
+
+  private async pump0() {
     while (!this.stopped) {
       const ahead = this.bufferedAhead();
       if (ahead > TARGET_AHEAD_SECONDS || this.fetching) {
@@ -153,28 +168,43 @@ export class RemuxStreamer {
         continue;
       }
       const chunk = await this.fetchNext();
-      if (!chunk) {
+      if ("done" in chunk) {
         this.flush(true);
+        const complete =
+          this.totalBytes != null && this.nextByte >= this.totalBytes;
         this.onStatus({
-          state: "ended",
-          message: "Reached the end of the file.",
+          state: complete ? "ended" : "error",
+          message: chunk.reason,
           bufferedSeconds: this.bufferedAhead(),
+          fetchedBytes: this.nextByte,
         });
         return;
       }
-      this.absorb(this.demuxer.push(chunk));
+      this.absorb(this.demuxer.push(chunk.bytes));
       this.flush(false);
+      const held = [...this.pending.values()].reduce(
+        (sum, frames) => sum + frames.length,
+        0,
+      );
       this.onStatus({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
-        message: `Streaming · ${(this.nextByte / 1024 / 1024).toFixed(1)} MB read`,
+        message: `${(this.nextByte / 1024 / 1024).toFixed(1)} MB read · queue ${this.queue.length} · ${held} frames held · demux buffer ${(this.demuxer.buffered / 1024).toFixed(0)} KB`,
         bufferedSeconds: this.bufferedAhead(),
         fetchedBytes: this.nextByte,
       });
     }
   }
 
-  private async fetchNext(): Promise<Uint8Array | null> {
-    if (this.totalBytes != null && this.nextByte >= this.totalBytes) return null;
+  /**
+   * Reports why it stopped rather than just returning nothing. Ending because
+   * the file ran out and ending because a request was refused look identical
+   * from the loop, and they need completely different responses.
+   */
+  private async fetchNext(): Promise<
+    { bytes: Uint8Array } | { done: true; reason: string }
+  > {
+    if (this.totalBytes != null && this.nextByte >= this.totalBytes)
+      return { done: true, reason: "Reached the end of the file." };
     this.fetching = true;
     try {
       const end = this.nextByte + CHUNK_BYTES - 1;
@@ -182,13 +212,21 @@ export class RemuxStreamer {
         headers: { Range: `bytes=${this.nextByte}-${end}` },
         cache: "no-store",
       });
-      if (!response.ok && response.status !== 206) return null;
+      if (!response.ok && response.status !== 206)
+        return {
+          done: true,
+          reason: `Host refused a range at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB (HTTP ${response.status}). The link may have expired or be rate limited.`,
+        };
       const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength === 0) return null;
+      if (bytes.byteLength === 0)
+        return { done: true, reason: "Host returned an empty range." };
       this.nextByte += bytes.byteLength;
-      return bytes;
-    } catch {
-      return null;
+      return { bytes };
+    } catch (error) {
+      return {
+        done: true,
+        reason: `Range request failed: ${error instanceof Error ? error.message : "unknown"}.`,
+      };
     } finally {
       this.fetching = false;
     }
