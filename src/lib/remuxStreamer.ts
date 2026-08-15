@@ -154,6 +154,15 @@ export class RemuxStreamer {
     this.element.disableRemotePlayback = true;
     this.element.src = URL.createObjectURL(source as unknown as MediaSource);
 
+    // A MediaSource that closes takes every later call with it, so the moment
+    // it happens is worth recording rather than inferring from the wreckage.
+    source.addEventListener("sourceclose", () => {
+      this.mediaNote = "MediaSource closed";
+    });
+    source.addEventListener("sourceended", () => {
+      this.mediaNote = "MediaSource ended";
+    });
+
     await new Promise<void>((resolve) =>
       source.addEventListener("sourceopen", () => resolve(), { once: true }),
     );
@@ -166,8 +175,13 @@ export class RemuxStreamer {
       buffer.addEventListener("error", () =>
         this.onStatus({ state: "error", message: "SourceBuffer rejected a segment." }),
       );
-      if (this.demuxer.durationSeconds)
-        (source as MediaSource).duration = this.demuxer.durationSeconds;
+      // Best effort: a rejected duration costs a seek bar, not playback.
+      try {
+        if (this.demuxer.durationSeconds)
+          (source as MediaSource).duration = this.demuxer.durationSeconds;
+      } catch (error) {
+        this.mediaNote = `duration rejected (${describeError(error)})`;
+      }
       this.enqueue(buildInitSegment(tracks));
     } catch (error) {
       this.onStatus({
@@ -229,7 +243,9 @@ export class RemuxStreamer {
     } catch (error) {
       this.onStatus({
         state: "error",
-        message: `Streaming stopped: ${error instanceof Error ? error.message : "unknown"}.`,
+        message: `Streaming stopped: ${describeError(error)} · source ${this.source?.readyState ?? "none"} · at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB`,
+        ranges: this.describeRanges(),
+        fetchedBytes: this.nextByte,
       });
     }
   }
@@ -535,6 +551,15 @@ export class RemuxStreamer {
   private pump() {
     const buffer = this.buffer;
     if (!buffer || buffer.updating || this.stopped) return;
+    // Every MSE call throws InvalidStateError once the MediaSource stops being
+    // open, and the exception does not say which object it meant. Checking
+    // first turns that into a state we can report — and a closed source is
+    // worth waiting on, because a ManagedMediaSource detaches under memory
+    // pressure and can be reattached rather than being a dead end.
+    if (this.source?.readyState !== "open") {
+      window.setTimeout(() => this.pump(), 500);
+      return;
+    }
     const next = this.queue.shift();
     if (!next) return;
     try {
@@ -552,7 +577,9 @@ export class RemuxStreamer {
       }
       this.onStatus({
         state: "error",
-        message: error instanceof Error ? error.message : "Append failed.",
+        message: `Append failed: ${describeError(error)} · source ${this.source?.readyState ?? "none"} · updating ${buffer.updating} · queue ${this.queue.length} · segment ${(next.byteLength / 1024).toFixed(0)} KB · readyState ${this.element.readyState}`,
+        ranges: this.describeRanges(),
+        fetchedBytes: this.nextByte,
       });
     }
   }
@@ -623,6 +650,7 @@ export class RemuxStreamer {
   private evict(aggressive = false) {
     const buffer = this.buffer;
     if (!buffer || buffer.updating || !buffer.buffered.length) return false;
+    if (this.source?.readyState !== "open") return false;
     const keep = aggressive ? 2 : KEEP_BEHIND_SECONDS;
     const cutoff = this.element.currentTime - keep;
     if (cutoff <= buffer.buffered.start(0) + 0.1) return false;
@@ -639,6 +667,15 @@ export class RemuxStreamer {
       return false;
     }
   }
+}
+
+/**
+ * A DOMException's message is generic — "The object is in an invalid state"
+ * names neither the object nor the call. The name is the useful half.
+ */
+function describeError(error: unknown) {
+  if (error instanceof DOMException) return `${error.name}: ${error.message}`;
+  return error instanceof Error ? error.message : "unknown";
 }
 
 /** The streaming demuxer and the scanner describe tracks slightly differently. */
