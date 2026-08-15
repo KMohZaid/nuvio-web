@@ -273,9 +273,17 @@ export function App() {
       setSections([]);
       const home = await loadHome(
         installed,
-        (section) => setSections((current) => [...current, section]),
+        (section) => {
+          setSections((current) => [...current, section]);
+          // The first row on screen is the end of "loading". Everything after
+          // this — the rest of the catalogs, and the Continue Watching
+          // metadata — fills in behind a page you can already use.
+          setLoading(false);
+        },
         nextLayout,
       );
+      // No catalog returned anything, so nothing will clear it above.
+      setLoading(false);
       const known = new Map<string, Meta>();
       for (const item of [
         ...home.sections.flatMap((section) => section.items),
