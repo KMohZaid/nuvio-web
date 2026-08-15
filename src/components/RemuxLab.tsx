@@ -105,7 +105,7 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
               <strong>
                 {result.acceptsRanges
                   ? "Range requests accepted"
-                  : "No 206 — the host sent the whole file"}
+                  : "No 206 — the host ignored the range, read was capped"}
               </strong>
               <small>
                 Read {(result.bytesRead / 1024).toFixed(0)} KB

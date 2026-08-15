@@ -67,6 +67,7 @@ function parseTrackEntry(view: DataView, start: number, end: number) {
   const track: MatroskaTrack = { kind: "other", codecId: "" };
   const cursor: Cursor = { view, offset: start };
   while (cursor.offset < end) {
+    const previous = cursor.offset;
     const id = readVint(cursor, true);
     const size = readVint(cursor, false);
     if (id == null || size == null) break;
@@ -92,6 +93,7 @@ function parseTrackEntry(view: DataView, start: number, end: number) {
       // Nested element: walk its children for dimensions and channel count.
       const inner: Cursor = { view, offset: body };
       while (inner.offset < body + size) {
+        const innerPrevious = inner.offset;
         const innerId = readVint(inner, true);
         const innerSize = readVint(inner, false);
         if (innerId == null || innerSize == null) break;
@@ -103,9 +105,13 @@ function parseTrackEntry(view: DataView, start: number, end: number) {
         else if (innerId === ID_CHANNELS)
           track.channels = readUint(view, innerBody, innerSize);
         inner.offset = innerBody + innerSize;
+        if (inner.offset <= innerPrevious) break;
       }
     }
     cursor.offset = body + size;
+    // A malformed element that consumes nothing would loop forever, and a
+    // blocked main thread on iOS is killed — indistinguishable from a crash.
+    if (cursor.offset <= previous) break;
   }
   return track;
 }
@@ -118,6 +124,7 @@ function findTracks(
 ): MatroskaTrack[] | null {
   const cursor: Cursor = { view, offset: start };
   while (cursor.offset < end) {
+    const previous = cursor.offset;
     const id = readVint(cursor, true);
     const size = readVint(cursor, false);
     if (id == null || size == null) return null;
@@ -130,6 +137,7 @@ function findTracks(
       const tracks: MatroskaTrack[] = [];
       const inner: Cursor = { view, offset: body };
       while (inner.offset < limit) {
+        const entryPrevious = inner.offset;
         const entryId = readVint(inner, true);
         const entrySize = readVint(inner, false);
         if (entryId == null || entrySize == null) break;
@@ -143,11 +151,13 @@ function findTracks(
             ),
           );
         inner.offset = entryBody + entrySize;
+        if (inner.offset <= entryPrevious) break;
       }
       return tracks;
     }
     if (size <= 0 || body + size > end) return null;
     cursor.offset = body + size;
+    if (cursor.offset <= previous) return null;
   }
   return null;
 }
@@ -169,21 +179,56 @@ export async function probeMatroska(
   url: string,
   bytes = 2 * 1024 * 1024,
 ): Promise<ProbeResult> {
-  const response = await fetch(url, {
-    headers: { Range: `bytes=0-${bytes - 1}` },
-  });
-  if (!response.ok && response.status !== 206)
-    throw new Error(`Server refused the range request (${response.status}).`);
-  const buffer = await response.arrayBuffer();
-  const contentRange = response.headers.get("content-range");
-  const total = contentRange?.split("/")?.[1];
-  const view = new DataView(buffer);
-  return {
-    bytesRead: buffer.byteLength,
-    acceptsRanges: response.status === 206,
-    totalBytes: total && total !== "*" ? Number(total) : null,
-    tracks: findTracks(view, 0, buffer.byteLength) ?? [],
-  };
+  // 20s ceiling: a debrid host that stalls should fail, not hang the page.
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(url, {
+      headers: { Range: `bytes=0-${bytes - 1}` },
+      signal: controller.signal,
+      // The service worker has no business touching a multi-gigabyte media
+      // request, and on iOS its handling of Range is not dependable.
+      cache: "no-store",
+    });
+    if (!response.ok && response.status !== 206)
+      throw new Error(`Server refused the range request (${response.status}).`);
+
+    // Read incrementally and stop at the cap rather than calling
+    // arrayBuffer(). A host that ignores Range answers 200 with the whole
+    // file, and buffering that is an instant out-of-memory kill on a phone —
+    // which reads as the app simply reloading.
+    const chunks: Uint8Array[] = [];
+    let read = 0;
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("This browser gave no readable stream.");
+    while (read < bytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      chunks.push(value);
+      read += value.byteLength;
+    }
+    // Stop the transfer; without this the rest of the file keeps downloading.
+    await reader.cancel().catch(() => undefined);
+
+    const buffer = new Uint8Array(Math.min(read, bytes));
+    let offset = 0;
+    for (const chunk of chunks) {
+      if (offset >= buffer.byteLength) break;
+      buffer.set(chunk.subarray(0, buffer.byteLength - offset), offset);
+      offset += chunk.byteLength;
+    }
+    const contentRange = response.headers.get("content-range");
+    const total = contentRange?.split("/")?.[1];
+    const view = new DataView(buffer.buffer, 0, buffer.byteLength);
+    return {
+      bytesRead: buffer.byteLength,
+      acceptsRanges: response.status === 206,
+      totalBytes: total && total !== "*" ? Number(total) : null,
+      tracks: findTracks(view, 0, buffer.byteLength) ?? [],
+    };
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 /** What a codec means for a remux-only pipeline in this browser. */
