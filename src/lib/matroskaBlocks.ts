@@ -147,7 +147,7 @@ function readBlockHeader(view: DataView, start: number) {
   return { track, relative, flags, headerEnd: cursor.offset + 3 };
 }
 
-export function scanBlocks(buffer: Uint8Array, frameLimit = 400): BlockScan {
+export function scanBlocks(buffer: Uint8Array, frameLimit = 20_000): BlockScan {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const scan: BlockScan = {
     timestampScaleNs: 1_000_000,

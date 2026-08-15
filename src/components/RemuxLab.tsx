@@ -87,7 +87,13 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
         ]
           .filter(Boolean)
           .join(" ");
-        return `  ${track.kind.padEnd(8)} ${verdict.label.padEnd(8)} ${shape.padEnd(16)} ${verdict.status.padEnd(9)} ${track.codecId}`;
+        const status =
+          track.kind === "subtitle"
+            ? track.codecId.toUpperCase().startsWith("S_TEXT")
+              ? "webvtt"
+              : "dropped"
+            : verdict.status;
+        return `  ${track.kind.padEnd(8)} ${verdict.label.padEnd(11)} ${shape.padEnd(16)} ${status.padEnd(9)} ${track.codecId}`;
       }),
     ];
     if (blocks) {
@@ -100,8 +106,22 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
       lines.push(
         "",
         `frames: ${blocks.frames.length} across ${blocks.clusters} cluster(s) · ${keys} keyframes · ${(span / 1000).toFixed(2)}s spanned`,
-        `config: ${config}/${blocks.tracks.length} tracks carry decoder config · timestamp scale ${blocks.timestampScaleNs / 1000}µs`,
-        blocks.truncated ? "note: buffer ended mid-element" : "",
+        `timestamp scale ${blocks.timestampScaleNs / 1000}µs · ${config}/${blocks.tracks.length} tracks carry decoder config`,
+        "",
+        "per track:",
+        ...blocks.tracks.map((track) => {
+          const own = blocks.frames.filter(
+            (frame) => frame.track === track.number,
+          );
+          const ownKeys = own.filter((frame) => frame.keyframe).length;
+          const ownTimes = own.map((frame) => frame.timeMs);
+          const ownSpan = ownTimes.length
+            ? Math.max(...ownTimes) - Math.min(...ownTimes)
+            : 0;
+          return `  #${track.number} ${track.kind.padEnd(8)} ${track.codecId.padEnd(16)} ${String(own.length).padStart(5)} frames  ${String(ownKeys).padStart(4)} key  ${(ownSpan / 1000).toFixed(2).padStart(7)}s  ${track.codecPrivate?.length ? `${track.codecPrivate.length}B config` : "no config"}`;
+        }),
+        blocks.truncated ? "" : "",
+        blocks.truncated ? "note: buffer ended mid-element (expected)" : "",
       );
     }
     return lines.filter((line) => line !== undefined).join("\n").trim();
@@ -249,6 +269,40 @@ export function RemuxLab({ onBack }: { onBack(): void }) {
               </div>
             );
           })()}
+          {scan &&
+            scan.tracks.map((track) => {
+              const frames = scan.frames.filter(
+                (frame) => frame.track === track.number,
+              );
+              const keys = frames.filter((frame) => frame.keyframe).length;
+              const times = frames.map((frame) => frame.timeMs);
+              const span = times.length
+                ? Math.max(...times) - Math.min(...times)
+                : 0;
+              const config = track.codecPrivate?.length ?? 0;
+              // A track a remuxer would carry needs both: frames located, and
+              // either decoder config or a codec whose config is synthesised.
+              const usable = frames.length > 0;
+              return (
+                <div className="info-row" key={`scan-${track.number}`}>
+                  <span>
+                    <strong>
+                      track {track.number} · {track.kind} · {track.codecId}
+                    </strong>
+                    <small className={usable ? "probe-ok" : "probe-blocked"}>
+                      {frames.length} frames
+                      {frames.length
+                        ? ` · ${keys} key · ${(span / 1000).toFixed(2)}s · ${(frames.reduce((sum, frame) => sum + frame.size, 0) / 1024).toFixed(0)} KB`
+                        : " — none in this range"}
+                      {" · "}
+                      {config
+                        ? `${config} bytes of decoder config`
+                        : "no CodecPrivate"}
+                    </small>
+                  </span>
+                </div>
+              );
+            })}
           {scan && (
             <div className="info-row">
               <span>
