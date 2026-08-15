@@ -2854,9 +2854,34 @@ body.is-locked {
 }
 .watch-prompt-fields {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 16px;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+/* The runtime the addon gave us, shown beside the field rather than in it. */
+.watch-prompt-total {
+  padding-bottom: 13px;
+  color: #8d97a2;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.watch-prompt-fields input[aria-invalid="true"] {
+  border-color: #7d3b3f;
+}
+.watch-prompt-hint {
+  margin: 0 0 18px;
+  min-height: 18px;
+  color: #8d97a2;
+  font-size: 12.5px;
+}
+.watch-prompt-hint.is-error {
+  color: #e58b8b;
+}
+.watch-prompt-actions .primary:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .watch-prompt-fields label {
   display: grid;

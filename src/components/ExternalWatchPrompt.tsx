@@ -11,16 +11,31 @@ import type { Meta, Video } from "../types";
  */
 const HOUR = 3600;
 
-/** Accepts `mm:ss`, `h:mm:ss`, or a plain minute count. */
+/**
+ * Strictly `m:ss` or `h:mm:ss`, with real minute and second values.
+ *
+ * Deliberately refuses a half-typed time: `24:1` reads as twenty-four minutes
+ * and one second but almost always means `24:10`, and silently accepting it
+ * writes a resume point a minute and a half from where you actually were.
+ */
 export function parseTimecode(value: string): number | null {
   const trimmed = value.trim();
-  if (!trimmed) return null;
-  if (!/^\d{1,2}(:\d{1,2}){0,2}$/.test(trimmed)) return null;
-  const parts = trimmed.split(":").map(Number);
-  if (parts.some((part) => !Number.isFinite(part))) return null;
-  if (parts.length === 1) return parts[0]! * 60;
-  if (parts.length === 2) return parts[0]! * 60 + parts[1]!;
-  return parts[0]! * HOUR + parts[1]! * 60 + parts[2]!;
+  const short = /^(\d{1,3}):([0-5]\d)$/.exec(trimmed);
+  if (short) return Number(short[1]) * 60 + Number(short[2]);
+  const long = /^(\d{1,2}):([0-5]\d):([0-5]\d)$/.exec(trimmed);
+  if (long)
+    return Number(long[1]) * HOUR + Number(long[2]) * 60 + Number(long[3]);
+  return null;
+}
+
+export function formatSeconds(total: number): string {
+  const hours = Math.floor(total / HOUR);
+  const minutes = Math.floor((total % HOUR) / 60);
+  const seconds = Math.floor(total % 60);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return hours
+    ? `${hours}:${pad(minutes)}:${pad(seconds)}`
+    : `${minutes}:${pad(seconds)}`;
 }
 
 /** Minutes from `Video.runtime` (a number) or `Meta.runtime` ("142 min"). */
@@ -36,8 +51,7 @@ export function runtimeMinutes(meta: Meta, video?: Video): number | null {
   return bare ? Number(bare[1]) : null;
 }
 
-const formatMinutes = (minutes: number) =>
-  `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, "0")}`;
+
 
 export function ExternalWatchPrompt({
   meta,
@@ -55,28 +69,25 @@ export function ExternalWatchPrompt({
   const known = runtimeMinutes(meta, video);
   const [partial, setPartial] = useState(false);
   const [stoppedAt, setStoppedAt] = useState("");
-  const [total, setTotal] = useState(known ? formatMinutes(known) : "");
-  const [error, setError] = useState("");
+  const [total, setTotal] = useState("");
 
-  const save = () => {
-    const position = parseTimecode(stoppedAt);
-    const duration = parseTimecode(total);
-    if (position == null) {
-      setError("Enter a time like 24:10 or 1:24:10.");
-      return;
-    }
-    // A resume point needs a duration: progress is stored as a fraction, and
-    // without one the card cannot show how far through you are.
-    if (duration == null || duration <= 0) {
-      setError("Enter the total length so the position means something.");
-      return;
-    }
-    if (position >= duration) {
-      setError("That is past the end — use “I finished it” instead.");
-      return;
-    }
-    onStopped(position * 1000, duration * 1000);
-  };
+  // The runtime the addon reported, when it reported one — shown rather than
+  // asked for, so there is nothing to mistype.
+  const knownSeconds = known ? known * 60 : null;
+  const duration = knownSeconds ?? parseTimecode(total);
+  const position = parseTimecode(stoppedAt);
+
+  const problem =
+    stoppedAt.trim() === ""
+      ? null
+      : position == null
+        ? "Use m:ss or h:mm:ss — 24:10, or 1:24:10."
+        : duration == null
+          ? "Enter the total length too."
+          : position >= duration
+            ? `That is past the end of ${formatSeconds(duration)} — use “I finished it”.`
+            : null;
+  const ready = position != null && duration != null && problem == null;
 
   return (
     <div className="sheet-backdrop" onClick={onDismiss}>
@@ -100,25 +111,41 @@ export function ExternalWatchPrompt({
                   inputMode="numeric"
                   placeholder="24:10"
                   value={stoppedAt}
+                  aria-invalid={problem != null}
                   onChange={(event) => setStoppedAt(event.target.value)}
                 />
               </label>
-              <label>
-                Total length
-                <input
-                  inputMode="numeric"
-                  placeholder="48:00"
-                  value={total}
-                  onChange={(event) => setTotal(event.target.value)}
-                />
-              </label>
+              {knownSeconds == null ? (
+                <label>
+                  Total length
+                  <input
+                    inputMode="numeric"
+                    placeholder="48:00"
+                    value={total}
+                    onChange={(event) => setTotal(event.target.value)}
+                  />
+                </label>
+              ) : (
+                <span className="watch-prompt-total">
+                  of {formatSeconds(knownSeconds)}
+                </span>
+              )}
             </div>
-            {error && <div className="notice error">{error}</div>}
+            <p className={problem ? "watch-prompt-hint is-error" : "watch-prompt-hint"}>
+              {problem ??
+                (ready
+                  ? `${formatSeconds(position!)} of ${formatSeconds(duration!)} · ${Math.round((position! / duration!) * 100)}% watched`
+                  : "Enter where you stopped, as m:ss or h:mm:ss.")}
+            </p>
             <div className="watch-prompt-actions">
               <button className="secondary" onClick={() => setPartial(false)}>
                 Back
               </button>
-              <button className="primary" onClick={save}>
+              <button
+                className="primary"
+                disabled={!ready}
+                onClick={() => onStopped(position! * 1000, duration! * 1000)}
+              >
                 Save position
               </button>
             </div>
