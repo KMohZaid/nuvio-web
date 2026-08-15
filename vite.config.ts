@@ -1,0 +1,60 @@
+import { defineConfig, loadEnv } from "vite";
+import react from "@vitejs/plugin-react";
+import { VitePWA } from "vite-plugin-pwa";
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, ".", "");
+  return {
+    define: {
+      "import.meta.env.VITE_NUVIO_SUPABASE_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_URL || env.NUVIO_SUPABASE_URL || ""),
+      "import.meta.env.VITE_NUVIO_SUPABASE_FALLBACK_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_FALLBACK_URL || env.NUVIO_SUPABASE_FALLBACK_URL || ""),
+      "import.meta.env.VITE_NUVIO_SUPABASE_ANON_KEY": JSON.stringify(env.VITE_NUVIO_SUPABASE_ANON_KEY || env.NUVIO_SUPABASE_ANON_KEY || ""),
+    },
+    plugins: [
+      react(),
+      VitePWA({
+        registerType: "autoUpdate",
+        includeAssets: [
+          "app-icon-1024.png",
+          "Nuvio-icon.png",
+          "nuvio-wordmark.png",
+        ],
+        manifest: {
+          name: "Nuvio Web",
+          short_name: "Nuvio",
+          description: "Browse Nuvio catalogs and play browser-compatible streams.",
+          theme_color: "#080a0d",
+          background_color: "#080a0d",
+          display: "standalone",
+          orientation: "any",
+          start_url: "/",
+          icons: [
+            { src: "/app-icon-1024.png", sizes: "1024x1024", type: "image/png", purpose: "any" },
+            // Kept separate from "any": a maskable icon is cropped to the
+            // platform's safe zone, so declaring one entry as both lets
+            // Android crop artwork that was never padded for it.
+            { src: "/app-icon-1024.png", sizes: "1024x1024", type: "image/png", purpose: "maskable" }
+          ]
+        },
+        workbox: {
+          navigateFallback: "/index.html",
+          runtimeCaching: [
+            {
+              urlPattern: ({ request }) => request.destination === "image",
+              handler: "CacheFirst",
+              options: { cacheName: "nuvio-images", expiration: { maxEntries: 300, maxAgeSeconds: 604800 } }
+            }
+          ]
+        }
+      })
+    ],
+    // The tunnel forwards the public Host header through to Vite, which
+    // rejects hosts it does not know with "Blocked request".
+    server: { port: 4174, host: "0.0.0.0", allowedHosts: ["nuvioweb.lucaboox.win"] },
+    // The tunnel targets preview, not dev: vite-plugin-pwa only emits a
+    // service worker on build, so a PWA install needs the built output.
+    // strictPort keeps it from drifting onto another port and silently
+    // leaving the tunnel pointed at nothing.
+    preview: { port: 4180, strictPort: true, host: "0.0.0.0", allowedHosts: ["nuvioweb.lucaboox.win"] }
+  };
+});

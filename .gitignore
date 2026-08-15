@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.env.local
+*.log
+
+# Tunnel config: names a specific tunnel UUID and points at the credentials
+# JSON in ~/.cloudflared. Machine-specific, and not something to publish.
+cloudflared.yml
+*.cloudflared.yml
+cert.pem
+*.pem
+
+
+# Compiled artifacts of vite.config.ts. Vite loads vite.config.js in
+# preference to the .ts, so a stale copy here silently shadows the source.
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#080a0d" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="darkreader-lock" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <!--
+      iOS takes the Home Screen icon from apple-touch-icon in preference to the
+      manifest, and applies its own rounded-corner mask — so this wants the
+      full-bleed square artwork, not a pre-rounded one.
+    -->
+    <link rel="apple-touch-icon" href="/app-icon-1024.png" />
+    <link rel="icon" type="image/png" href="/app-icon-1024.png" />
+    <!--
+      NOT black-translucent. That mode puts page content underneath the status
+      bar, and iOS then composites its own blurred scrim behind the clock so it
+      stays legible over whatever is below — which is the haze across the top of
+      the installed app. `black` makes iOS reserve the status bar area instead,
+      so nothing renders under it and no scrim is drawn. SeatWatch omits this
+      meta entirely and has never shown the band.
+    -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; img-src 'self' https: data: blob:; media-src 'self' https: http: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; worker-src 'self' blob:; frame-src https://www.youtube-nocookie.com; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <title>Nuvio Web</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
