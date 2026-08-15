@@ -338,15 +338,21 @@ a {
   z-index: 35;
   top: 88px;
   margin: 0 auto 12px;
-  max-width: 800px;
+  max-width: 620px;
   display: flex;
-  justify-content: space-between;
+  align-items: center;
   gap: 12px;
   background: #20262d;
   border: 1px solid #3a434d;
   border-radius: 12px;
   padding: 12px 14px;
   color: #d7dce1;
+}
+/* The message absorbs the free space so the actions stay grouped at the end
+   rather than being spread across the bar. */
+.notice > span {
+  flex: 1;
+  min-width: 0;
 }
 .notice.error {
   background: #301b1e;
@@ -2637,7 +2643,7 @@ body.is-locked {
    sits on, not match it — which is what the earlier green-on-green did. */
 .update-notice {
   align-items: center;
-  gap: 14px;
+  gap: 10px;
   border-color: #2f7d55;
   background: #17663d;
   color: #eaf6ee;
@@ -2735,9 +2741,16 @@ body.is-locked {
 .media-row.is-dragging,
 .continue-row.is-dragging {
   cursor: grabbing;
-  /* Snap fights a drag, and text selection turns it into a highlight. */
-  scroll-snap-type: none;
   user-select: none;
+}
+/* Scroll snap and free dragging are incompatible: on release the row jumps to
+   the nearest card, which reads as jitter. Snap is worth keeping for a touch
+   swipe, so it is dropped only where a mouse is driving. */
+@media (hover: hover) and (pointer: fine) {
+  .media-row,
+  .continue-row {
+    scroll-snap-type: none;
+  }
 }
 .media-row.is-dragging img,
 .continue-row.is-dragging img {
