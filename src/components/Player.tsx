@@ -5,7 +5,7 @@ import {
   audioIsSilent,
   shouldUseRemuxFallback,
 } from "../lib/playback";
-import { RemuxStreamer } from "../lib/remuxStreamer";
+import { StableRemuxStreamer } from "../lib/stableRemuxStreamer";
 import {
   browserColor,
   type WebPlayerSettings,
@@ -201,7 +201,7 @@ export function Player({
       return;
     }
     let disposed = false;
-    let remuxer: RemuxStreamer | null = null;
+    let remuxer: StableRemuxStreamer | null = null;
     let audioWatch: number | undefined;
     let preferredAudioApplied = false;
     let preferredSubtitleApplied = false;
@@ -411,7 +411,7 @@ export function Player({
     const verdict = assessPlayback(url, sourceText);
     if (shouldUseRemuxFallback(url, sourceText)) {
         setRemuxActive(true);
-        remuxer = new RemuxStreamer(
+        remuxer = new StableRemuxStreamer(
           url,
           element,
           (next) => {
@@ -428,7 +428,10 @@ export function Player({
               setStatus("");
             }
           },
-          { requestHeaders: stream.behaviorHints?.proxyHeaders?.request },
+          {
+            requestHeaders: stream.behaviorHints?.proxyHeaders?.request,
+            preferredAudioLanguage: settings.preferredAudioLanguage,
+          },
         );
         void remuxer.start().catch((reason: unknown) => {
           if (disposed) return;

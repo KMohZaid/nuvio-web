@@ -86,6 +86,8 @@ export type StreamerStatus = {
 export type RemuxStreamerOptions = {
   /** Request headers supplied by the Stremio stream behavior hints. */
   requestHeaders?: Record<string, string>;
+  /** Synced Nuvio language preference used when an MKV has several tracks. */
+  preferredAudioLanguage?: string;
 };
 
 export class RemuxStreamer {

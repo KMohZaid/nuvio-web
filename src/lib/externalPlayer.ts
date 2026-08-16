@@ -35,6 +35,19 @@ export async function copyStreamUrl(url: string): Promise<boolean> {
   }
 }
 
+export function infusePlaybackUrl(url: string, title: string) {
+  let extension = ".mkv";
+  try {
+    const match = new URL(url).pathname.match(/\.(mkv|mp4|m4v|mov|avi|webm)$/i);
+    if (match) extension = match[0].toLowerCase();
+  } catch {
+    // Signed and custom URLs do not always parse, but filename is optional.
+  }
+  const filename = `${title.replace(/[^a-z0-9 _.-]/gi, "_").trim() || "Nuvio"}${extension}`;
+  const query = new URLSearchParams({ url, filename });
+  return `infuse://x-callback-url/play?${query.toString()}`;
+}
+
 /**
  * Hands a stream to something outside the browser.
  *
@@ -62,6 +75,10 @@ export function launchExternalPlayer(
   }
   if (mode === "outplayer") {
     window.location.href = `outplayer://${url}`;
+    return;
+  }
+  if (mode === "infuse") {
+    window.location.href = infusePlaybackUrl(url, title);
     return;
   }
   if (mode === "m3u") download(m3uFor(url, title), title, "m3u");

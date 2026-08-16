@@ -164,6 +164,7 @@ export type ExternalPlayerMode =
   | "copy"
   | "vlc"
   | "outplayer"
+  | "infuse"
   | "m3u";
 export type NavKey =
   | "home"

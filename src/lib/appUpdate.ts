@@ -12,6 +12,7 @@ let apply: (() => Promise<void>) | null = null;
 let ready = false;
 let registration: ServiceWorkerRegistration | null = null;
 const listeners = new Set<Listener>();
+let suppressPromptUntil = 0;
 
 export function setRegistration(value: ServiceWorkerRegistration | null): void {
   registration = value;
@@ -24,7 +25,29 @@ export type UpdateCheck = "pending" | "current" | "unsupported";
  * its own periodic check. A pending worker means a new build is waiting, and
  * `onNeedRefresh` will have raised the reload prompt.
  */
-export async function checkForUpdate(): Promise<UpdateCheck> {
+async function waitForInstallation(active: ServiceWorkerRegistration) {
+  const worker = active.installing;
+  if (!worker || worker.state === "installed" || worker.state === "redundant")
+    return;
+  await new Promise<void>((resolve) => {
+    const timeout = window.setTimeout(finish, 15_000);
+    function finish() {
+      window.clearTimeout(timeout);
+      worker?.removeEventListener("statechange", onState);
+      resolve();
+    }
+    function onState() {
+      if (worker?.state === "installed" || worker?.state === "redundant")
+        finish();
+    }
+    worker.addEventListener("statechange", onState);
+  });
+}
+
+export async function checkForUpdate({
+  prompt = true,
+}: { prompt?: boolean } = {}): Promise<UpdateCheck> {
+  if (!prompt) suppressPromptUntil = Date.now() + 30_000;
   const active =
     registration ??
     (await navigator.serviceWorker?.getRegistration().catch(() => null)) ??
@@ -33,16 +56,19 @@ export async function checkForUpdate(): Promise<UpdateCheck> {
   registration = active;
   try {
     await active.update();
+    await waitForInstallation(active);
   } catch {
     return "unsupported";
   }
-  return active.waiting || active.installing || ready ? "pending" : "current";
+  return active.waiting || ready ? "pending" : "current";
 }
 
 export function setUpdateHandler(handler: () => Promise<void>): void {
   apply = handler;
   ready = true;
-  for (const listener of listeners) listener();
+  if (Date.now() >= suppressPromptUntil) {
+    for (const listener of listeners) listener();
+  }
 }
 
 export function subscribeUpdate(listener: Listener): () => void {

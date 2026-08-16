@@ -278,7 +278,10 @@ export function App() {
     ) as ExternalPlayerMode | null;
     // The iOS-only schemes cannot work here, so an old choice would silently
     // do nothing. Copying is the desktop equivalent.
-    if (isDesktop() && (stored === "vlc" || stored === "outplayer"))
+    if (
+      isDesktop() &&
+      (stored === "vlc" || stored === "outplayer" || stored === "infuse")
+    )
       return "copy";
     return stored ?? "internal";
   });
@@ -324,7 +327,9 @@ export function App() {
   // Ask once at startup rather than waiting for the browser's own schedule,
   // which can be hours — long enough to keep running a build you replaced.
   useEffect(() => {
-    void checkForUpdate();
+    void checkForUpdate({ prompt: true }).then((result) => {
+      if (result === "pending") setHasUpdate(true);
+    });
   }, []);
   const activateProfile = useCallback((next: Profile | null) => {
     profileGeneration.current += 1;
@@ -1118,14 +1123,26 @@ export function App() {
       webSettings.continueWatching,
     ],
   );
+  const updatePrompt = hasUpdate ? (
+    <UpdateModal onLater={() => setHasUpdate(false)} />
+  ) : null;
   if (booting)
     return (
-      <div className="splash">
-        <img src={`${import.meta.env.BASE_URL}Nuvio-icon.png`} alt="" />
-        <span>Restoring Nuvio…</span>
-      </div>
+      <>
+        <div className="splash">
+          <img src={`${import.meta.env.BASE_URL}Nuvio-icon.png`} alt="" />
+          <span>Restoring Nuvio…</span>
+        </div>
+        {updatePrompt}
+      </>
     );
-  if (!session) return <AuthScreen onSession={setSession} />;
+  if (!session)
+    return (
+      <>
+        <AuthScreen onSession={setSession} />
+        {updatePrompt}
+      </>
+    );
   return (
     <div className={`app-shell${playback ? " player-active" : ""}`}>
       <aside className="rail">
@@ -1178,21 +1195,6 @@ export function App() {
         />
       </header>
       <main className="content">
-        {hasUpdate && (
-          <div className="notice update-notice">
-            <span>A new version of Nuvio Web is ready.</span>
-            <button className="notice-action" onClick={() => applyUpdate()}>
-              Reload
-            </button>
-            <button
-              className="notice-dismiss"
-              aria-label="Dismiss"
-              onClick={() => setHasUpdate(false)}
-            >
-              <X size={18} />
-            </button>
-          </div>
-        )}
         {message && (
           <div className="notice">
             <span>{message}</span>
@@ -1309,6 +1311,7 @@ export function App() {
           />
         )}
       </main>
+      {updatePrompt}
       <nav
         className="bottom-nav"
         style={
@@ -1408,7 +1411,13 @@ export function App() {
                   ? "Stream URL copied. Paste it into VLC or your media player to watch."
                   : externalPlayer === "m3u"
                     ? "Playlist downloaded. Open it with your preferred player."
-                    : `Opening ${externalPlayer === "vlc" ? "VLC" : "Outplayer"}…`,
+                    : `Opening ${
+                        externalPlayer === "vlc"
+                          ? "VLC"
+                          : externalPlayer === "infuse"
+                            ? "Infuse"
+                            : "Outplayer"
+                      }…`,
               );
               // Details stays open: the stream opened elsewhere, so this page
               // is exactly where you want to be when you come back. The prompt
@@ -1821,9 +1830,50 @@ function AddonSettings({
  * hours; this asks immediately. A found update raises the usual reload prompt
  * rather than restarting the app from under you.
  */
+function UpdateModal({ onLater }: { onLater(): void }) {
+  const [applying, setApplying] = useState(false);
+  return (
+    <div className="update-modal-backdrop" role="presentation">
+      <section
+        className="update-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="update-modal-title"
+      >
+        <span className="update-modal-icon">
+          <RefreshCw />
+        </span>
+        <div>
+          <h2 id="update-modal-title">Nuvio Web update ready</h2>
+          <p>
+            Install the latest version now. The page will reload automatically
+            when it is ready.
+          </p>
+        </div>
+        <div className="update-modal-actions">
+          <button className="secondary" disabled={applying} onClick={onLater}>
+            Later
+          </button>
+          <button
+            className="primary"
+            disabled={applying}
+            onClick={() => {
+              setApplying(true);
+              void applyUpdate();
+            }}
+          >
+            <RefreshCw size={17} className={applying ? "spin-icon" : ""} />
+            {applying ? "Updating…" : "Update now"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function UpdateRow() {
   const [state, setState] = useState<"idle" | "checking" | "current" | "pending">(
-    "idle",
+    updateReady() ? "pending" : "idle",
   );
   return (
     <>
@@ -1836,7 +1886,7 @@ function UpdateRow() {
               : state === "current"
                 ? "You are on the latest version."
                 : state === "pending"
-                  ? "An update is ready — use the Reload bar at the top."
+                  ? "An update is downloaded and ready to install."
                   : `Build ${new Date(__APP_BUILD__).toLocaleString()}`}
           </small>
         </span>
@@ -1844,19 +1894,19 @@ function UpdateRow() {
           className="secondary"
           disabled={state === "checking"}
           onClick={async () => {
+            if (state === "pending") {
+              await applyUpdate();
+              return;
+            }
             setState("checking");
-            const result = await checkForUpdate();
+            const result = await checkForUpdate({ prompt: false });
             setState(result === "pending" ? "pending" : "current");
           }}
         >
-          <RefreshCw size={16} /> Check
+          <RefreshCw size={16} className={state === "checking" ? "spin-icon" : ""} />
+          {state === "pending" ? "Update" : state === "checking" ? "Checking…" : "Check"}
         </button>
       </div>
-      {state === "pending" && (
-        <button className="primary wide" onClick={() => applyUpdate()}>
-          Reload now
-        </button>
-      )}
     </>
   );
 }
@@ -3001,7 +3051,9 @@ function SettingsPage({
             <small>
               {isDesktop()
                 ? "Desktop browsers copy the URL for VLC. The desktop Nuvio app has native playback."
-                : "VLC and Outplayer open through their iOS URL schemes."}
+                : isAppleMobile()
+                  ? "VLC, Outplayer, and Infuse open through their iOS URL schemes."
+                  : "External players open through their registered mobile URL schemes."}
             </small>
           </span>
           <select
@@ -3017,6 +3069,7 @@ function SettingsPage({
               <>
                 <option value="vlc">VLC</option>
                 <option value="outplayer">Outplayer (iOS/iPadOS)</option>
+                {isAppleMobile() && <option value="infuse">Infuse</option>}
               </>
             )}
             <option value="m3u">Download M3U playlist</option>
