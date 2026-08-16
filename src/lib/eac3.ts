@@ -20,7 +20,10 @@ const FSCOD2_RATES = [24000, 22050, 16000];
 
 class BitReader {
   private bit = 0;
-  constructor(private readonly bytes: Uint8Array) {}
+  private readonly bytes: Uint8Array;
+  constructor(bytes: Uint8Array) {
+    this.bytes = bytes;
+  }
   read(count: number): number {
     let value = 0;
     for (let index = 0; index < count; index += 1) {
@@ -43,6 +46,8 @@ export type Ac3Info = {
   channels: number;
   /** Nominal rate in kbit/s, which the dec3 box carries. */
   dataRateKbps: number;
+  /** AC-3's coded bitrate index, used verbatim by the dac3 box. */
+  bitRateCode?: number;
 };
 
 /** Finds the 0x0B77 sync word; a Matroska block should open with it. */
@@ -57,10 +62,8 @@ export function parseAc3(frame: Uint8Array): Ac3Info | null {
   if (start < 0) return null;
   const reader = new BitReader(frame.subarray(start + 2));
 
-  // bsid sits at a fixed offset from the sync word in both variants, and
+  // bsid sits at a fixed byte offset from the sync word in both variants and
   // decides which layout the rest of the header uses: 16 means E-AC-3.
-  const probe = new BitReader(frame.subarray(start + 2));
-  probe.read(16 + 16); // skip enough to reach bsid in the AC-3 layout
   const isEac3 = ((frame[start + 5] ?? 0) >> 3) === 16;
 
   if (isEac3) {
@@ -97,8 +100,11 @@ export function parseAc3(frame: Uint8Array): Ac3Info | null {
     };
   }
 
+  // AC-3 carries a 16-bit CRC immediately after the sync word. Reading fscod
+  // before skipping it generated a plausible but incorrect dac3 record.
+  reader.read(16); // crc1
   const fscod = reader.read(2);
-  reader.read(6); // frmsizecod
+  const frmsizecod = reader.read(6);
   const bsid = reader.read(5);
   const bsmod = reader.read(3);
   const acmod = reader.read(3);
@@ -116,6 +122,7 @@ export function parseAc3(frame: Uint8Array): Ac3Info | null {
     sampleRate: FSCOD_RATES[fscod] ?? 48000,
     channels: (ACMOD_CHANNELS[acmod] ?? 2) + lfeon,
     dataRateKbps: 640,
+    bitRateCode: frmsizecod >> 1,
   };
 }
 
@@ -162,7 +169,7 @@ export function buildDac3(info: Ac3Info): Uint8Array {
     .write(info.bsmod, 3)
     .write(info.acmod, 3)
     .write(info.lfeon, 1)
-    .write(0x10, 5) // bit_rate_code — nominal, not enforced by decoders
+    .write(info.bitRateCode ?? 0x10, 5)
     .write(0, 5) // reserved
     .bytes();
 }

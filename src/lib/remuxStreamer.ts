@@ -1,7 +1,27 @@
 import { codecStringFor } from "./codecString";
-import { buildInitSegment, buildMediaSegment, type MuxTrack } from "./fmp4";
+import {
+  buildInitSegment,
+  buildMediaSegment,
+  type MuxSample,
+  type MuxTrack,
+} from "./fmp4";
 import { MatroskaStream, type StreamFrame } from "./matroskaStream";
 import { describeTrack } from "./remux";
+import {
+  parseContentRange,
+  partialResponseMatches,
+  reachedDeclaredRangeEnd,
+} from "./httpRange";
+import {
+  fragmentCutIndex,
+  initialFragmentStartIndex,
+} from "./remuxFragments";
+import {
+  shouldManuallyEvict,
+  shouldPauseManagedBuffering,
+  shouldPauseForRemuxQueue,
+  shouldReportNoAppendProgress,
+} from "./remuxBufferPolicy";
 import type { TrackHeader } from "./matroskaBlocks";
 
 /**
@@ -21,6 +41,8 @@ import type { TrackHeader } from "./matroskaBlocks";
  * and which shows up as a generic network failure part way in.
  */
 const CHUNK_BYTES = 8 * 1024 * 1024;
+/** Header/track priming must not accumulate a normal 8 MB media chunk. */
+const PRIME_CHUNK_BYTES = 512 * 1024;
 /** A refused range is usually transient: back off and try again. */
 const FETCH_ATTEMPTS = 3;
 /**
@@ -43,17 +65,15 @@ const STUCK_AFTER_MS = 12_000;
 const BUFFER_BUDGET_BYTES = 40 * 1024 * 1024;
 const MAX_AHEAD_SECONDS = 30;
 const MIN_AHEAD_SECONDS = 6;
+/** iOS WebContent has a much tighter practical memory ceiling than desktop. */
+const MANAGED_BUFFER_BUDGET_BYTES = 24 * 1024 * 1024;
+const MANAGED_MAX_AHEAD_SECONDS = 12;
+const MANAGED_MIN_AHEAD_SECONDS = 4;
+/** Remuxed fragments waiting for SourceBuffer need their own hard ceiling. */
+const MAX_QUEUED_BYTES = 16 * 1024 * 1024;
+const MAX_QUEUED_SEGMENTS = 32;
 /** How much history to keep before evicting; MSE throws when the quota goes. */
 const KEEP_BEHIND_SECONDS = 6;
-/** Frames are batched into fragments of about this length. */
-const FRAGMENT_SECONDS = 2;
-/**
- * A video fragment is cut at a keyframe, so it can run longer than the target
- * while waiting for one. Past this it is emitted regardless: a long GOP is
- * worth a non-conforming fragment less than it is worth a stall.
- */
-const MAX_FRAGMENT_SECONDS = 12;
-
 export type StreamerStatus = {
   state: "idle" | "starting" | "buffering" | "ready" | "ended" | "error";
   message: string;
@@ -63,13 +83,21 @@ export type StreamerStatus = {
   ranges?: string;
 };
 
+export type RemuxStreamerOptions = {
+  /** Request headers supplied by the Stremio stream behavior hints. */
+  requestHeaders?: Record<string, string>;
+};
+
 export class RemuxStreamer {
   private demuxer = new MatroskaStream();
   private source: MediaSource | null = null;
   private buffer: SourceBuffer | null = null;
   private queue: Uint8Array[] = [];
+  private queuedBytes = 0;
   private pending = new Map<number, StreamFrame[]>();
   private muxTracks = new Map<number, MuxTrack>();
+  /** Tracks that have already emitted their initial random-access fragment. */
+  private startedTracks = new Set<number>();
   private sequence = 1;
   private nextByte = 0;
   private totalBytes: number | null = null;
@@ -102,6 +130,20 @@ export class RemuxStreamer {
    */
   private failed = false;
   private closedWaits = 0;
+  private activeAbort: AbortController | null = null;
+  /** Used when a host ignores Range and returns one ordinary HTTP 200 body. */
+  private sequentialReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  private sequentialRemainder: Uint8Array | null = null;
+  private sequentialDone = false;
+  private eofPending = false;
+  private eofReason = "";
+  private objectUrl = "";
+  private cleanups: Array<() => void> = [];
+  private selectionError = "";
+  /** MMS performs its own active cleanup and must not be trimmed continuously. */
+  private managedMediaSource = false;
+  /** Set by MMS startstreaming/endstreaming demand signals. */
+  private managedWantsData = true;
 
   private enter(phase: string) {
     this.phase = phase;
@@ -129,6 +171,7 @@ export class RemuxStreamer {
   }
 
   private report(status: StreamerStatus) {
+    if (this.stopped) return;
     if (this.failed && status.state !== "error") return;
     if (status.state === "error") this.failed = true;
     this.onStatus(status);
@@ -138,56 +181,98 @@ export class RemuxStreamer {
     private readonly url: string,
     private readonly element: HTMLVideoElement,
     private readonly onStatus: (status: StreamerStatus) => void,
+    private readonly options: RemuxStreamerOptions = {},
   ) {}
 
   stop() {
+    if (this.stopped) return;
     this.stopped = true;
+    this.activeAbort?.abort();
+    this.activeAbort = null;
+    void this.sequentialReader?.cancel().catch(() => undefined);
+    this.sequentialReader = null;
+    this.sequentialRemainder = null;
     if (this.watchdog) window.clearInterval(this.watchdog);
     this.watchdog = 0;
     this.queue = [];
-    try {
-      if (this.source?.readyState === "open") this.source.endOfStream();
-    } catch {
-      // Already torn down.
+    this.queuedBytes = 0;
+    for (const cleanup of this.cleanups.splice(0)) {
+      try {
+        cleanup();
+      } catch {
+        // Teardown is best effort; continue releasing the remaining handles.
+      }
     }
+    // Do not call endOfStream here. Closing/backing out is not natural EOF,
+    // and Safari otherwise fires `ended` and records an unfinished title as
+    // watched.
+    if (this.objectUrl) {
+      if (this.element.src === this.objectUrl) {
+        this.element.pause();
+        this.element.removeAttribute("src");
+        this.element.load();
+      }
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = "";
+    }
+    this.buffer = null;
+    this.source = null;
   }
 
   async start() {
     this.report({ state: "starting", message: "Resolving source…" });
+    const resolveAbort = this.beginFetch();
     try {
       // One resolution up front: debrid links redirect, and the Range header
       // does not survive the hop.
       const head = await fetch(this.url, {
-        headers: { Range: "bytes=0-1" },
+        headers: this.headersFor(this.url, "bytes=0-1"),
         cache: "no-store",
+        signal: resolveAbort.signal,
       });
       this.resolvedUrl = head.url || this.url;
-      const range = head.headers.get("content-range");
-      const total = range?.split("/")?.[1];
-      const parsed = total && total !== "*" ? Number(total) : NaN;
-      // A bad or absent total is worse than none: it ends the stream early.
-      // Treat anything implausible as unknown and let the reads decide.
-      this.totalBytes =
-        Number.isFinite(parsed) && parsed > CHUNK_BYTES ? parsed : null;
-      await head.body?.cancel().catch(() => undefined);
+      const contentRange = head.headers.get("content-range");
+      const range = parseContentRange(contentRange);
+      if (partialResponseMatches(head.status, contentRange, 0)) {
+        if (range?.total != null) this.totalBytes = range.total;
+        await head.body?.cancel().catch(() => undefined);
+      } else if (head.status === 200 && head.body) {
+        // Some storage/CDN endpoints ignore Range. Keep this response open and
+        // consume it once instead of repeatedly downloading the first 8 MB.
+        this.sequentialReader = head.body.getReader();
+        const length = Number(head.headers.get("content-length"));
+        this.totalBytes = Number.isSafeInteger(length) && length > 0 ? length : null;
+      } else {
+        await head.body?.cancel().catch(() => undefined);
+        throw new Error(
+          head.status === 206
+            ? "The media host returned an invalid byte range."
+            : `The media host answered HTTP ${head.status}.`,
+        );
+      }
     } catch (error) {
       this.report({
         state: "error",
         message: error instanceof Error ? error.message : "Could not reach the source.",
       });
       return;
+    } finally {
+      // The abort signal owns the retained HTTP 200 stream for its lifetime.
+      if (!this.sequentialReader) this.finishFetch(resolveAbort);
     }
 
     // Read until the demuxer has the track headers, which is what the init
     // segment is built from.
     // Read past the headers into the first cluster: choosing an audio track
     // needs a frame in hand, because AC-3 config is read from the bitstream.
-    let primed = 0;
-    while (!this.stopped && (!this.demuxer.headerComplete || primed < 2)) {
-      const chunk = await this.fetchNext();
+    while (!this.stopped && !this.primingComplete()) {
+      const chunk = await this.fetchNext(PRIME_CHUNK_BYTES);
+      if ("failed" in chunk) {
+        this.report({ state: "error", message: chunk.reason });
+        return;
+      }
       if ("done" in chunk) break;
       this.absorb(this.demuxer.push(chunk.bytes));
-      if (this.demuxer.headerComplete) primed += 1;
     }
     if (this.stopped) return;
     if (!this.demuxer.headerComplete) {
@@ -195,57 +280,138 @@ export class RemuxStreamer {
       return;
     }
 
-    const tracks = this.chooseTracks();
+    const ManagedSource = (
+      window as unknown as { ManagedMediaSource?: typeof MediaSource }
+    ).ManagedMediaSource;
+    const Source = ManagedSource ?? window.MediaSource;
+    if (!Source) {
+      this.report({ state: "error", message: "Media Source is unavailable." });
+      return;
+    }
+    const tracks = this.chooseTracks(Source);
     if (!tracks.length) {
       this.report({
         state: "error",
-        message: "No track in this file can be remuxed here.",
+        message:
+          this.selectionError || "No track in this file can be remuxed here.",
       });
       return;
     }
 
     const mime = `video/mp4; codecs="${tracks.map(codecString).join(",")}"`;
     this.mime = mime;
-    const Source =
-      (window as unknown as { ManagedMediaSource?: typeof MediaSource })
-        .ManagedMediaSource ?? window.MediaSource;
     if (!Source?.isTypeSupported(mime)) {
       this.report({ state: "error", message: `Browser rejects ${mime}.` });
       return;
     }
 
     const source = new Source();
+    this.managedMediaSource = Boolean(ManagedSource && Source === ManagedSource);
+    this.managedWantsData = true;
     this.source = source as MediaSource;
     this.watchElement();
     this.element.disableRemotePlayback = true;
-    this.element.src = URL.createObjectURL(source as unknown as MediaSource);
+
+    if (this.managedMediaSource) {
+      const managed = source as MediaSource & {
+        addEventListener(type: "startstreaming" | "endstreaming", listener: EventListener): void;
+        removeEventListener(type: "startstreaming" | "endstreaming", listener: EventListener): void;
+      };
+      const onStartStreaming: EventListener = () => {
+        this.managedWantsData = true;
+        this.mediaNote = "ManagedMediaSource requested data";
+        this.pump();
+      };
+      const onEndStreaming: EventListener = () => {
+        this.managedWantsData = false;
+        this.mediaNote = "ManagedMediaSource has enough data";
+      };
+      managed.addEventListener("startstreaming", onStartStreaming);
+      managed.addEventListener("endstreaming", onEndStreaming);
+      this.cleanups.push(() => {
+        managed.removeEventListener("startstreaming", onStartStreaming);
+        managed.removeEventListener("endstreaming", onEndStreaming);
+      });
+    }
+    this.objectUrl = URL.createObjectURL(source as unknown as MediaSource);
+    this.element.src = this.objectUrl;
 
     // A MediaSource that closes takes every later call with it, so the moment
     // it happens is worth recording rather than inferring from the wreckage.
-    source.addEventListener("sourceclose", () => {
+    const onSourceClose = () => {
       this.mediaNote = "MediaSource closed";
-    });
-    source.addEventListener("sourceended", () => {
+    };
+    const onSourceEnded = () => {
       this.mediaNote = "MediaSource ended";
+    };
+    source.addEventListener("sourceclose", onSourceClose);
+    source.addEventListener("sourceended", onSourceEnded);
+    this.cleanups.push(() => {
+      source.removeEventListener("sourceclose", onSourceClose);
+      source.removeEventListener("sourceended", onSourceEnded);
     });
 
-    await new Promise<void>((resolve) =>
-      source.addEventListener("sourceopen", () => resolve(), { once: true }),
-    );
-    if (this.stopped) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        source.removeEventListener("sourceopen", finish);
+        source.removeEventListener("sourceclose", finish);
+        resolve();
+      };
+      source.addEventListener("sourceopen", finish, { once: true });
+      source.addEventListener("sourceclose", finish, { once: true });
+      this.cleanups.push(finish);
+      if (this.stopped) finish();
+    });
+    if (this.stopped || source.readyState !== "open") return;
 
     try {
       const buffer = (source as MediaSource).addSourceBuffer(mime);
       this.buffer = buffer;
-      buffer.addEventListener("updateend", () => this.pump());
-      buffer.addEventListener("error", () =>
+      const onUpdateEnd = () => {
+        // appendBuffer is asynchronous. A completed update is real producer
+        // progress even when the public buffered range cannot advance until
+        // the other track catches up.
+        this.bytesSinceProgress = 0;
+        this.lastBufferedEnd = Math.max(
+          this.lastBufferedEnd,
+          this.bufferedEnd(),
+        );
+        this.pump();
+      };
+      const onBufferedChange: EventListener = () => {
+        // ManagedSourceBuffer can evict ranges without a remove() call.
+        // Observe what WebKit actually retained instead of trusting append
+        // history when deciding whether more data is needed.
+        this.lastBufferedEnd = this.bufferedEnd();
+        this.mediaNote = "ManagedMediaSource buffer changed";
+        this.pump();
+      };
+      const onBufferError = () =>
         this.report({
           state: "error",
           message: `SourceBuffer rejected a segment — ${this.lastSegment || "no segment recorded"} · element error ${this.element.error?.message || this.element.error?.code || "none"} · source ${this.source?.readyState ?? "none"}`,
           ranges: this.describeRanges(),
           fetchedBytes: this.nextByte,
-        }),
-      );
+        });
+      buffer.addEventListener("updateend", onUpdateEnd);
+      buffer.addEventListener("error", onBufferError);
+      if (this.managedMediaSource)
+        (buffer as SourceBuffer & {
+          addEventListener(type: "bufferedchange", listener: EventListener): void;
+          removeEventListener(type: "bufferedchange", listener: EventListener): void;
+        }).addEventListener("bufferedchange", onBufferedChange);
+      this.cleanups.push(() => {
+        buffer.removeEventListener("updateend", onUpdateEnd);
+        buffer.removeEventListener("error", onBufferError);
+        if (this.managedMediaSource)
+          (buffer as SourceBuffer & {
+            addEventListener(type: "bufferedchange", listener: EventListener): void;
+            removeEventListener(type: "bufferedchange", listener: EventListener): void;
+          }).removeEventListener("bufferedchange", onBufferedChange);
+      });
       // Best effort: a rejected duration costs a seek bar, not playback.
       try {
         if (this.demuxer.durationSeconds)
@@ -277,9 +443,12 @@ export class RemuxStreamer {
     const note = (text: string) => {
       this.mediaNote = text;
     };
-    for (const event of ["waiting", "stalled", "playing", "pause", "seeking"])
-      this.element.addEventListener(event, () => note(event));
-    this.element.addEventListener("error", () => {
+    for (const event of ["waiting", "stalled", "playing", "pause", "seeking"]) {
+      const listener = () => note(event);
+      this.element.addEventListener(event, listener);
+      this.cleanups.push(() => this.element.removeEventListener(event, listener));
+    }
+    const onError = () => {
       const error = this.element.error;
       note(`element error ${error?.code ?? "?"}: ${error?.message || "no detail"}`);
       this.report({
@@ -288,7 +457,9 @@ export class RemuxStreamer {
         ranges: this.describeRanges(),
         fetchedBytes: this.nextByte,
       });
-    });
+    };
+    this.element.addEventListener("error", onError);
+    this.cleanups.push(() => this.element.removeEventListener("error", onError));
   }
 
   /**
@@ -335,16 +506,39 @@ export class RemuxStreamer {
       // free what is behind the playhead, so a budget smaller than the minimum
       // costs deadlocks: holding at four seconds with the playhead at zero,
       // nothing old enough to evict, and no way back under.
+      // ManagedMediaSource performs active cleanup itself. Its buffered ranges
+      // are authoritative; our cumulative appended-byte estimate is not,
+      // because WebKit can evict data without going through SourceBuffer.remove.
       const overBudget =
-        ahead >= MIN_AHEAD_SECONDS && this.appendedBytes > this.budgetBytes();
-      if (ahead > this.targetAhead() || overBudget || this.fetching) {
+        !this.managedMediaSource &&
+        ahead >= MIN_AHEAD_SECONDS &&
+        this.appendedBytes > this.budgetBytes();
+      const managedPaused = shouldPauseManagedBuffering(
+        this.managedMediaSource,
+        this.managedWantsData,
+        ahead,
+      );
+      const queueBacklogged = shouldPauseForRemuxQueue(
+        this.queuedBytes,
+        this.queue.length,
+        MAX_QUEUED_BYTES,
+        MAX_QUEUED_SEGMENTS,
+      );
+      if (
+        ahead > this.targetAhead() ||
+        overBudget ||
+        managedPaused ||
+        queueBacklogged ||
+        this.fetching
+      ) {
         this.enter("holding");
         await new Promise((resolve) => window.setTimeout(resolve, 250));
-        this.evict();
+        if (shouldManuallyEvict(this.managedMediaSource, overBudget))
+          this.evict();
         this.tryPlay();
         this.report({
           state: "ready",
-          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · target ${this.targetAhead().toFixed(0)}s · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · readyState ${this.element.readyState}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
+          message: `Holding · ${(this.nextByte / 1024 / 1024).toFixed(0)} MB read · target ${this.targetAhead().toFixed(0)}s · queued ${(this.queuedBytes / 1024 / 1024).toFixed(1)} MB/${this.queue.length} · resident ~${(this.appendedBytes / 1024 / 1024).toFixed(0)} MB of ${(this.budgetBytes() / 1024 / 1024).toFixed(0)} MB · readyState ${this.element.readyState}${this.mediaNote ? ` · ${this.mediaNote}` : ""}`,
           bufferedSeconds: ahead,
           fetchedBytes: this.nextByte,
           ranges: this.describeRanges(),
@@ -352,13 +546,23 @@ export class RemuxStreamer {
         continue;
       }
       const chunk = await this.fetchNext();
+      if ("failed" in chunk) {
+        this.report({
+          state: "error",
+          message: chunk.reason,
+          bufferedSeconds: this.bufferedAhead(),
+          fetchedBytes: this.nextByte,
+        });
+        return;
+      }
       if ("done" in chunk) {
         this.flush(true);
-        const complete =
-          this.totalBytes != null && this.nextByte >= this.totalBytes;
+        this.eofPending = true;
+        this.eofReason = chunk.reason;
+        this.pump();
         this.report({
-          state: complete ? "ended" : "error",
-          message: chunk.reason,
+          state: "ready",
+          message: "Finishing the final buffered segment…",
           bufferedSeconds: this.bufferedAhead(),
           fetchedBytes: this.nextByte,
         });
@@ -368,6 +572,10 @@ export class RemuxStreamer {
       this.absorb(this.demuxer.push(chunk.bytes));
       this.flush(false);
       this.enter("waiting on the buffer");
+      const held = [...this.pending.values()].reduce(
+        (sum, frames) => sum + frames.length,
+        0,
+      );
 
       // Reading without the buffer advancing means the data is being fetched
       // and discarded — a parse that produces no frames, or appends that never
@@ -378,20 +586,22 @@ export class RemuxStreamer {
         this.bytesSinceProgress = 0;
       } else {
         this.bytesSinceProgress += chunk.bytes.byteLength;
-        if (this.bytesSinceProgress > 48 * 1024 * 1024) {
+        if (
+          shouldReportNoAppendProgress(
+            this.bytesSinceProgress,
+            Boolean(this.buffer?.updating),
+            this.queue.length,
+          )
+        ) {
           this.report({
             state: "error",
-            message: `Read 48 MB without the buffer advancing — segments are not landing. Buffered end stuck at ${end.toFixed(1)}s.`,
+            message: `Read 48 MB without the buffer advancing — segments are not landing. Buffered end stuck at ${end.toFixed(1)}s · queue ${this.queue.length}/${(this.queuedBytes / 1024 / 1024).toFixed(1)} MB · ${held} frames held · parser ${(this.demuxer.buffered / 1024 / 1024).toFixed(1)} MB · last ${this.lastSegment || "none"}.`,
             ranges: this.describeRanges(),
             fetchedBytes: this.nextByte,
           });
           return;
         }
       }
-      const held = [...this.pending.values()].reduce(
-        (sum, frames) => sum + frames.length,
-        0,
-      );
       this.tryPlay();
       this.report({
         state: this.bufferedAhead() > 1 ? "ready" : "buffering",
@@ -408,32 +618,43 @@ export class RemuxStreamer {
    * the file ran out and ending because a request was refused look identical
    * from the loop, and they need completely different responses.
    */
-  private async fetchNext(): Promise<
-    { bytes: Uint8Array } | { done: true; reason: string }
+  private async fetchNext(maxBytes = CHUNK_BYTES): Promise<
+    | { bytes: Uint8Array }
+    | { done: true; reason: string }
+    | { failed: true; reason: string }
   > {
-    if (this.totalBytes != null && this.nextByte >= this.totalBytes)
+    if (
+      reachedDeclaredRangeEnd(
+        this.nextByte,
+        this.totalBytes,
+        this.sequentialReader != null,
+      )
+    )
       return {
         done: true,
         reason: `Reached the end of the file (${this.nextByte} of ${this.totalBytes} bytes).`,
       };
     this.fetching = true;
-    this.enter(`fetching ${(this.nextByte / 1024 / 1024).toFixed(0)}-${((this.nextByte + CHUNK_BYTES) / 1024 / 1024).toFixed(0)} MB`);
+    this.enter(`fetching ${(this.nextByte / 1024 / 1024).toFixed(1)}-${((this.nextByte + maxBytes) / 1024 / 1024).toFixed(1)} MB`);
     try {
-      return await this.fetchWithRetry();
+      return await this.fetchWithRetry(maxBytes);
     } finally {
       this.fetching = false;
     }
   }
 
-  private async fetchWithRetry(): Promise<
-    { bytes: Uint8Array } | { done: true; reason: string }
+  private async fetchWithRetry(maxBytes: number): Promise<
+    | { bytes: Uint8Array }
+    | { done: true; reason: string }
+    | { failed: true; reason: string }
   > {
+    if (this.sequentialReader) return this.readSequentialChunk(maxBytes);
     let lastReason = "";
     for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
       // A CDN link can expire mid-stream, so re-resolve before the last try
       // rather than giving up on a URL that has simply gone stale.
       if (attempt === FETCH_ATTEMPTS) await this.reresolve();
-      const outcome = await this.fetchOnce();
+      const outcome = await this.fetchOnce(maxBytes);
       if (!("retry" in outcome)) return outcome;
       lastReason = outcome.reason;
       if (this.stopped) break;
@@ -442,41 +663,154 @@ export class RemuxStreamer {
       );
     }
     return {
-      done: true,
+      failed: true,
       reason: `${lastReason} Gave up after ${FETCH_ATTEMPTS} attempts at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB.`,
     };
   }
 
+  /** Reads one bounded chunk from a host that returned a single HTTP 200 body. */
+  private async readSequentialChunk(maxBytes: number): Promise<
+    { bytes: Uint8Array } | { done: true; reason: string } | { failed: true; reason: string }
+  > {
+    const reader = this.sequentialReader;
+    if (!reader) return { failed: true, reason: "The sequential media response was lost." };
+    if (this.sequentialDone && !this.sequentialRemainder)
+      return { done: true, reason: "Reached the end of the media response." };
+
+    const output = new Uint8Array(maxBytes);
+    let written = 0;
+    const append = (value: Uint8Array) => {
+      const count = Math.min(value.byteLength, maxBytes - written);
+      output.set(value.subarray(0, count), written);
+      written += count;
+      this.sequentialRemainder =
+        count < value.byteLength ? value.subarray(count) : null;
+    };
+
+    if (this.sequentialRemainder) append(this.sequentialRemainder);
+    try {
+      while (written < maxBytes && !this.sequentialDone) {
+        const result = await reader.read();
+        if (result.done || !result.value) {
+          this.sequentialDone = true;
+          break;
+        }
+        append(result.value);
+      }
+    } catch (error) {
+      return {
+        failed: true,
+        reason: `Sequential media read failed: ${describeError(error)}.`,
+      };
+    }
+    if (written === 0) {
+      // The stream reader, rather than a possibly transformed/misreported
+      // Content-Length, is authoritative for an ordinary HTTP 200 response.
+      this.totalBytes = this.nextByte;
+      return { done: true, reason: "Reached the end of the media response." };
+    }
+    const bytes = output.subarray(0, written);
+    this.nextByte += written;
+    if (this.sequentialDone && !this.sequentialRemainder)
+      this.totalBytes = this.nextByte;
+    return { bytes };
+  }
+
+  private beginFetch() {
+    const controller = new AbortController();
+    this.activeAbort = controller;
+    return controller;
+  }
+
+  private finishFetch(controller: AbortController) {
+    if (this.activeAbort === controller) this.activeAbort = null;
+  }
+
+  /**
+   * Combines the addon's request headers with our byte range.
+   *
+   * Credentials intended for the source origin are never replayed onto a
+   * cross-origin redirect target. Fetch itself applies the same protection to
+   * Authorization during a redirect; resolving the CDN URL first must not
+   * accidentally weaken it.
+   */
+  private headersFor(target: string, range: string) {
+    const headers = new Headers();
+    let sameOrigin = target === this.url;
+    try {
+      sameOrigin =
+        new URL(target, window.location.href).origin ===
+        new URL(this.url, window.location.href).origin;
+    } catch {
+      // Relative or opaque targets are treated as the original source.
+    }
+    if (sameOrigin) {
+      for (const [name, value] of Object.entries(
+        this.options.requestHeaders ?? {},
+      )) {
+        const lower = name.toLowerCase();
+        if (
+          lower === "range" ||
+          lower === "host" ||
+          lower === "content-length" ||
+          lower === "connection" ||
+          lower === "origin" ||
+          lower === "referer" ||
+          lower.startsWith("sec-") ||
+          typeof value !== "string"
+        )
+          continue;
+        try {
+          headers.set(name, value);
+        } catch {
+          // A malformed addon-supplied header must not abort playback setup.
+        }
+      }
+    }
+    headers.set("Range", range);
+    return headers;
+  }
+
   private async reresolve() {
+    if (this.stopped) return;
+    const controller = this.beginFetch();
     try {
       const head = await fetch(this.url, {
-        headers: { Range: "bytes=0-1" },
+        headers: this.headersFor(this.url, "bytes=0-1"),
         cache: "no-store",
+        signal: controller.signal,
       });
       if (head.url) this.resolvedUrl = head.url;
       await head.body?.cancel().catch(() => undefined);
     } catch {
       // Keep the previous URL; the retry will report if it still fails.
+    } finally {
+      this.finishFetch(controller);
     }
   }
 
-  private async fetchOnce(): Promise<
-    { bytes: Uint8Array } | { done: true; reason: string } | { retry: true; reason: string }
+  private async fetchOnce(maxBytes: number): Promise<
+    | { bytes: Uint8Array }
+    | { done: true; reason: string }
+    | { retry: true; reason: string }
   > {
+    if (this.stopped)
+      return { done: true, reason: "Playback was stopped." };
     // fetch waits forever by default, so a host that accepts the connection and
     // then goes quiet hangs the loop with nothing to show for it. The deadline
     // is on silence, not on the transfer: an 8 MB chunk is allowed to take as
     // long as it needs provided it keeps arriving.
-    const abort = new AbortController();
+    const abort = this.beginFetch();
     let idle = window.setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
     const keepAlive = () => {
       window.clearTimeout(idle);
       idle = window.setTimeout(() => abort.abort(), FETCH_TIMEOUT_MS);
     };
     try {
-      const end = this.nextByte + CHUNK_BYTES - 1;
-      const response = await fetch(this.resolvedUrl || this.url, {
-        headers: { Range: `bytes=${this.nextByte}-${end}` },
+      const end = this.nextByte + maxBytes - 1;
+      const target = this.resolvedUrl || this.url;
+      const response = await fetch(target, {
+        headers: this.headersFor(target, `bytes=${this.nextByte}-${end}`),
         cache: "no-store",
         signal: abort.signal,
       });
@@ -485,37 +819,44 @@ export class RemuxStreamer {
           retry: true,
           reason: `Host answered HTTP ${response.status} at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB.`,
         };
+      const contentRange = response.headers.get("content-range");
+      const returnedRange = parseContentRange(contentRange);
+      if (!partialResponseMatches(response.status, contentRange, this.nextByte)) {
+        await response.body?.cancel().catch(() => undefined);
+        return {
+          retry: true,
+          reason:
+            response.status !== 206
+              ? `Host stopped honouring byte ranges (HTTP ${response.status}).`
+              : `Host returned the wrong range (wanted ${this.nextByte}, received ${returnedRange?.start ?? "invalid"}).`,
+        };
+      }
+      if (returnedRange?.total != null) this.totalBytes = returnedRange.total;
       // Capped read, not arrayBuffer(): a host that ignores the range answers
       // with the whole file, and buffering that is an out-of-memory kill.
       const reader = response.body?.getReader();
       if (!reader)
-        return { done: true, reason: "No readable stream from the host." };
-      const parts: Uint8Array[] = [];
+        return { retry: true, reason: "Host returned no readable response body." };
+      // Fill one range-sized allocation directly. The old parts[] + combine
+      // path kept both copies alive at once (about 16 MB per 8 MB request),
+      // which is especially costly inside iOS's memory-limited WebContent
+      // process.
+      const output = new Uint8Array(maxBytes);
       let read = 0;
-      while (read < CHUNK_BYTES) {
+      while (read < maxBytes) {
         const { done, value } = await reader.read();
         if (done || !value) break;
         keepAlive();
-        parts.push(value);
-        read += value.byteLength;
+        const kept = Math.min(value.byteLength, maxBytes - read);
+        output.set(value.subarray(0, kept), read);
+        read += kept;
       }
       await reader.cancel().catch(() => undefined);
       if (read === 0) return { retry: true, reason: "Host returned no bytes." };
-      const bytes = new Uint8Array(Math.min(read, CHUNK_BYTES));
-      let offset = 0;
-      for (const part of parts) {
-        if (offset >= bytes.byteLength) break;
-        bytes.set(part.subarray(0, bytes.byteLength - offset), offset);
-        offset += part.byteLength;
-      }
+      const bytes = read === output.byteLength ? output : output.slice(0, read);
       // Advance by what was kept, not by what arrived: a 200 response would
       // otherwise skip the byte counter past the end of the file in one go.
       this.nextByte += bytes.byteLength;
-      if (response.status !== 206 && this.nextByte > bytes.byteLength)
-        return {
-          done: true,
-          reason: `Host stopped honouring ranges at ${(this.nextByte / 1024 / 1024).toFixed(1)} MB (HTTP ${response.status}).`,
-        };
       return { bytes };
     } catch (error) {
       const timedOut = error instanceof DOMException && error.name === "AbortError";
@@ -527,6 +868,7 @@ export class RemuxStreamer {
       };
     } finally {
       window.clearTimeout(idle);
+      this.finishFetch(abort);
     }
   }
 
@@ -552,13 +894,44 @@ export class RemuxStreamer {
     }
   }
 
-  private chooseTracks(): MuxTrack[] {
-    const wanted: MuxTrack[] = [];
-    const video = this.demuxer.tracks.find((track) => track.kind === "video");
+  /**
+   * Track headers are sufficient except for Dolby audio, whose MP4 decoder
+   * configuration is derived from the first encoded frame. The previous
+   * implementation always read two normal 8 MB chunks here; on iOS that
+   * created one enormous first fragment and exhausted SourceBuffer quota
+   * before a single frame could play.
+   */
+  private primingComplete() {
+    if (!this.demuxer.headerComplete) return false;
+    const audio = this.demuxer.tracks.filter((track) => track.kind === "audio");
+    if (!audio.length) return true;
+    const readyFromHeader = audio.some(
+      (track) =>
+        track.codecId.toUpperCase().startsWith("A_AAC") &&
+        Boolean(track.codecPrivate?.byteLength),
+    );
+    if (readyFromHeader) return true;
+    const dolby = audio.filter((track) => {
+      const codec = track.codecId.toUpperCase();
+      return codec.startsWith("A_AC3") || codec.startsWith("A_EAC3");
+    });
+    if (!dolby.length) return true;
+    return dolby.some((track) => Boolean(this.pending.get(track.number)?.length));
+  }
+
+  private chooseTracks(Source: typeof MediaSource): MuxTrack[] {
+    this.selectionError = "";
+    this.muxTracks.clear();
+    const videos = this.demuxer.tracks
+      .filter((track) => track.kind === "video")
+      .map((track) => describeTrack(asHeader(track), track.width, track.height))
+      .filter((track): track is MuxTrack => !("reason" in track));
+    const sourceAudio = this.demuxer.tracks.filter(
+      (track) => track.kind === "audio",
+    );
     // Prefer an audio track whose config can actually be built, which skips
-    // TrueHD in favour of the E-AC-3 alongside it.
-    const audio = this.demuxer.tracks
-      .filter((track) => track.kind === "audio")
+    // TrueHD/DTS in favour of an AAC, AC-3 or E-AC-3 compatibility track.
+    const audios = sourceAudio
       .map((track) => ({ track, first: this.pending.get(track.number)?.[0] }))
       .map(({ track, first }) =>
         describeTrack(
@@ -569,17 +942,41 @@ export class RemuxStreamer {
           first?.data,
         ),
       )
-      .find((described) => !("reason" in described));
+      .filter((track): track is MuxTrack => !("reason" in track));
 
-    if (video) {
-      const described = describeTrack(
-        asHeader(video),
-        video.width,
-        video.height,
-      );
-      if (!("reason" in described)) wanted.push(described);
+    let wanted: MuxTrack[] = [];
+    for (const video of videos) {
+      if (!sourceAudio.length) {
+        const videoMime = `video/mp4; codecs="${codecString(video)}"`;
+        if (Source.isTypeSupported(videoMime)) {
+          wanted = [video];
+          break;
+        }
+      }
+      for (const audio of audios) {
+        const candidate = [video, audio];
+        const mime = `video/mp4; codecs="${candidate.map(codecString).join(",")}"`;
+        if (Source.isTypeSupported(mime)) {
+          wanted = candidate;
+          break;
+        }
+      }
+      if (wanted.length) break;
     }
-    if (audio && !("reason" in audio)) wanted.push(audio);
+
+    if (!wanted.length) {
+      if (!videos.length) {
+        this.selectionError =
+          "The video codec in this Matroska source is not supported by this browser.";
+      } else if (sourceAudio.length && !audios.length) {
+        const codecs = [...new Set(sourceAudio.map((track) => track.codecId))];
+        this.selectionError = `This source only has ${codecs.join(", ")} audio. Remuxing cannot decode or transcode it; use an external player or choose a source with AAC, AC-3 or E-AC-3 audio.`;
+      } else if (sourceAudio.length) {
+        this.selectionError =
+          "This browser does not support the video's audio and video codec combination. Use an external player or another source.";
+      }
+      return [];
+    }
     for (const track of wanted) this.muxTracks.set(track.id, track);
     // Discard what the priming phase collected for tracks now known to be
     // unused; without this the first seconds of TrueHD stay resident forever.
@@ -597,73 +994,113 @@ export class RemuxStreamer {
    * a stall at every fragment boundary.
    */
   private flush(final: boolean) {
+    const built: Array<{
+      startMs: number;
+      trackNumber: number;
+      track: MuxTrack;
+      samples: MuxSample[];
+      endMs: number;
+      spanMs: number;
+      opensOnKeyframe: boolean;
+      reordered: boolean;
+    }> = [];
     for (const [trackNumber, frames] of this.pending) {
       const track = this.muxTracks.get(trackNumber);
-      if (!track || frames.length < 2) continue;
-      let usable = final ? frames : frames.slice(0, -1);
-      // Reordered video arrives out of presentation order, so the span is the
-      // spread of the timestamps rather than the difference across the ends.
-      let span = spanOf(usable);
-      if (!final && span < FRAGMENT_SECONDS * 1000) continue;
+      if (!track) continue;
+      let remaining = frames;
 
-      // Video fragments are cut at a keyframe so every one of them opens on a
-      // sync sample. Cutting mid-GOP leaves a fragment whose first sample
-      // depends on frames in the previous one, which Safari is entitled to
-      // reject outright — and which makes seeking impossible later regardless.
-      if (track.kind === "video" && !final) {
-        let cut = -1;
-        for (let index = usable.length - 1; index > 0; index -= 1)
-          if (usable[index]!.keyframe) {
-            cut = index;
-            break;
-          }
-        if (cut > 0) usable = usable.slice(0, cut);
-        else if (span < MAX_FRAGMENT_SECONDS * 1000) continue;
-        span = spanOf(usable);
+      // Starting midway through a GOP can only produce undecodable video. This
+      // is normally zero frames, but protects sources whose first Cluster does
+      // not begin on a random-access point.
+      if (track.kind === "video" && remaining.length) {
+        const firstSync = initialFragmentStartIndex(
+          remaining,
+          this.startedTracks.has(trackNumber),
+        );
+        if (firstSync < 0) {
+          this.pending.set(trackNumber, final ? [] : remaining);
+          continue;
+        }
+        if (firstSync > 0) remaining = remaining.slice(firstSync);
       }
 
-      // Matroska stores frames in decode order and stamps them with their
-      // presentation time; MP4 wants decode times in tfdt and trun, with the
-      // difference carried as a composition offset. Sorting the presentation
-      // times recovers the decode timeline: the set is the same, only the
-      // order differs, so the nth frame to be decoded is due at the nth
-      // smallest timestamp. Without this a B-frame's negative gap became a
-      // one-tick duration and the timeline collapsed.
-      const decodeTimes = usable.map((frame) => frame.timeMs).sort((a, b) => a - b);
-      const samples = usable.map((frame, index) => {
-        const decode = decodeTimes[index]!;
-        const next = decodeTimes[index + 1];
-        const duration = next != null ? next - decode : lastGap(decodeTimes);
-        return {
-          data: frame.data,
-          durationTicks: Math.max(1, Math.round(duration)),
-          keyframe: frame.keyframe,
-          compositionOffsetTicks: Math.round(frame.timeMs - decode),
-        };
-      });
+      while (remaining.length >= 2) {
+        // Hold one future timestamp during normal streaming so the final
+        // sample gets a real duration instead of a guess.
+        const available = final ? remaining : remaining.slice(0, -1);
+        const cut = fragmentCutIndex(available, track.kind, final);
+        if (cut <= 0) break;
+        const usable = available.slice(0, cut);
+        const following = remaining[cut];
+        const span = spanOf(usable);
+
+        // Matroska stores frames in decode order and stamps them with their
+        // presentation time; MP4 wants decode times in tfdt and trun, with the
+        // difference carried as a composition offset.
+        const decodeTimes = usable
+          .map((frame) => frame.timeMs)
+          .sort((a, b) => a - b);
+        const samples = usable.map((frame, index) => {
+          const decode = decodeTimes[index]!;
+          const next = decodeTimes[index + 1];
+          const duration =
+            next != null
+              ? next - decode
+              : following && following.timeMs > decode
+                ? following.timeMs - decode
+                : lastGap(decodeTimes);
+          return {
+            data: frame.data,
+            durationTicks: Math.max(1, Math.round(duration)),
+            keyframe: frame.keyframe,
+            compositionOffsetTicks: Math.round(frame.timeMs - decode),
+          };
+        });
+        const reordered = samples.some(
+          (sample) => sample.compositionOffsetTicks !== 0,
+        );
+        built.push({
+          startMs: decodeTimes[0]!,
+          trackNumber,
+          track,
+          samples,
+          endMs: decodeTimes.at(-1)!,
+          spanMs: span,
+          opensOnKeyframe: usable[0]!.keyframe,
+          reordered,
+        });
+        this.startedTracks.add(trackNumber);
+        remaining = remaining.slice(cut);
+      }
+      this.pending.set(trackNumber, final ? [] : remaining);
+    }
+
+    // Interleave audio and video by time. Appending an entire video track
+    // before its audio leaves the muxed SourceBuffer with no playable range
+    // and can hit quota while `buffered` still reports empty.
+    built.sort((left, right) => left.startMs - right.startMs);
+    for (const fragment of built) {
+      // mfhd sequence_number describes fragment order, so assign it only
+      // after the cross-track timestamp sort. Safari is stricter here than
+      // Chromium even though both accept independently valid moof boxes.
       const segment = buildMediaSegment(
         this.sequence++,
-        trackNumber,
-        Math.round(decodeTimes[0]!),
-        samples,
+        fragment.trackNumber,
+        Math.round(fragment.startMs),
+        fragment.samples,
       );
-      // The SourceBuffer error event says nothing about what it rejected, so
-      // the last thing handed to it is worth remembering.
-      const reordered = samples.some((sample) => sample.compositionOffsetTicks !== 0);
-      this.lastSegment = `track ${trackNumber} ${track.kind} · ${samples.length} samples · ${(decodeTimes[0]! / 1000).toFixed(2)}-${(decodeTimes.at(-1)! / 1000).toFixed(2)}s · ${usable[0]!.keyframe ? "opens on keyframe" : "MID-GOP"}${reordered ? " · reordered" : ""} · ${(segment.byteLength / 1024).toFixed(0)} KB`;
-      // Only the video track is measured: audio is a rounding error next to it
-      // and counting both would double-count the same wall-clock seconds.
-      if (track.kind === "video") {
+      this.lastSegment = `track ${fragment.trackNumber} ${fragment.track.kind} · ${fragment.samples.length} samples · ${(fragment.startMs / 1000).toFixed(2)}-${(fragment.endMs / 1000).toFixed(2)}s · ${fragment.opensOnKeyframe ? "opens on keyframe" : "MID-GOP"}${fragment.reordered ? " · reordered" : ""} · ${(segment.byteLength / 1024).toFixed(0)} KB`;
+      if (fragment.track.kind === "video") {
         this.appendedBytes += segment.byteLength;
-        this.appendedSeconds += span / 1000;
+        this.appendedSeconds += fragment.spanMs / 1000;
       }
       this.enqueue(segment);
-      this.pending.set(trackNumber, final ? [] : frames.slice(usable.length));
     }
   }
 
   private enqueue(segment: Uint8Array) {
     this.queue.push(segment);
+    this.queuedBytes += segment.byteLength;
     this.pump();
   }
 
@@ -704,11 +1141,40 @@ export class RemuxStreamer {
       return;
     }
     this.closedWaits = 0;
+    // `endstreaming` asks the producer to stop fetching new data; it does not
+    // make already-remuxed fragments disposable. Always drain this bounded
+    // queue. Otherwise iOS asks us to pause at ~2 seconds and the very data
+    // needed to advance beyond 2 seconds remains stranded in JavaScript.
     const next = this.queue.shift();
     if (!next) {
-      this.pumpNote = "queue empty";
+      if (this.eofPending) {
+        this.eofPending = false;
+        try {
+          this.source.endOfStream();
+          if (this.watchdog) window.clearInterval(this.watchdog);
+          this.watchdog = 0;
+          this.enter("ended");
+          this.report({
+            state: "ended",
+            message: this.eofReason || "Reached the end of the file.",
+            bufferedSeconds: this.bufferedAhead(),
+            fetchedBytes: this.nextByte,
+            ranges: this.describeRanges(),
+          });
+        } catch (error) {
+          this.report({
+            state: "error",
+            message: `Could not finish the remux stream: ${describeError(error)}.`,
+            ranges: this.describeRanges(),
+            fetchedBytes: this.nextByte,
+          });
+        }
+      } else {
+        this.pumpNote = "queue empty";
+      }
       return;
     }
+    this.queuedBytes = Math.max(0, this.queuedBytes - next.byteLength);
     try {
       this.pumpNote = `appending ${(next.byteLength / 1024).toFixed(0)} KB`;
       buffer.appendBuffer(next as unknown as BufferSource);
@@ -716,7 +1182,14 @@ export class RemuxStreamer {
       // A quota error means eviction has to happen before this can retry.
       if (error instanceof DOMException && error.name === "QuotaExceededError") {
         this.queue.unshift(next);
-        const freed = this.evict(true);
+        this.queuedBytes += next.byteLength;
+        const freed = shouldManuallyEvict(
+          this.managedMediaSource,
+          true,
+          true,
+        )
+          ? this.evict(true)
+          : false;
         // Eviction drives the retry through updateend. When it frees nothing —
         // the playhead is still near the start, so there is no history to drop
         // — nothing fires and the queue never drains again. Retry on a timer.
@@ -738,10 +1211,18 @@ export class RemuxStreamer {
    * Falls back to the maximum until enough has been appended to judge.
    */
   private targetAhead() {
-    if (this.appendedSeconds < 2 || this.appendedBytes === 0)
-      return MAX_AHEAD_SECONDS;
-    const affordable = this.budgetBytes() / this.bytesPerSecond();
-    return Math.max(MIN_AHEAD_SECONDS, Math.min(MAX_AHEAD_SECONDS, affordable));
+    const minimum = this.managedMediaSource
+      ? MANAGED_MIN_AHEAD_SECONDS
+      : MIN_AHEAD_SECONDS;
+    const maximum = this.managedMediaSource
+      ? MANAGED_MAX_AHEAD_SECONDS
+      : MAX_AHEAD_SECONDS;
+    if (this.appendedSeconds < 2 || this.appendedBytes === 0) return maximum;
+    const budget = this.managedMediaSource
+      ? MANAGED_BUFFER_BUDGET_BYTES
+      : this.budgetBytes();
+    const affordable = budget / this.bytesPerSecond();
+    return Math.max(minimum, Math.min(maximum, affordable));
   }
 
   private bytesPerSecond() {
@@ -850,13 +1331,14 @@ function asHeader(track: {
   kind: string;
   codecId: string;
   codecPrivate: Uint8Array | null;
+  defaultDurationNs?: number;
 }): TrackHeader {
   return {
     number: track.number,
     kind: track.kind as TrackHeader["kind"],
     codecId: track.codecId,
     codecPrivate: track.codecPrivate,
-    defaultDurationNs: null,
+    defaultDurationNs: track.defaultDurationNs ?? null,
   };
 }
 

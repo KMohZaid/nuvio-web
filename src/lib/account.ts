@@ -12,11 +12,166 @@ import type {
   WatchedItem,
 } from "../types";
 import { deleteValue, getValue, setValue } from "./idb";
+import {
+  blobRawValue,
+  blobStringPayload,
+  blobTypedValue,
+  emptySettingsBlob,
+  withBlobRawValue,
+  withBlobStringPayload,
+  withBlobTypedValue,
+  type SettingsBlob,
+  type SyncPreferenceType,
+  type SyncPreferenceValue,
+} from "./settingsBlob";
+import {
+  decodeProviderCredentials,
+  providerCredentialPayload,
+  withProviderCredential,
+  type ProviderCredentialRow,
+} from "./providerCredentials";
+
+export type { ProviderCredentialRow };
+
+export {
+  blobStringPayload,
+  blobTypedValue,
+  withBlobRawValue,
+  withBlobStringPayload,
+  withBlobTypedValue,
+};
+export type { SettingsBlob, SyncPreferenceType, SyncPreferenceValue };
 
 const CONFIG_KEY = "backend-config";
 const REFRESH_KEY = "refresh-session";
+const AUTH_LOCK_KEY = "nuvio-web-auth-session";
+const AUTH_CHANNEL_NAME = "nuvio-web-auth-session-v1";
 const CLIENT_ID = `nuvio-web-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+const TAB_ID = `tab-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
 let activeSession: Session | null = null;
+let sessionGeneration = 0;
+let sessionAbortController = new AbortController();
+let refreshFlight: { generation: number; promise: Promise<string> } | null =
+  null;
+
+type StoredRefreshSession = {
+  backendUrl: string;
+  refreshToken: string;
+  /** Shared only within this origin so another tab can reuse a rotation. */
+  accessToken?: string;
+  userId?: string;
+  email?: string;
+  updatedAt?: number;
+};
+
+type AuthChannelMessage =
+  | { source: string; type: "invalidate" }
+  | {
+      source: string;
+      type: "token";
+      backendUrl: string;
+      accessToken: string;
+      userId: string;
+      email?: string;
+    };
+type AuthChannelPayload =
+  | { type: "invalidate" }
+  | {
+      type: "token";
+      backendUrl: string;
+      accessToken: string;
+      userId: string;
+      email?: string;
+    };
+
+class BackendRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "BackendRequestError";
+  }
+}
+
+class StaleSessionError extends Error {
+  constructor() {
+    super("The Nuvio session changed while this request was running.");
+    this.name = "StaleSessionError";
+  }
+}
+
+class InvalidSessionPayloadError extends Error {
+  constructor(message = "The backend did not return a usable session.") {
+    super(message);
+    this.name = "InvalidSessionPayloadError";
+  }
+}
+
+const authChannel =
+  typeof globalThis.BroadcastChannel === "function"
+    ? new BroadcastChannel(AUTH_CHANNEL_NAME)
+    : null;
+
+function broadcastAuth(message: AuthChannelPayload): void {
+  authChannel?.postMessage({ ...message, source: TAB_ID });
+}
+
+function invalidateLocalSession(): number {
+  sessionAbortController.abort();
+  sessionAbortController = new AbortController();
+  sessionGeneration += 1;
+  activeSession = null;
+  refreshFlight = null;
+  return sessionGeneration;
+}
+
+function invalidateSessionAcrossTabs(): number {
+  const generation = invalidateLocalSession();
+  broadcastAuth({ type: "invalidate" });
+  return generation;
+}
+
+function assertCurrentGeneration(generation: number): void {
+  if (generation !== sessionGeneration) throw new StaleSessionError();
+}
+
+authChannel?.addEventListener("message", (event: MessageEvent<unknown>) => {
+  const message = event.data as Partial<AuthChannelMessage> | null;
+  if (!message || message.source === TAB_ID) return;
+  if (message.type === "invalidate") {
+    invalidateLocalSession();
+    return;
+  }
+  if (
+    message.type === "token" &&
+    activeSession &&
+    message.backendUrl === activeSession.backend.url &&
+    message.userId === activeSession.user.id &&
+    typeof message.accessToken === "string" &&
+    message.accessToken
+  ) {
+    activeSession = {
+      ...activeSession,
+      accessToken: message.accessToken,
+      user: {
+        ...activeSession.user,
+        email: message.email ?? activeSession.user.email,
+      },
+    };
+  }
+});
+
+async function withAuthLock<T>(work: () => Promise<T>): Promise<T> {
+  // Web Locks are origin-wide rather than tab-local, so refresh-token rotation,
+  // sign-out, and backend changes cannot interleave. Current Chromium, Firefox,
+  // and Safari/iOS releases implement this. The fallback still keeps the
+  // in-tab promise single-flight on older embedded browsers.
+  if (typeof navigator !== "undefined" && navigator.locks) {
+    return navigator.locks.request(AUTH_LOCK_KEY, { mode: "exclusive" }, work);
+  }
+  return work();
+}
 
 type TokenPayload = {
   access_token?: string;
@@ -73,6 +228,9 @@ async function request<T>(
   token?: string,
 ): Promise<T> {
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
+  if (init.signal?.aborted) controller.abort();
+  else init.signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timeout = setTimeout(() => controller.abort(), 20_000);
   try {
     const response = await fetch(`${backend.url}${path}`, {
@@ -93,33 +251,61 @@ async function request<T>(
       } catch {
         if (text.trim()) message = text.slice(0, 240);
       }
-      throw new Error(message);
+      throw new BackendRequestError(message, response.status);
     }
     return (text ? JSON.parse(text) : null) as T;
   } finally {
     clearTimeout(timeout);
+    init.signal?.removeEventListener("abort", abortFromCaller);
   }
+}
+
+function sessionFromToken(
+  backend: BackendConfig,
+  payload: TokenPayload,
+): Session {
+  if (!payload.access_token || !payload.refresh_token || !payload.user?.id)
+    throw new InvalidSessionPayloadError();
+  return {
+    accessToken: payload.access_token,
+    user: payload.user,
+    backend,
+  };
 }
 
 async function installToken(
   backend: BackendConfig,
   payload: TokenPayload,
+  generation: number,
 ): Promise<Session> {
-  if (!payload.access_token || !payload.refresh_token || !payload.user?.id)
-    throw new Error("The backend did not return a usable session.");
-  activeSession = {
-    accessToken: payload.access_token,
-    user: payload.user,
-    backend,
-  };
-  await Promise.all([
-    setValue(CONFIG_KEY, backend),
-    setValue(REFRESH_KEY, {
+  const session = sessionFromToken(backend, payload);
+  return withAuthLock(async () => {
+    assertCurrentGeneration(generation);
+    // The refresh credential is durable before the access token is visible to
+    // callers. A failed IndexedDB write therefore cannot create a session that
+    // silently dies on reload.
+    await Promise.all([
+      setValue(CONFIG_KEY, backend),
+      setValue<StoredRefreshSession>(REFRESH_KEY, {
+        backendUrl: backend.url,
+        refreshToken: payload.refresh_token!,
+        accessToken: session.accessToken,
+        userId: session.user.id,
+        email: session.user.email,
+        updatedAt: Date.now(),
+      }),
+    ]);
+    assertCurrentGeneration(generation);
+    activeSession = session;
+    broadcastAuth({
+      type: "token",
       backendUrl: backend.url,
-      refreshToken: payload.refresh_token,
-    }),
-  ]);
-  return activeSession;
+      accessToken: session.accessToken,
+      userId: session.user.id,
+      email: session.user.email,
+    });
+    return session;
+  });
 }
 
 export async function signIn(
@@ -127,62 +313,241 @@ export async function signIn(
   email: string,
   password: string,
 ): Promise<Session> {
+  // Changing account or backend invalidates every pending request before the
+  // new password exchange starts. A slow response from the old session can no
+  // longer publish state after this transition.
+  const generation = invalidateSessionAcrossTabs();
+  const signal = sessionAbortController.signal;
   const payload = await request<TokenPayload>(
     backend,
     "/auth/v1/token?grant_type=password",
     {
       method: "POST",
       body: JSON.stringify({ email, password }),
+      signal,
     },
   );
-  return installToken(backend, payload);
+  return installToken(backend, payload, generation);
 }
 
 export async function restoreSession(): Promise<Session | null> {
-  const [savedBackend, savedRefresh] = await Promise.all([
-    getValue<BackendConfig>(CONFIG_KEY),
-    getValue<{ backendUrl: string; refreshToken: string }>(REFRESH_KEY),
-  ]);
-  const backend = savedBackend ?? officialBackend();
-  if (!backend || !savedRefresh || savedRefresh.backendUrl !== backend.url)
-    return null;
+  const generation = invalidateLocalSession();
+  const signal = sessionAbortController.signal;
   try {
-    const payload = await request<TokenPayload>(
-      backend,
-      "/auth/v1/token?grant_type=refresh_token",
-      {
-        method: "POST",
-        body: JSON.stringify({ refresh_token: savedRefresh.refreshToken }),
-      },
-    );
-    return installToken(backend, payload);
-  } catch {
-    await deleteValue(REFRESH_KEY);
+    return await withAuthLock(async () => {
+      assertCurrentGeneration(generation);
+      const [savedBackend, savedRefresh] = await Promise.all([
+        getValue<BackendConfig>(CONFIG_KEY),
+        getValue<StoredRefreshSession>(REFRESH_KEY),
+      ]);
+      const backend = savedBackend ?? officialBackend();
+      if (
+        !backend ||
+        !savedRefresh ||
+        savedRefresh.backendUrl !== backend.url
+      )
+        return null;
+      const payload = await request<TokenPayload>(
+        backend,
+        "/auth/v1/token?grant_type=refresh_token",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            refresh_token: savedRefresh.refreshToken,
+          }),
+          signal,
+        },
+      );
+      assertCurrentGeneration(generation);
+      const session = sessionFromToken(backend, payload);
+      await setValue<StoredRefreshSession>(REFRESH_KEY, {
+        backendUrl: backend.url,
+        refreshToken: payload.refresh_token!,
+        accessToken: payload.access_token!,
+        userId: payload.user!.id,
+        email: payload.user!.email,
+        updatedAt: Date.now(),
+      });
+      assertCurrentGeneration(generation);
+      activeSession = session;
+      broadcastAuth({
+        type: "token",
+        backendUrl: backend.url,
+        accessToken: session.accessToken,
+        userId: session.user.id,
+        email: session.user.email,
+      });
+      return session;
+    });
+  } catch (error) {
+    // Invalid refresh credentials are terminal. Network/timeout failures are
+    // not: retain the backend-scoped token so a reload can try again.
+    const terminal =
+      (error instanceof BackendRequestError &&
+        [400, 401, 403].includes(error.status)) ||
+      error instanceof InvalidSessionPayloadError;
+    if (generation === sessionGeneration && terminal) {
+      invalidateSessionAcrossTabs();
+      await withAuthLock(async () => {
+        await deleteValue(REFRESH_KEY);
+      });
+    }
     return null;
   }
 }
 
 export async function signOut(): Promise<void> {
-  if (activeSession) {
+  const session = activeSession;
+  invalidateSessionAcrossTabs();
+  if (session) {
     request(
-      activeSession.backend,
+      session.backend,
       "/auth/v1/logout",
       { method: "POST" },
-      activeSession.accessToken,
+      session.accessToken,
     ).catch(() => undefined);
   }
-  activeSession = null;
-  await deleteValue(REFRESH_KEY);
+  await withAuthLock(() => deleteValue(REFRESH_KEY));
+}
+
+function isRefreshableUnauthorized(error: unknown): boolean {
+  return error instanceof BackendRequestError && error.status === 401;
+}
+
+async function refreshAccessToken(
+  session: Session,
+  generation: number,
+  rejectedAccessToken: string,
+  signal: AbortSignal,
+): Promise<string> {
+  assertCurrentGeneration(generation);
+  if (refreshFlight?.generation === generation) return refreshFlight.promise;
+
+  const run = withAuthLock(async () => {
+    assertCurrentGeneration(generation);
+    const saved = await getValue<StoredRefreshSession>(REFRESH_KEY);
+    if (
+      !saved ||
+      saved.backendUrl !== session.backend.url ||
+      !saved.refreshToken.trim()
+    ) {
+      invalidateSessionAcrossTabs();
+      throw new Error("The saved Nuvio session has expired. Sign in again.");
+    }
+
+    // A different tab may have rotated the token while this tab waited for the
+    // origin-wide lock. Its persisted access token is authoritative for the
+    // same backend/user and avoids a second refresh request.
+    if (
+      saved.accessToken &&
+      saved.accessToken !== rejectedAccessToken &&
+      saved.userId === session.user.id
+    ) {
+      assertCurrentGeneration(generation);
+      activeSession = { ...session, accessToken: saved.accessToken };
+      return saved.accessToken;
+    }
+
+    let payload: TokenPayload;
+    try {
+      payload = await request<TokenPayload>(
+        session.backend,
+        "/auth/v1/token?grant_type=refresh_token",
+        {
+          method: "POST",
+          body: JSON.stringify({ refresh_token: saved.refreshToken }),
+          signal,
+        },
+      );
+    } catch (error) {
+      if (
+        error instanceof BackendRequestError &&
+        [400, 401, 403].includes(error.status)
+      ) {
+        invalidateSessionAcrossTabs();
+        await deleteValue(REFRESH_KEY);
+      }
+      throw error;
+    }
+
+    const accessToken = payload.access_token?.trim();
+    const refreshToken = payload.refresh_token?.trim();
+    if (!accessToken || !refreshToken) {
+      invalidateSessionAcrossTabs();
+      await deleteValue(REFRESH_KEY);
+      throw new InvalidSessionPayloadError(
+        "The backend did not return a refreshed Nuvio session.",
+      );
+    }
+    assertCurrentGeneration(generation);
+    await setValue<StoredRefreshSession>(REFRESH_KEY, {
+      backendUrl: session.backend.url,
+      refreshToken,
+      accessToken,
+      userId: session.user.id,
+      email: payload.user?.email ?? session.user.email,
+      updatedAt: Date.now(),
+    });
+    // Persist the rotated refresh token before publishing the access token.
+    assertCurrentGeneration(generation);
+    activeSession = {
+      ...session,
+      accessToken,
+      user: {
+        ...session.user,
+        email: payload.user?.email ?? session.user.email,
+      },
+    };
+    broadcastAuth({
+      type: "token",
+      backendUrl: session.backend.url,
+      accessToken,
+      userId: session.user.id,
+      email: activeSession.user.email,
+    });
+    return accessToken;
+  });
+  const tracked = run.finally(() => {
+    if (refreshFlight?.promise === tracked) refreshFlight = null;
+  });
+  refreshFlight = { generation, promise: tracked };
+  return tracked;
 }
 
 async function authorized<T>(path: string, init: RequestInit = {}): Promise<T> {
-  if (!activeSession) throw new Error("Sign in first.");
-  return request<T>(
-    activeSession.backend,
-    path,
-    init,
-    activeSession.accessToken,
-  );
+  const session = activeSession;
+  if (!session) throw new Error("Sign in first.");
+  const generation = sessionGeneration;
+  const signal = sessionAbortController.signal;
+  try {
+    const value = await request<T>(
+      session.backend,
+      path,
+      { ...init, signal },
+      session.accessToken,
+    );
+    assertCurrentGeneration(generation);
+    return value;
+  } catch (error) {
+    if (!isRefreshableUnauthorized(error)) throw error;
+    assertCurrentGeneration(generation);
+    const accessToken = await refreshAccessToken(
+      session,
+      generation,
+      session.accessToken,
+      signal,
+    );
+    // Exactly one replay: a second 401 is returned to the caller and never
+    // recursively enters refreshAccessToken.
+    const value = await request<T>(
+      session.backend,
+      path,
+      { ...init, signal },
+      accessToken,
+    );
+    assertCurrentGeneration(generation);
+    return value;
+  }
 }
 
 export async function rpc<T>(name: string, body: unknown): Promise<T> {
@@ -380,13 +745,6 @@ export function settingsPlatform(): "desktop" | "mobile" {
     : "desktop";
 }
 
-export type SettingsBlob = {
-  version: number;
-  features: Record<string, Record<string, { type: string; value: unknown }>>;
-};
-
-const emptyBlob = (): SettingsBlob => ({ version: 3, features: {} });
-
 export async function loadSettingsBlob(
   profileIndex: number,
 ): Promise<SettingsBlob> {
@@ -395,9 +753,68 @@ export async function loadSettingsBlob(
     { p_profile_id: profileIndex, p_platform: settingsPlatform() },
   );
   const value = rows?.[0]?.settings_json;
-  return value && typeof value === "object"
+  return value && typeof value === "object" && !Array.isArray(value)
     ? (value as SettingsBlob)
-    : emptyBlob();
+    : emptySettingsBlob();
+}
+
+/** The RPC replaces the platform row wholesale, so callers always send all of it. */
+export async function pushSettingsBlob(
+  profileIndex: number,
+  next: SettingsBlob,
+): Promise<SettingsBlob> {
+  await rpc("sync_push_profile_settings_blob", {
+    p_profile_id: profileIndex,
+    p_platform: settingsPlatform(),
+    p_settings_json: next,
+    p_origin_client_id: CLIENT_ID,
+  });
+  return next;
+}
+
+export async function loadProviderCredentials(
+  profileIndex: number,
+): Promise<ProviderCredentialRow[]> {
+  // Match the official client: create any provider rows that do not exist yet
+  // before pulling the authoritative remote snapshot. The seed RPC only fills
+  // missing rows, so existing/unknown credentials are never overwritten.
+  const seedRows: ProviderCredentialRow[] = [
+    { provider: "tmdb", credentialJson: { api_key: "" } },
+    { provider: "mdblist", credentialJson: { api_key: "" } },
+    { provider: "animeskip", credentialJson: { client_id: "" } },
+    { provider: "introdb", credentialJson: { api_key: "" } },
+  ];
+  await rpc("sync_seed_provider_credentials", {
+    p_profile_id: profileIndex,
+    p_credentials: providerCredentialPayload(seedRows),
+    p_origin_client_id: CLIENT_ID,
+  });
+  return decodeProviderCredentials(
+    await rpc<unknown>("sync_pull_provider_credentials", {
+      p_profile_id: profileIndex,
+    }),
+  );
+}
+
+/**
+ * Credential pushes replace the provider array wholesale. Pull immediately
+ * before the merge so a browser tab cannot erase a credential changed by a
+ * different Nuvio client since startup.
+ */
+export async function updateProviderCredential(
+  profileIndex: number,
+  provider: "tmdb" | "mdblist" | "animeskip" | "introdb",
+  value: string,
+): Promise<ProviderCredentialRow[]> {
+  const field = provider === "animeskip" ? "client_id" : "api_key";
+  const current = await loadProviderCredentials(profileIndex);
+  const next = withProviderCredential(current, provider, field, value);
+  await rpc("sync_push_provider_credentials", {
+    p_profile_id: profileIndex,
+    p_credentials: providerCredentialPayload(next),
+    p_origin_client_id: CLIENT_ID,
+  });
+  return next;
 }
 
 /** Reads one typed boolean out of the blob, matching Nuvio's storage shape. */
@@ -407,10 +824,7 @@ export function blobBoolean(
   key: string,
   fallback: boolean,
 ): boolean {
-  const entry = blob?.features?.[feature]?.[key];
-  return entry?.type === "boolean" && typeof entry.value === "boolean"
-    ? entry.value
-    : fallback;
+  return blobTypedValue(blob, feature, key, "boolean", fallback);
 }
 
 /**
@@ -427,23 +841,10 @@ export async function pushBlobBoolean(
   key: string,
   value: boolean,
 ): Promise<SettingsBlob> {
-  const next: SettingsBlob = {
-    version: blob.version ?? 3,
-    features: {
-      ...blob.features,
-      [feature]: {
-        ...(blob.features?.[feature] ?? {}),
-        [key]: { type: "boolean", value },
-      },
-    },
-  };
-  await rpc("sync_push_profile_settings_blob", {
-    p_profile_id: profileIndex,
-    p_platform: settingsPlatform(),
-    p_settings_json: next,
-    p_origin_client_id: CLIENT_ID,
-  });
-  return next;
+  return pushSettingsBlob(
+    profileIndex,
+    withBlobTypedValue(blob, feature, key, "boolean", value),
+  );
 }
 
 /**
@@ -458,8 +859,13 @@ export function blobRawBoolean(
   key: string,
   fallback: boolean,
 ): boolean {
-  const value = (blob?.features?.[feature] as Record<string, unknown> | undefined)?.[key];
-  return typeof value === "boolean" ? value : fallback;
+  return blobRawValue(
+    blob,
+    feature,
+    key,
+    (value): value is boolean => typeof value === "boolean",
+    fallback,
+  );
 }
 
 export async function pushBlobRawBoolean(
@@ -469,20 +875,10 @@ export async function pushBlobRawBoolean(
   key: string,
   value: boolean,
 ): Promise<SettingsBlob> {
-  const next: SettingsBlob = {
-    version: blob.version ?? 3,
-    features: {
-      ...blob.features,
-      [feature]: { ...(blob.features?.[feature] ?? {}), [key]: value },
-    },
-  } as SettingsBlob;
-  await rpc("sync_push_profile_settings_blob", {
-    p_profile_id: profileIndex,
-    p_platform: settingsPlatform(),
-    p_settings_json: next,
-    p_origin_client_id: CLIENT_ID,
-  });
-  return next;
+  return pushSettingsBlob(
+    profileIndex,
+    withBlobRawValue(blob, feature, key, value),
+  );
 }
 
 /** Identifies one watchable thing: a movie, or one episode of a series. */

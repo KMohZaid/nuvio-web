@@ -1,4 +1,5 @@
 import type { Meta, ProgressRow, Video, WatchedItem } from "../types";
+import type { ContinueWatchingSettings } from "./webSettings";
 
 export type ContinueCard = {
   item: Meta;
@@ -69,6 +70,7 @@ export function buildContinueWatching(
   entries: ProgressRow[],
   watched: WatchedItem[],
   metadata: Meta[],
+  settings?: ContinueWatchingSettings,
 ): ContinueCard[] {
   const metaById = new Map(metadata.map((item) => [item.id, item]));
   const ids = new Set([
@@ -124,8 +126,10 @@ export function buildContinueWatching(
           episode: entry.episode!,
           at: entry.watchedAt,
         })),
-    ].sort(
-      (a, b) => b.season - a.season || b.episode - a.episode || b.at - a.at,
+    ].sort((a, b) =>
+      settings?.upNextFromFurthestEpisode !== false
+        ? b.season - a.season || b.episode - a.episode || b.at - a.at
+        : b.at - a.at || b.season - a.season || b.episode - a.episode,
     );
     const seed = seeds[0];
     if (!seed) continue;
@@ -135,7 +139,9 @@ export function buildContinueWatching(
         (entry) =>
           (entry.season ?? 0) > 0 &&
           entry.available !== false &&
-          (!entry.released || new Date(entry.released).getTime() <= now),
+          (settings?.showUnairedNextUp !== false ||
+            !entry.released ||
+            new Date(entry.released).getTime() <= now),
       )
       .sort(
         (a, b) =>
@@ -148,12 +154,30 @@ export function buildContinueWatching(
           ((entry.season ?? 0) === seed.season &&
             (entry.episode ?? 0) > seed.episode),
       );
-    if (next)
+    const dismissKey = next
+      ? `${id}|${next.season ?? -1}|${next.episode ?? -1}`
+      : "";
+    if (next && !settings?.dismissedNextUpKeys.includes(dismissKey))
       cards.push({ item, video: next, nextUp: true, lastWatched: seed.at });
   }
   // Deliberately generous: the row scrolls, so a longer list costs nothing,
   // and truncating it is what made titles look like they had gone missing.
-  return cards.sort((a, b) => b.lastWatched - a.lastWatched).slice(0, 40);
+  const recent = cards.sort((a, b) => b.lastWatched - a.lastWatched);
+  if (settings?.sortMode !== "STREAMING_STYLE") return recent.slice(0, 40);
+  const released: ContinueCard[] = [];
+  const upcoming: ContinueCard[] = [];
+  for (const card of recent) {
+    const release = card.nextUp && card.video?.released
+      ? new Date(card.video.released).getTime()
+      : Number.NaN;
+    (Number.isFinite(release) && release > Date.now() ? upcoming : released).push(card);
+  }
+  upcoming.sort((left, right) => {
+    const leftDate = new Date(left.video?.released || "").getTime();
+    const rightDate = new Date(right.video?.released || "").getTime();
+    return leftDate - rightDate;
+  });
+  return [...released, ...upcoming].slice(0, 40);
 }
 
 /** Stable identity for one episode (or a movie, with no season/episode). */

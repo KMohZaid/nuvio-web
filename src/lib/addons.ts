@@ -33,9 +33,25 @@ export function normalizeManifestUrl(value: string): string {
   return url.toString();
 }
 
-async function fetchJson<T>(url: string, timeoutMs = 14_000): Promise<T> {
+/** Nuvio delegates configuration to the addon's own endpoint. */
+export function addonConfigureUrl(manifestUrl: string): string {
+  const url = safeAddonUrl(normalizeManifestUrl(manifestUrl));
+  url.search = "";
+  url.hash = "";
+  url.pathname = `${url.pathname.replace(/manifest\.json\/?$/i, "").replace(/\/+$/, "")}/configure`;
+  return url.toString();
+}
+
+async function fetchJson<T>(
+  url: string,
+  timeoutMs = 14_000,
+  signal?: AbortSignal,
+): Promise<T> {
   safeAddonUrl(url);
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abort, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, {
@@ -59,6 +75,7 @@ async function fetchJson<T>(url: string, timeoutMs = 14_000): Promise<T> {
     throw error;
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -586,6 +603,7 @@ export async function loadStreams(
   type: string,
   id: string,
   addons: InstalledAddon[],
+  signal?: AbortSignal,
 ): Promise<Stream[]> {
   const targets = addons.filter(
     (addon) =>
@@ -598,7 +616,7 @@ export async function loadStreams(
       try {
         const payload = await fetchJson<{
           streams?: Array<Record<string, unknown>>;
-        }>(resourceUrl(addon.url, "stream", type, id), 20_000);
+        }>(resourceUrl(addon.url, "stream", type, id), 20_000, signal);
         return (payload.streams ?? []).map((stream): Stream => ({
           name: String(stream.name ?? addon.manifest!.name),
           title: String(stream.title ?? ""),

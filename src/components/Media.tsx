@@ -1,5 +1,5 @@
 import { Check, Play } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { watchKey, type WatchIndex } from "../lib/progress";
 import { useDragScroll } from "../lib/useDragScroll";
 import type { CatalogSection, Meta } from "../types";
@@ -74,10 +74,7 @@ export function MediaRow({
   return (
     <section className="media-section">
       <header>
-        <div>
-          <h2>{section.name}</h2>
-          <span>{section.addonName}</span>
-        </div>
+        <h2>{section.name}</h2>
         <button onClick={onSeeAll}>See all</button>
       </header>
       <div className="media-row" ref={rowRef}>
@@ -112,7 +109,23 @@ export function Hero({
 }) {
   const [index, setIndex] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [transitionDirection, setTransitionDirection] = useState<
+    "next" | "previous"
+  >("next");
+  const swipe = useRef({ active: false, pointerId: -1, x: 0, y: 0 });
   const active = items[index % Math.max(items.length, 1)];
+  const move = (direction: -1 | 1) => {
+    setTransitionDirection(direction > 0 ? "next" : "previous");
+    setIndex((current) =>
+      (current + direction + items.length) % items.length,
+    );
+  };
+
+  const select = (nextIndex: number) => {
+    if (nextIndex === index) return;
+    setTransitionDirection(nextIndex > index ? "next" : "previous");
+    setIndex(nextIndex);
+  };
 
   useEffect(() => {
     if (index >= items.length) setIndex(0);
@@ -121,12 +134,9 @@ export function Hero({
   useEffect(() => {
     if (items.length < 2 || paused) return;
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    const timer = window.setInterval(
-      () => setIndex((current) => (current + 1) % items.length),
-      HERO_ROTATE_MS,
-    );
+    const timer = window.setInterval(() => move(1), HERO_ROTATE_MS);
     return () => window.clearInterval(timer);
-  }, [items.length, paused]);
+  }, [items.length, paused, index]);
 
   if (!active) return null;
   const artwork = active.background || active.banner || active.poster;
@@ -135,9 +145,40 @@ export function Hero({
       // Keyed so a slide change restarts the fade rather than cross-fading
       // two backgrounds into mud.
       key={`${active.type}:${active.id}`}
-      className="hero"
+      className={`hero hero-transition-${transitionDirection}`}
       onPointerEnter={() => setPaused(true)}
-      onPointerLeave={() => setPaused(false)}
+      onPointerLeave={() => {
+        if (!swipe.current.active) setPaused(false);
+      }}
+      onPointerDown={(event) => {
+        if (items.length < 2 || (event.target as HTMLElement).closest("button"))
+          return;
+        swipe.current = {
+          active: true,
+          pointerId: event.pointerId,
+          x: event.clientX,
+          y: event.clientY,
+        };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        setPaused(true);
+      }}
+      onPointerUp={(event) => {
+        const start = swipe.current;
+        if (!start.active || start.pointerId !== event.pointerId) return;
+        swipe.current.active = false;
+        if (event.currentTarget.hasPointerCapture(event.pointerId))
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        const x = event.clientX - start.x;
+        const y = event.clientY - start.y;
+        if (Math.abs(x) >= 48 && Math.abs(x) > Math.abs(y) * 1.15)
+          move(x < 0 ? 1 : -1);
+        setPaused(false);
+      }}
+      onPointerCancel={(event) => {
+        if (swipe.current.pointerId !== event.pointerId) return;
+        swipe.current.active = false;
+        setPaused(false);
+      }}
       style={
         artwork
           ? {
@@ -152,12 +193,11 @@ export function Hero({
         ) : (
           <h1>{active.name}</h1>
         )}
-        <div className="hero-meta">
-          <span>{active.releaseInfo}</span>
-          {active.imdbRating && <span>★ {active.imdbRating}</span>}
+        <div className="hero-meta home-hero-meta">
           <span>{active.type === "series" ? "Series" : "Movie"}</span>
+          {active.genres[0] && <span>{active.genres[0]}</span>}
+          {active.releaseInfo && <span>{active.releaseInfo}</span>}
         </div>
-        <p>{active.description}</p>
         <button className="primary" onClick={() => onOpen(active)}>
           <Play size={18} fill="currentColor" /> View details
         </button>
@@ -171,7 +211,7 @@ export function Hero({
               aria-selected={dot === index}
               aria-label={item.name}
               className={dot === index ? "active" : undefined}
-              onClick={() => setIndex(dot)}
+              onClick={() => select(dot)}
             />
           ))}
         </div>

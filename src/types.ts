@@ -45,6 +45,10 @@ export type AddonManifest = {
     string | { name: string; types?: string[]; idPrefixes?: string[] }
   >;
   catalogs?: ManifestCatalog[];
+  behaviorHints?: {
+    configurable?: boolean;
+    configurationRequired?: boolean;
+  };
 };
 export type InstalledAddon = AddonRow & {
   manifest?: AddonManifest;

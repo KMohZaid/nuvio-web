@@ -1,13 +1,31 @@
 const DB_NAME = "nuvio-web";
 const STORE = "key-value";
+let databasePromise: Promise<IDBDatabase> | null = null;
 
 function database(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (databasePromise) return databasePromise;
+
+  databasePromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1);
     request.onupgradeneeded = () => request.result.createObjectStore(STORE);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        databasePromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => {
+      databasePromise = null;
+      reject(request.error);
+    };
+    request.onblocked = () => {
+      databasePromise = null;
+      reject(new Error("Nuvio web storage is blocked by another tab."));
+    };
   });
+  return databasePromise;
 }
 
 export async function getValue<T>(key: string): Promise<T | null> {
@@ -39,4 +57,3 @@ export async function deleteValue(key: string): Promise<void> {
     tx.onerror = () => reject(tx.error);
   });
 }
-

@@ -18,9 +18,34 @@ export type PlayabilityVerdict = {
   reason: string;
 };
 
-const isAppleWebKit = () =>
+export const isAppleWebKit = () =>
   /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent) ||
-  /iPad|iPhone|iPod/.test(navigator.userAgent);
+    /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+/** The local remuxer understands Matroska only, not every legacy type. */
+export function isMatroskaSource(url: string, filename?: string): boolean {
+  return [filename, url].some((value) =>
+    /\.mkv(?:$|[?#\s])/i.test(value ?? ""),
+  );
+}
+
+/**
+ * Prefer remuxing Matroska on every browser that exposes MSE/MMS.
+ *
+ * Chromium can demux many MKVs natively, but it commonly accepts the video
+ * while silently rejecting its AC-3/E-AC-3 audio. Waiting for native playback
+ * to fail therefore never reaches the compatibility audio track that the
+ * remuxer can select.
+ */
+export function shouldUseRemuxFallback(url: string, filename?: string): boolean {
+  return (
+    isMatroskaSource(url, filename) &&
+    Boolean(
+      (window as unknown as { ManagedMediaSource?: typeof MediaSource })
+        .ManagedMediaSource ?? window.MediaSource,
+    )
+  );
+}
 
 export function assessPlayback(url: string, filename?: string): PlayabilityVerdict {
   const target = `${filename ?? ""} ${url}`;

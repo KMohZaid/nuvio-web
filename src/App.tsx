@@ -1,19 +1,30 @@
 import {
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   ChevronRight,
+  Eye,
+  EyeOff,
   FlaskConical,
   RefreshCw,
   X,
   Compass,
   Home,
   Library,
+  LayoutGrid,
+  Link2,
   LogOut,
+  Palette,
+  Play,
   Puzzle,
   Search,
   Settings,
+  SlidersHorizontal,
+  Trash2,
   UserRound,
 } from "lucide-react";
 import {
+  type CSSProperties,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -35,8 +46,6 @@ import { Hero, MediaRow, PosterCard } from "./components/Media";
 import { Player } from "./components/Player";
 import { ProfileSwitcher } from "./components/ProfileSwitcher";
 import {
-  blobBoolean,
-  blobRawBoolean,
   loadAddons,
   loadAvatarCatalog,
   loadLibrary,
@@ -48,9 +57,9 @@ import {
   COLLECTION_KEY_PREFIX,
   type HomeLayout,
   loadSettingsBlob,
+  loadProviderCredentials,
   loadWatchedItems,
-  pushBlobBoolean,
-  pushBlobRawBoolean,
+  pushSettingsBlob,
   pushProgress,
   isComplete,
   restoreSession,
@@ -60,8 +69,15 @@ import {
   setWatched,
   signOut,
   type SettingsBlob,
+  type ProviderCredentialRow,
+  type SyncPreferenceType,
+  withBlobRawValue,
+  withBlobStringPayload,
+  withBlobTypedValue,
+  updateProviderCredential,
 } from "./lib/account";
 import {
+  addonConfigureUrl,
   loadCatalog,
   loadHome,
   loadInstalledAddons,
@@ -89,6 +105,21 @@ import {
   type WatchIndex,
 } from "./lib/progress";
 import { useProgressiveList } from "./lib/useProgressiveList";
+import { useSwipeBack } from "./lib/useSwipeBack";
+import { providerCredential } from "./lib/providerCredentials";
+import type { MetadataEnrichmentConfig } from "./lib/metadataEnrichment";
+import {
+  moveMetaScreenSection,
+  withMetaScreenPayload,
+  withMetaScreenSection,
+  type MetaScreenSectionKey,
+} from "./lib/metaScreenSettings";
+import {
+  readWebSettings,
+  type ContinueWatchingSettings,
+  type PosterSettings,
+  type WebSettings,
+} from "./lib/webSettings";
 import type {
   AddonRow,
   CatalogSection,
@@ -116,7 +147,84 @@ const nav: Array<{ key: NavKey; label: string; icon: typeof Home }> = [
   { key: "settings", label: "Settings", icon: Settings },
 ];
 
+type SettingsCategory =
+  | "appearance"
+  | "home"
+  | "details"
+  | "playback"
+  | "integrations"
+  | "addons"
+  | "app";
+
+const SETTINGS_CATEGORIES: Array<{
+  key: SettingsCategory;
+  label: string;
+  description: string;
+  icon: typeof Home;
+}> = [
+  {
+    key: "appearance",
+    label: "Appearance",
+    description: "Theme, navigation, and poster cards",
+    icon: Palette,
+  },
+  {
+    key: "home",
+    label: "Home",
+    description: "Continue Watching and home presentation",
+    icon: Home,
+  },
+  {
+    key: "details",
+    label: "Details",
+    description: "Detail page layout and episode cards",
+    icon: LayoutGrid,
+  },
+  {
+    key: "addons",
+    label: "Content & discovery",
+    description: "Manage addons and discovery sources",
+    icon: Puzzle,
+  },
+  {
+    key: "playback",
+    label: "Playback",
+    description: "Player, subtitles, sources, and auto-play",
+    icon: Play,
+  },
+  {
+    key: "integrations",
+    label: "Integrations",
+    description: "TMDB, MDBList, and metadata providers",
+    icon: Link2,
+  },
+  {
+    key: "app",
+    label: "App & account",
+    description: "Profile, notifications, updates, and install",
+    icon: UserRound,
+  },
+];
+
 const AMOLED_CACHE_KEY = "nuvio-web-amoled";
+const WEB_DETAIL_SECTION_KEYS = [
+  "EPISODES",
+  "PRODUCTION",
+  "CAST",
+  "TRAILERS",
+  "DETAILS",
+] as const satisfies readonly MetaScreenSectionKey[];
+
+const DETAIL_SECTION_LABELS: Record<
+  (typeof WEB_DETAIL_SECTION_KEYS)[number],
+  string
+> = {
+  EPISODES: "Episodes",
+  PRODUCTION: "Production",
+  CAST: "Cast",
+  TRAILERS: "Trailers & extras",
+  DETAILS: "Details",
+};
 
 // The synced value arrives a round trip after boot. Painting the last known
 // theme immediately avoids a flash of the wrong background on every launch.
@@ -140,6 +248,22 @@ export function App() {
   progressRef.current = progress;
   const [recentMetadata, setRecentMetadata] = useState<Meta[]>([]);
   const [settingsBlob, setSettingsBlob] = useState<SettingsBlob | null>(null);
+  // Every settings RPC replaces the complete platform blob. Keep optimistic
+  // edits in a ref and serialize writes so two quick controls cannot race and
+  // silently restore an older full blob over a newer one.
+  const settingsBlobRef = useRef<SettingsBlob | null>(null);
+  settingsBlobRef.current = settingsBlob;
+  const settingsWriteQueue = useRef<Promise<void>>(Promise.resolve());
+  const settingsRevision = useRef(0);
+  const [providerCredentials, setProviderCredentials] = useState<
+    ProviderCredentialRow[]
+  >([]);
+  const [credentialsReady, setCredentialsReady] = useState(false);
+  const accountHydrationGeneration = useRef(0);
+  const profileGeneration = useRef(0);
+  const profileLoadGeneration = useRef(0);
+  const activeProfileIndexRef = useRef<number | null>(null);
+  const hydratedProfileIndexRef = useRef<number | null>(null);
   const [collections, setCollections] = useState<Collection[]>([]);
   const [homeLayout, setHomeLayout] = useState<HomeLayout | null>(null);
   const [folder, setFolder] = useState<CollectionFolder | null>(null);
@@ -202,6 +326,35 @@ export function App() {
   useEffect(() => {
     void checkForUpdate();
   }, []);
+  const activateProfile = useCallback((next: Profile | null) => {
+    profileGeneration.current += 1;
+    profileLoadGeneration.current += 1;
+    activeProfileIndexRef.current = next?.profileIndex ?? null;
+    hydratedProfileIndexRef.current = null;
+    settingsRevision.current += 1;
+    settingsBlobRef.current = null;
+    setAddonRows([]);
+    setAddons([]);
+    setSections([]);
+    setLibrary([]);
+    setProgress([]);
+    setWatchedItems([]);
+    setRecentMetadata([]);
+    setSettingsBlob(null);
+    setProviderCredentials([]);
+    setCredentialsReady(false);
+    setCollections([]);
+    setHomeLayout(null);
+    setFolder(null);
+    setCatalog(null);
+    setSelected(null);
+    setQuery("");
+    setResults([]);
+    setSearching(false);
+    setPlayback(null);
+    setExternalWatch(null);
+    setProfile(next);
+  }, []);
   useEffect(() => {
     restoreSession()
       .then((value) => {
@@ -210,7 +363,13 @@ export function App() {
       .finally(() => setBooting(false));
   }, []);
   const hydrate = useCallback(async () => {
-    if (!session) return;
+    const hydrationGeneration = ++accountHydrationGeneration.current;
+    if (!session) {
+      setLoading(false);
+      return;
+    }
+    const isCurrent = () =>
+      hydrationGeneration === accountHydrationGeneration.current;
     setLoading(true);
     setMessage("");
     try {
@@ -231,52 +390,76 @@ export function App() {
       const nextProfile =
         nextProfiles.find((item) => item.profileIndex === stored) ??
         nextProfiles[0];
+      if (!isCurrent()) return;
       setProfiles(nextProfiles);
-      setProfile(nextProfile ?? null);
+      activateProfile(nextProfile ?? null);
     } catch (error) {
+      if (!isCurrent()) return;
       setMessage(
         error instanceof Error ? error.message : "Account loading failed",
       );
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
-  }, [session]);
+  }, [session, activateProfile]);
   useEffect(() => {
     hydrate();
   }, [hydrate]);
   const loadProfileData = useCallback(async () => {
     if (!profile) return;
+    const profileIndex = profile.profileIndex;
+    const generation = profileGeneration.current;
+    const loadGeneration = ++profileLoadGeneration.current;
+    const isCurrent = () =>
+      generation === profileGeneration.current &&
+      loadGeneration === profileLoadGeneration.current &&
+      activeProfileIndexRef.current === profileIndex;
+    if (!isCurrent()) return;
     setLoading(true);
     try {
-      const profileIndex = profile.profileIndex;
-
       // Everything the catalogs do not depend on runs on its own and lands
       // when it lands. Gathering all seven into one Promise.all meant the
       // slowest request — usually the watched history — held up the rows.
       const libraryTask = loadLibrary(profileIndex)
         .then((items) => {
-          setLibrary(items);
+          if (isCurrent()) setLibrary(items);
           return items;
         })
         .catch(() => [] as LibraryItem[]);
       // Snapshot once, then deltas — see lib/watchSync.
       const progressTask = syncProgress(profileIndex)
         .then((rows) => {
-          setProgress(rows);
+          if (isCurrent()) setProgress(rows);
           return rows;
         })
         .catch(() => [] as ProgressRow[]);
       const watchedTask = syncWatched(profileIndex)
         .then((items) => {
-          setWatchedItems(items);
+          if (isCurrent()) setWatchedItems(items);
           return items;
         })
         .catch(() => [] as WatchedItem[]);
+      setCredentialsReady(false);
       void loadSettingsBlob(profileIndex)
-        .then((blob) => blob && setSettingsBlob(blob))
+        .then((blob) => {
+          if (!blob || !isCurrent()) return;
+          settingsBlobRef.current = blob;
+          setSettingsBlob(blob);
+        })
         .catch(() => undefined);
+      void loadProviderCredentials(profileIndex)
+        .then((rows) => {
+          if (!isCurrent()) return;
+          setProviderCredentials(rows);
+          setCredentialsReady(true);
+        })
+        .catch(() => {
+          if (!isCurrent()) return;
+          setProviderCredentials([]);
+          setCredentialsReady(true);
+        });
       void loadCollections(profileIndex)
-        .then(setCollections)
+        .then((items) => isCurrent() && setCollections(items))
         .catch(() => undefined);
 
       // The critical path: addons and the layout that orders them. The layout
@@ -286,16 +469,20 @@ export function App() {
         loadAddons(profileIndex),
         loadHomeLayout(profileIndex).catch(() => null),
       ]);
+      if (!isCurrent()) return;
       setAddonRows(rows);
       setHomeLayout(nextLayout);
       const installed = await loadInstalledAddons(rows);
+      if (!isCurrent()) return;
       setAddons(installed);
+      hydratedProfileIndexRef.current = profileIndex;
       // Rows appear as each batch lands instead of after every addon has
       // answered, which is what left the page blank on a slow connection.
       setSections([]);
       const home = await loadHome(
         installed,
         (section) => {
+          if (!isCurrent()) return;
           setSections((current) => [...current, section]);
           // The first row on screen is the end of "loading". Everything after
           // this fills in behind a page you can already use.
@@ -303,6 +490,7 @@ export function App() {
         },
         nextLayout,
       );
+      if (!isCurrent()) return;
       // No catalog returned anything, so nothing will clear it above.
       setLoading(false);
 
@@ -313,6 +501,7 @@ export function App() {
         progressTask,
         watchedTask,
       ]);
+      if (!isCurrent()) return;
       const known = new Map<string, Meta>();
       for (const item of [
         ...home.sections.flatMap((section) => section.items),
@@ -359,21 +548,23 @@ export function App() {
               return resolveMeta(seed, installed).catch(() => existing ?? seed);
             }),
         );
+        if (!isCurrent()) return;
         resolved.push(...batch);
         // Publish each batch so the row fills in rather than appearing whole
         // at the end.
         setRecentMetadata([...resolved]);
       }
-      if (home.errors.length)
+      if (home.errors.length && isCurrent())
         setMessage(
           `${home.errors.length} addon request${home.errors.length === 1 ? "" : "s"} could not load in this browser.`,
         );
     } catch (error) {
-      setMessage(
-        error instanceof Error ? error.message : "Profile data failed",
-      );
+      if (isCurrent())
+        setMessage(
+          error instanceof Error ? error.message : "Profile data failed",
+        );
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [profile]);
   useEffect(() => {
@@ -381,16 +572,31 @@ export function App() {
   }, [loadProfileData]);
   async function runSearch() {
     if (!query.trim()) return;
+    const generation = profileGeneration.current;
+    const profileIndex = activeProfileIndexRef.current;
     setSearching(true);
     setActive("discover");
     try {
-      setResults(await searchAddons(query.trim(), addons));
+      const next = await searchAddons(query.trim(), addons);
+      if (
+        generation === profileGeneration.current &&
+        profileIndex === activeProfileIndexRef.current
+      )
+        setResults(next);
     } finally {
-      setSearching(false);
+      if (
+        generation === profileGeneration.current &&
+        profileIndex === activeProfileIndexRef.current
+      )
+        setSearching(false);
     }
   }
   async function updateAddons(next: AddonRow[]) {
     if (!profile) return;
+    if (hydratedProfileIndexRef.current !== profile.profileIndex) {
+      setMessage("Wait for this profile to finish loading before changing addons.");
+      return;
+    }
     setAddonRows(next);
     await saveAddons(profile.profileIndex, next);
     await loadProfileData();
@@ -404,71 +610,252 @@ export function App() {
       { url: normalized, enabled: true, sortOrder: addonRows.length },
     ]);
   }
-  const amoled = blobBoolean(settingsBlob, "theme_settings", "amoled_enabled", false);
-  const releaseAlerts = blobRawBoolean(
-    settingsBlob,
-    "notifications_settings",
-    "episode_release_alerts_enabled",
-    false,
+  function toggleAddon(index: number) {
+    void updateAddons(
+      addonRows.map((row, rowIndex) =>
+        rowIndex === index ? { ...row, enabled: !row.enabled } : row,
+      ),
+    );
+  }
+  function moveAddon(index: number, direction: -1 | 1) {
+    const destination = index + direction;
+    if (destination < 0 || destination >= addonRows.length) return;
+    const next = [...addonRows];
+    [next[index], next[destination]] = [next[destination], next[index]];
+    void updateAddons(next.map((row, sortOrder) => ({ ...row, sortOrder })));
+  }
+  function removeAddon(index: number) {
+    const addon = addons[index];
+    if (
+      !window.confirm(
+        `Remove ${addon?.manifest?.name || addon?.name || "this addon"}?`,
+      )
+    )
+      return;
+    void updateAddons(
+      addonRows
+        .filter((_, rowIndex) => rowIndex !== index)
+        .map((row, sortOrder) => ({ ...row, sortOrder })),
+    );
+  }
+  const webSettings = useMemo(
+    () => readWebSettings(settingsBlob),
+    [settingsBlob],
+  );
+  const amoled = webSettings.amoled;
+  const metadataEnrichment = useMemo<MetadataEnrichmentConfig>(
+    () => ({
+      tmdb: {
+        enabled: webSettings.integrations.tmdbEnabled,
+        apiKey: providerCredential(providerCredentials, "tmdb", "api_key"),
+        language: webSettings.integrations.tmdbLanguage,
+        useArtwork: webSettings.integrations.tmdbUseArtwork,
+        useBasicInfo: webSettings.integrations.tmdbUseBasicInfo,
+        useDetails: webSettings.integrations.tmdbUseDetails,
+        useReleaseDates: webSettings.integrations.tmdbUseReleaseDates,
+        useCredits: webSettings.integrations.tmdbUseCredits,
+        useEpisodes: webSettings.integrations.tmdbUseEpisodes,
+        useTrailers: webSettings.integrations.tmdbUseTrailers,
+      },
+      mdbList: {
+        enabled: webSettings.integrations.mdbListEnabled,
+        apiKey: providerCredential(
+          providerCredentials,
+          "mdblist",
+          "api_key",
+        ),
+        providers: webSettings.integrations.mdbListProviders,
+      },
+    }),
+    [providerCredentials, webSettings.integrations],
   );
 
-  /** Raw boolean, not the typed wrapper — see pushBlobRawBoolean. */
-  async function updateReleaseAlerts(next: boolean) {
-    if (!profile || !settingsBlob) return;
-    const previous = settingsBlob;
-    try {
-      setSettingsBlob(
-        await pushBlobRawBoolean(
-          profile.profileIndex,
-          previous,
-          "notifications_settings",
-          "episode_release_alerts_enabled",
-          next,
+  const updateSettings = useCallback(
+    (transform: (current: SettingsBlob) => SettingsBlob) => {
+      const current = settingsBlobRef.current;
+      if (
+        !profile ||
+        !current ||
+        hydratedProfileIndexRef.current !== profile.profileIndex
+      )
+        return;
+      const next = transform(current);
+      const revision = ++settingsRevision.current;
+      const profileIndex = profile.profileIndex;
+      settingsBlobRef.current = next;
+      setSettingsBlob(next);
+      const save = settingsWriteQueue.current
+        .catch(() => undefined)
+        .then(() => pushSettingsBlob(profileIndex, next))
+        .then(() => undefined);
+      settingsWriteQueue.current = save.catch(() => undefined);
+      void save.catch(async (error) => {
+        setMessage(
+          error instanceof Error ? error.message : "Could not save settings",
+        );
+        // Only the newest failed edit may refresh. An older failure must not
+        // roll back a later optimistic edit which is still queued to save.
+        if (
+          revision === settingsRevision.current &&
+          activeProfileIndexRef.current === profileIndex
+        ) {
+          const restored = await loadSettingsBlob(profileIndex).catch(() => null);
+          if (restored) {
+            settingsBlobRef.current = restored;
+            setSettingsBlob(restored);
+          }
+        }
+      });
+    },
+    [profile],
+  );
+
+  const updateTypedSetting = useCallback(
+    (
+      feature: string,
+      key: string,
+      type: SyncPreferenceType,
+      value: string | boolean | number | string[],
+    ) => {
+      updateSettings((blob) => {
+        switch (type) {
+          case "boolean":
+            return withBlobTypedValue(blob, feature, key, type, Boolean(value));
+          case "int":
+          case "float":
+            return withBlobTypedValue(blob, feature, key, type, Number(value));
+          case "string_set":
+            return withBlobTypedValue(
+              blob,
+              feature,
+              key,
+              type,
+              Array.isArray(value) ? value : [],
+            );
+          default:
+            return withBlobTypedValue(blob, feature, key, type, String(value));
+        }
+      });
+    },
+    [updateSettings],
+  );
+
+  const updatePosterSetting = useCallback(
+    (patch: Partial<PosterSettings>) =>
+      updateSettings((blob) =>
+        withBlobStringPayload(
+          blob,
+          "poster_card_style_settings_payload",
+          patch,
         ),
-      );
-    } catch (error) {
-      setSettingsBlob(previous);
-      setMessage(
-        error instanceof Error ? error.message : "Could not save notifications",
-      );
-    }
-  }
+      ),
+    [updateSettings],
+  );
+
+  const updateContinueWatchingSetting = useCallback(
+    (patch: Record<string, unknown>) =>
+      updateSettings((blob) =>
+        withBlobStringPayload(
+          blob,
+          "continue_watching_settings_payload",
+          patch,
+        ),
+      ),
+    [updateSettings],
+  );
+
+  const updateMetaScreenSetting = useCallback(
+    (patch: Record<string, unknown>) =>
+      updateSettings((blob) => withMetaScreenPayload(blob, patch)),
+    [updateSettings],
+  );
+
+  const updateMetaScreenSection = useCallback(
+    (key: MetaScreenSectionKey, enabled: boolean) =>
+      updateSettings((blob) =>
+        withMetaScreenSection(blob, key, { enabled }),
+      ),
+    [updateSettings],
+  );
+
+  const moveDetailSection = useCallback(
+    (key: MetaScreenSectionKey, direction: -1 | 1) =>
+      updateSettings((blob) =>
+        moveMetaScreenSection(
+          blob,
+          key,
+          direction,
+          WEB_DETAIL_SECTION_KEYS,
+        ),
+      ),
+    [updateSettings],
+  );
+
+  const updateRawSetting = useCallback(
+    (feature: string, key: string, value: unknown) =>
+      updateSettings((blob) => withBlobRawValue(blob, feature, key, value)),
+    [updateSettings],
+  );
+
+  const saveProviderCredential = useCallback(
+    async (
+      provider: "tmdb" | "mdblist" | "animeskip" | "introdb",
+      value: string,
+    ) => {
+      if (!profile) return;
+      if (hydratedProfileIndexRef.current !== profile.profileIndex)
+        throw new Error("Wait for this profile to finish loading.");
+      const profileIndex = profile.profileIndex;
+      const generation = profileGeneration.current;
+      const isCurrent = () =>
+        generation === profileGeneration.current &&
+        activeProfileIndexRef.current === profileIndex;
+      try {
+        const next = await updateProviderCredential(
+          profileIndex,
+          provider,
+          value,
+        );
+        if (!isCurrent()) return;
+        setProviderCredentials(next);
+        setMessage("Integration credential saved.");
+      } catch (error) {
+        if (!isCurrent()) return;
+        setMessage(
+          error instanceof Error ? error.message : "Could not save credential",
+        );
+        throw error;
+      }
+    },
+    [profile],
+  );
+
   useEffect(() => {
     document.documentElement.dataset.theme = amoled ? "amoled" : "default";
     localStorage.setItem(AMOLED_CACHE_KEY, String(amoled));
   }, [amoled]);
-
-  /** Applies the theme immediately and rolls back if the push is rejected. */
-  async function updateAmoled(next: boolean) {
-    if (!profile || !settingsBlob) return;
-    const previous = settingsBlob;
-    setSettingsBlob({
-      ...settingsBlob,
-      features: {
-        ...settingsBlob.features,
-        theme_settings: {
-          ...(settingsBlob.features?.theme_settings ?? {}),
-          amoled_enabled: { type: "boolean", value: next },
-        },
-      },
-    });
-    try {
-      setSettingsBlob(
-        await pushBlobBoolean(
-          profile.profileIndex,
-          previous,
-          "theme_settings",
-          "amoled_enabled",
-          next,
-        ),
-      );
-    } catch (error) {
-      setSettingsBlob(previous);
-      setMessage(
-        error instanceof Error ? error.message : "Could not save the theme",
-      );
-    }
-  }
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.nuvioAccent = webSettings.selectedTheme.toLowerCase();
+    root.dataset.navLayout = webSettings.desktopNavigationLayout.toLowerCase();
+    root.dataset.navStyle = webSettings.navBarStyle.toLowerCase();
+    root.dataset.posterLandscape = String(
+      webSettings.poster.catalogLandscapeModeEnabled,
+    );
+    root.dataset.hidePosterLabels = String(
+      webSettings.poster.hideLabelsEnabled,
+    );
+    root.style.setProperty("--poster-width", `${webSettings.poster.widthDp}px`);
+    root.style.setProperty("--poster-height", `${webSettings.poster.heightDp}px`);
+    root.style.setProperty(
+      "--poster-aspect",
+      `${webSettings.poster.widthDp} / ${webSettings.poster.heightDp}`,
+    );
+    root.style.setProperty(
+      "--poster-radius",
+      `${webSettings.poster.cornerRadiusDp}px`,
+    );
+  }, [webSettings]);
 
   /**
    * Catalogs and collections in one list, ordered the way Nuvio stores them.
@@ -528,6 +915,8 @@ export function App() {
     ended: boolean,
   ) {
     if (!profile) return;
+    const profileIndex = profile.profileIndex;
+    const generation = profileGeneration.current;
     const identity = {
       contentId: current.meta.id,
       contentType: current.meta.type,
@@ -537,7 +926,7 @@ export function App() {
     };
     const rows = progressRef.current;
     void pushProgress(
-      profile.profileIndex,
+      profileIndex,
       identity,
       positionMs,
       durationMs,
@@ -545,7 +934,12 @@ export function App() {
       rows,
     )
       .then((stored) => {
-        if (!stored) return;
+        if (
+          !stored ||
+          generation !== profileGeneration.current ||
+          activeProfileIndexRef.current !== profileIndex
+        )
+          return;
         const complete = isComplete(positionMs, durationMs, ended);
         const key = watchKey(identity.contentId, identity.season, identity.episode);
         setProgress((currentRows) => [
@@ -577,6 +971,11 @@ export function App() {
    */
   async function toggleLibrary(meta: Meta) {
     if (!profile) return;
+    const profileIndex = profile.profileIndex;
+    const generation = profileGeneration.current;
+    const isCurrent = () =>
+      generation === profileGeneration.current &&
+      activeProfileIndexRef.current === profileIndex;
     const present = library.some(
       (item) => item.id === meta.id && item.type === meta.type,
     );
@@ -590,10 +989,12 @@ export function App() {
     );
     try {
       if (present)
-        await removeFromLibrary(profile.profileIndex, meta.id, meta.type);
-      else await addToLibrary(profile.profileIndex, meta);
+        await removeFromLibrary(profileIndex, meta.id, meta.type);
+      else await addToLibrary(profileIndex, meta);
+      if (!isCurrent()) return;
       setMessage(present ? "Removed from your library." : "Added to your library.");
     } catch (error) {
+      if (!isCurrent()) return;
       setLibrary(previous);
       setMessage(
         error instanceof Error ? error.message : "Could not update your library",
@@ -644,6 +1045,11 @@ export function App() {
    */
   async function toggleWatched(meta: Meta, video: Video | undefined, next: boolean) {
     if (!profile) return;
+    const profileIndex = profile.profileIndex;
+    const generation = profileGeneration.current;
+    const isCurrent = () =>
+      generation === profileGeneration.current &&
+      activeProfileIndexRef.current === profileIndex;
     const identity = {
       contentId: meta.id,
       contentType: meta.type,
@@ -680,13 +1086,14 @@ export function App() {
     );
     try {
       await setWatched(
-        profile.profileIndex,
+        profileIndex,
         identity,
         video?.title || meta.name,
         next,
         previousProgress,
       );
     } catch (error) {
+      if (!isCurrent()) return;
       setWatchedItems(previousWatched);
       setProgress(previousProgress);
       setMessage(
@@ -701,8 +1108,15 @@ export function App() {
         ...sections.flatMap((section) => section.items),
         ...library,
         ...recentMetadata,
-      ]),
-    [library, progress, recentMetadata, sections, watchedItems],
+      ], webSettings.continueWatching),
+    [
+      library,
+      progress,
+      recentMetadata,
+      sections,
+      watchedItems,
+      webSettings.continueWatching,
+    ],
   );
   if (booting)
     return (
@@ -713,7 +1127,7 @@ export function App() {
     );
   if (!session) return <AuthScreen onSession={setSession} />;
   return (
-    <div className="app-shell">
+    <div className={`app-shell${playback ? " player-active" : ""}`}>
       <aside className="rail">
         <img src={`${import.meta.env.BASE_URL}Nuvio-icon.png`} alt="Nuvio" />
         {nav.map((item) => (
@@ -754,10 +1168,11 @@ export function App() {
               "nuvio-active-profile",
               String(next.profileIndex),
             );
-            setProfile(next);
+            activateProfile(next);
           }}
           onSignOut={async () => {
             await signOut();
+            activateProfile(null);
             setSession(null);
           }}
         />
@@ -824,6 +1239,7 @@ export function App() {
             heroItems={heroItems}
             rows={homeRows}
             continueItems={continueItems}
+            continueSettings={webSettings.continueWatching}
             index={watchIndex}
             onOpen={setSelected}
             onSeeAll={setCatalog}
@@ -850,27 +1266,36 @@ export function App() {
             onBack={() => setActive("settings")}
             addons={addons}
             rows={addonRows}
-            onToggle={(index) =>
-              updateAddons(
-                addonRows.map((row, rowIndex) =>
-                  rowIndex === index ? { ...row, enabled: !row.enabled } : row,
-                ),
-              )
-            }
+            onToggle={toggleAddon}
+            onMove={moveAddon}
+            onRemove={removeAddon}
             onAdd={addAddon}
             onRefresh={loadProfileData}
           />
         ) : (
           <SettingsPage
-            onAddons={() => setActive("addons")}
             onRemuxLab={() => setActive("remuxLab")}
+            addons={addons}
+            addonRows={addonRows}
+            onToggleAddon={toggleAddon}
+            onMoveAddon={moveAddon}
+            onRemoveAddon={removeAddon}
+            onAddAddon={addAddon}
+            onRefreshAddons={loadProfileData}
             session={session}
             profile={profile}
-            amoled={amoled}
-            releaseAlerts={releaseAlerts}
-            onReleaseAlerts={updateReleaseAlerts}
-            amoledReady={settingsBlob != null}
-            onAmoled={updateAmoled}
+            settings={webSettings}
+            settingsReady={settingsBlob != null}
+            onTypedSetting={updateTypedSetting}
+            onPosterSetting={updatePosterSetting}
+            onContinueWatchingSetting={updateContinueWatchingSetting}
+            onMetaScreenSetting={updateMetaScreenSetting}
+            onMetaScreenSection={updateMetaScreenSection}
+            onMoveMetaScreenSection={moveDetailSection}
+            onRawSetting={updateRawSetting}
+            providerCredentials={providerCredentials}
+            credentialsReady={credentialsReady}
+            onProviderCredential={saveProviderCredential}
             externalPlayer={externalPlayer}
             onExternalPlayer={(mode) => {
               setExternalPlayer(mode);
@@ -878,16 +1303,28 @@ export function App() {
             }}
             onSignOut={async () => {
               await signOut();
+              activateProfile(null);
               setSession(null);
             }}
           />
         )}
       </main>
-      <nav className="bottom-nav">
+      <nav
+        className="bottom-nav"
+        style={
+          {
+            "--nav-index": Math.max(
+              0,
+              nav.findIndex((item) => item.key === active),
+            ),
+          } as CSSProperties
+        }
+      >
         {nav.map((item) => (
           <button
             key={item.key}
             className={active === item.key ? "active" : ""}
+            aria-current={active === item.key ? "page" : undefined}
             onClick={() => {
               setActive(item.key);
               setCatalog(null);
@@ -923,6 +1360,7 @@ export function App() {
            rebuilt home from scratch and only then re-opened details. */
         <Player
           {...playback}
+          settings={webSettings.player}
           startPositionMs={(() => {
             const row = watchIndex.progress.get(
               watchKey(
@@ -946,6 +1384,10 @@ export function App() {
         <Details
           seed={selected}
           addons={addons}
+          metadataEnrichment={metadataEnrichment}
+          playerSettings={webSettings.player}
+          streamBadgeSettings={webSettings.streamBadges}
+          metaScreenSettings={webSettings.metaScreen}
           watchIndex={watchIndex}
           onSetWatched={toggleWatched}
           inLibrary={library.some(
@@ -999,6 +1441,7 @@ function HomeView({
   heroItems,
   rows,
   continueItems,
+  continueSettings,
   index,
   onOpen,
   onSeeAll,
@@ -1007,6 +1450,7 @@ function HomeView({
   heroItems: Meta[];
   rows: HomeRow[];
   continueItems: ReturnType<typeof buildContinueWatching>;
+  continueSettings: ContinueWatchingSettings;
   index: WatchIndex;
   onOpen(item: Meta): void;
   onSeeAll(section: CatalogSection): void;
@@ -1021,7 +1465,11 @@ function HomeView({
     <>
       <Hero items={heroItems} onOpen={onOpen} />
       {continueItems.length > 0 && (
-        <ContinueWatching cards={continueItems} onOpen={onOpen} />
+        <ContinueWatching
+          cards={continueItems}
+          settings={continueSettings}
+          onOpen={onOpen}
+        />
       )}
       {visible.map((row) =>
         row.kind === "collection" ? (
@@ -1226,6 +1674,8 @@ function AddonsPage({
   rows,
   onBack,
   onToggle,
+  onMove,
+  onRemove,
   onAdd,
   onRefresh,
 }: {
@@ -1233,11 +1683,11 @@ function AddonsPage({
   rows: AddonRow[];
   onBack(): void;
   onToggle(index: number): void;
+  onMove(index: number, direction: -1 | 1): void;
+  onRemove(index: number): void;
   onAdd(url: string): Promise<void>;
   onRefresh(): void;
 }) {
-  const [url, setUrl] = useState("");
-  const [error, setError] = useState("");
   return (
     <section className="settings-page">
       <div className="page-head">
@@ -1258,6 +1708,32 @@ function AddonsPage({
           </p>
         </div>
       </div>
+      <AddonSettings
+        addons={addons}
+        rows={rows}
+        onToggle={onToggle}
+        onMove={onMove}
+        onRemove={onRemove}
+        onAdd={onAdd}
+        onRefresh={onRefresh}
+      />
+    </section>
+  );
+}
+
+function AddonSettings({
+  addons,
+  rows,
+  onToggle,
+  onMove,
+  onRemove,
+  onAdd,
+  onRefresh,
+}: Omit<Parameters<typeof AddonsPage>[0], "onBack">) {
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  return (
+    <>
       <form
         className="addon-install"
         onSubmit={async (event) => {
@@ -1310,18 +1786,34 @@ function AddonsPage({
               </small>
               <code>{addon.url}</code>
             </div>
-            <label className="switch">
-              <input
-                type="checkbox"
-                checked={rows[index]?.enabled ?? false}
-                onChange={() => onToggle(index)}
-              />
-              <i />
-            </label>
+            <div className="addon-controls">
+              {(addon.manifest?.behaviorHints?.configurable || addon.manifest?.behaviorHints?.configurationRequired) && (
+                <button
+                  className="addon-action"
+                  title="Configure addon"
+                  aria-label={`Configure ${addon.manifest?.name || addon.name || "addon"}`}
+                  onClick={() => window.open(addonConfigureUrl(addon.url), "_blank", "noopener,noreferrer")}
+                >
+                  <SlidersHorizontal />
+                </button>
+              )}
+              <button className="addon-action" title="Refresh addon" aria-label={`Refresh ${addon.manifest?.name || addon.name || "addon"}`} onClick={onRefresh}><RefreshCw /></button>
+              <button className="addon-action" title="Move up" aria-label="Move addon up" disabled={index === 0} onClick={() => onMove(index, -1)}><ArrowUp /></button>
+              <button className="addon-action" title="Move down" aria-label="Move addon down" disabled={index === rows.length - 1} onClick={() => onMove(index, 1)}><ArrowDown /></button>
+              <button className="addon-action danger-icon" title="Remove" aria-label={`Remove ${addon.manifest?.name || addon.name || "addon"}`} onClick={() => onRemove(index)}><Trash2 /></button>
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={rows[index]?.enabled ?? false}
+                  onChange={() => onToggle(index)}
+                />
+                <i />
+              </label>
+            </div>
           </article>
         ))}
       </div>
-    </section>
+    </>
   );
 }
 /**
@@ -1369,96 +1861,1176 @@ function UpdateRow() {
   );
 }
 
+function SettingToggle({
+  title,
+  description,
+  checked,
+  disabled,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange(next: boolean): void;
+}) {
+  return (
+    <div className="theme-row">
+      <span>
+        <strong>{title}</strong>
+        <small>{description}</small>
+      </span>
+      <label className="switch">
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <i />
+      </label>
+    </div>
+  );
+}
+
+const LANGUAGE_OPTIONS = [
+  ["en", "English"],
+  ["es", "Spanish"],
+  ["fr", "French"],
+  ["de", "German"],
+  ["it", "Italian"],
+  ["pt", "Portuguese"],
+  ["nl", "Dutch"],
+  ["pl", "Polish"],
+  ["tr", "Turkish"],
+  ["ru", "Russian"],
+  ["uk", "Ukrainian"],
+  ["ar", "Arabic"],
+  ["he", "Hebrew"],
+  ["hi", "Hindi"],
+  ["ja", "Japanese"],
+  ["ko", "Korean"],
+  ["zh", "Chinese"],
+] as const;
+
+function IntegrationCredentialField({
+  label,
+  description,
+  value,
+  ready,
+  onSave,
+}: {
+  label: string;
+  description: string;
+  value: string;
+  ready: boolean;
+  onSave(value: string): Promise<void>;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [visible, setVisible] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => setDraft(value), [value]);
+  return (
+    <form
+      className="credential-row"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setSaving(true);
+        try {
+          await onSave(draft);
+        } finally {
+          setSaving(false);
+        }
+      }}
+    >
+      <span>
+        <strong>{label}</strong>
+        <small>{description}</small>
+      </span>
+      <div className="credential-control">
+        <div className="password-field">
+          <input
+            type={visible ? "text" : "password"}
+            value={draft}
+            disabled={!ready || saving}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button
+            type="button"
+            aria-label={visible ? "Hide credential" : "Show credential"}
+            onClick={() => setVisible((current) => !current)}
+          >
+            {visible ? <EyeOff /> : <Eye />}
+          </button>
+        </div>
+        <button
+          className="secondary"
+          disabled={!ready || saving || draft === value}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 function SettingsPage({
-  onAddons,
   onRemuxLab,
+  addons,
+  addonRows,
+  onToggleAddon,
+  onMoveAddon,
+  onRemoveAddon,
+  onAddAddon,
+  onRefreshAddons,
   session,
   profile,
-  amoled,
-  amoledReady,
-  onAmoled,
-  releaseAlerts,
-  onReleaseAlerts,
+  settings,
+  settingsReady,
+  onTypedSetting,
+  onPosterSetting,
+  onContinueWatchingSetting,
+  onMetaScreenSetting,
+  onMetaScreenSection,
+  onMoveMetaScreenSection,
+  onRawSetting,
+  providerCredentials,
+  credentialsReady,
+  onProviderCredential,
   externalPlayer,
   onExternalPlayer,
   onSignOut,
 }: {
-  onAddons(): void;
   onRemuxLab(): void;
+  addons: InstalledAddon[];
+  addonRows: AddonRow[];
+  onToggleAddon(index: number): void;
+  onMoveAddon(index: number, direction: -1 | 1): void;
+  onRemoveAddon(index: number): void;
+  onAddAddon(url: string): Promise<void>;
+  onRefreshAddons(): void;
   session: Session;
   profile: Profile | null;
-  amoled: boolean;
-  amoledReady: boolean;
-  onAmoled(next: boolean): void;
-  releaseAlerts: boolean;
-  onReleaseAlerts(next: boolean): void;
+  settings: WebSettings;
+  settingsReady: boolean;
+  onTypedSetting(
+    feature: string,
+    key: string,
+    type: SyncPreferenceType,
+    value: string | boolean | number | string[],
+  ): void;
+  onPosterSetting(patch: Partial<PosterSettings>): void;
+  onContinueWatchingSetting(patch: Record<string, unknown>): void;
+  onMetaScreenSetting(patch: Record<string, unknown>): void;
+  onMetaScreenSection(key: MetaScreenSectionKey, enabled: boolean): void;
+  onMoveMetaScreenSection(key: MetaScreenSectionKey, direction: -1 | 1): void;
+  onRawSetting(feature: string, key: string, value: unknown): void;
+  providerCredentials: ProviderCredentialRow[];
+  credentialsReady: boolean;
+  onProviderCredential(
+    provider: "tmdb" | "mdblist" | "animeskip" | "introdb",
+    value: string,
+  ): Promise<void>;
   externalPlayer: ExternalPlayerMode;
   onExternalPlayer(mode: ExternalPlayerMode): void;
   onSignOut(): void;
 }) {
+  const [category, setCategory] = useState<SettingsCategory>("appearance");
+  const [mobilePanelOpen, setMobilePanelOpen] = useState(false);
+  const closeMobilePanel = useCallback(() => setMobilePanelOpen(false), []);
+  const mobilePanelRef = useSwipeBack<HTMLElement>(closeMobilePanel);
+  const activeCategory = SETTINGS_CATEGORIES.find(
+    (item) => item.key === category,
+  )!;
+  const ActiveCategoryIcon = activeCategory.icon;
+
+  useEffect(() => {
+    if (!mobilePanelOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMobilePanel();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    document.body.classList.add("mobile-settings-open");
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.classList.remove("mobile-settings-open");
+    };
+  }, [closeMobilePanel, mobilePanelOpen]);
+
+  const openMobileCategory = (next: SettingsCategory) => {
+    setCategory(next);
+    setMobilePanelOpen(true);
+  };
+  const tmdbKey = providerCredential(providerCredentials, "tmdb", "api_key");
+  const mdbListKey = providerCredential(
+    providerCredentials,
+    "mdblist",
+    "api_key",
+  );
+  const animeSkipClientId = providerCredential(
+    providerCredentials,
+    "animeskip",
+    "client_id",
+  );
+  const introDbApiKey = providerCredential(
+    providerCredentials,
+    "introdb",
+    "api_key",
+  );
+  const detailSections = settings.metaScreen.items.filter(
+    (item): item is typeof item & {
+      key: (typeof WEB_DETAIL_SECTION_KEYS)[number];
+    } => WEB_DETAIL_SECTION_KEYS.includes(
+      item.key as (typeof WEB_DETAIL_SECTION_KEYS)[number],
+    ),
+  );
   return (
-    <section className="settings-page">
+    <section className="settings-page" data-settings-category={category}>
       <span className="eyebrow">WEB CLIENT</span>
       <h1>Settings</h1>
       <p>
         This preview keeps media traffic off the Nuvio host and uses the browser
         whenever possible.
       </p>
-      <button className="setting-link" onClick={onAddons}>
-        <Puzzle />
-        <span>
-          <strong>Addons</strong>
-          <small>Install, reorder and disable your Stremio addons</small>
-        </span>
-        <ChevronRight />
-      </button>
-      <div className="setting-card">
+      <nav className="settings-category-nav" aria-label="Settings categories">
+        {SETTINGS_CATEGORIES.map(({ key, label }) => (
+          <button
+            key={key}
+            type="button"
+            className={category === key ? "active" : ""}
+            aria-current={category === key ? "page" : undefined}
+            onClick={() => setCategory(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+      <div className="mobile-settings-index">
+        <section
+          className="mobile-settings-group"
+          aria-labelledby="settings-account-group"
+        >
+          <span id="settings-account-group">ACCOUNT</span>
+          <div className="mobile-settings-list">
+            {SETTINGS_CATEGORIES.filter((item) => item.key === "app").map(
+              ({ key, label, description, icon: Icon }) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => openMobileCategory(key)}
+                >
+                  <i><Icon /></i>
+                  <span><strong>{label}</strong><small>{description}</small></span>
+                  <ChevronRight />
+                </button>
+              ),
+            )}
+          </div>
+        </section>
+        <section
+          className="mobile-settings-group"
+          aria-labelledby="settings-general-group"
+        >
+          <span id="settings-general-group">GENERAL</span>
+          <div className="mobile-settings-list">
+            {SETTINGS_CATEGORIES.filter((item) => item.key !== "app").map(
+              ({ key, label, description, icon: Icon }) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => openMobileCategory(key)}
+                >
+                  <i><Icon /></i>
+                  <span><strong>{label}</strong><small>{description}</small></span>
+                  <ChevronRight />
+                </button>
+              ),
+            )}
+          </div>
+        </section>
+      </div>
+      <section
+        ref={mobilePanelRef}
+        className={`mobile-settings-panel${mobilePanelOpen ? " is-open" : ""}`}
+      >
+        <header className="mobile-settings-panel-header">
+          <button
+            type="button"
+            className="circle-button"
+            aria-label="Back to settings"
+            onClick={closeMobilePanel}
+          >
+            <ArrowLeft />
+          </button>
+          <div>
+            <span>SETTINGS</span>
+            <h2>{activeCategory.label}</h2>
+          </div>
+          <ActiveCategoryIcon aria-hidden="true" />
+        </header>
+        <div className="mobile-settings-panel-content">
+      <div
+        className="settings-category-card addon-settings-category"
+        hidden={category !== "addons"}
+      >
+        <div className="settings-category-heading">
+          <h2>Addons</h2>
+          <p>
+            Synced with this Nuvio profile. Catalog and metadata requests go
+            directly from this device to each Stremio addon.
+          </p>
+        </div>
+        <AddonSettings
+          addons={addons}
+          rows={addonRows}
+          onToggle={onToggleAddon}
+          onMove={onMoveAddon}
+          onRemove={onRemoveAddon}
+          onAdd={onAddAddon}
+          onRefresh={onRefreshAddons}
+        />
+      </div>
+      <div
+        className="setting-card integrations-card settings-category-card"
+        hidden={category !== "integrations"}
+      >
+        <header>
+          <h2>Integrations</h2>
+          <span>Credentials sync separately and securely</span>
+        </header>
+        <p>
+          These use Nuvio's provider-credential RPC. They are never copied into
+          the profile settings blob.
+        </p>
+        <IntegrationCredentialField
+          label="TMDB API key"
+          description="Used for the TMDB enrichment settings shared with Nuvio."
+          value={tmdbKey}
+          ready={credentialsReady}
+          onSave={(value) => onProviderCredential("tmdb", value)}
+        />
+        <SettingToggle
+          title="TMDB enrichment"
+          description="Enable TMDB enrichment when a key is configured."
+          checked={settings.integrations.tmdbEnabled}
+          disabled={!settingsReady || !tmdbKey}
+          onChange={(next) =>
+            onTypedSetting(
+              "tmdb_settings",
+              "tmdb_enabled",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <label className="setting-select-row">
+          <span>
+            <strong>TMDB language</strong>
+            <small>Language requested for localized metadata.</small>
+          </span>
+          <select
+            value={settings.integrations.tmdbLanguage}
+            disabled={!settingsReady || !tmdbKey}
+            onChange={(event) =>
+              onTypedSetting(
+                "tmdb_settings",
+                "tmdb_language",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            {LANGUAGE_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        {[
+          ["Artwork and logos", "tmdb_use_artwork", settings.integrations.tmdbUseArtwork],
+          ["Titles and descriptions", "tmdb_use_basic_info", settings.integrations.tmdbUseBasicInfo],
+          ["Runtime and age details", "tmdb_use_details", settings.integrations.tmdbUseDetails],
+          ["Release dates", "tmdb_use_release_dates", settings.integrations.tmdbUseReleaseDates],
+          ["Cast and credits", "tmdb_use_credits", settings.integrations.tmdbUseCredits],
+          ["Episode metadata", "tmdb_use_episodes", settings.integrations.tmdbUseEpisodes],
+          ["Trailers", "tmdb_use_trailers", settings.integrations.tmdbUseTrailers],
+        ].map(([label, key, checked]) => (
+          <SettingToggle
+            key={String(key)}
+            title={String(label)}
+            description="Uses the matching official TMDB enrichment flag."
+            checked={Boolean(checked)}
+            disabled={!settingsReady || !settings.integrations.tmdbEnabled || !tmdbKey}
+            onChange={(next) =>
+              onTypedSetting(
+                "tmdb_settings",
+                String(key),
+                "boolean",
+                next,
+              )
+            }
+          />
+        ))}
+        <IntegrationCredentialField
+          label="MDBList API key"
+          description="Adds MDBList rating providers after metadata enrichment."
+          value={mdbListKey}
+          ready={credentialsReady}
+          onSave={(value) => onProviderCredential("mdblist", value)}
+        />
+        <SettingToggle
+          title="MDBList ratings"
+          description="Enable the synchronized rating enrichment when a key is configured."
+          checked={settings.integrations.mdbListEnabled}
+          disabled={!settingsReady || !mdbListKey}
+          onChange={(next) =>
+            onTypedSetting(
+              "mdblist_settings",
+              "mdblist_enabled",
+              "boolean",
+              next,
+            )
+          }
+        />
+        {[
+          ["IMDb", "imdb", "mdblist_use_imdb"],
+          ["TMDB", "tmdb", "mdblist_use_tmdb"],
+          ["Rotten Tomatoes", "tomatoes", "mdblist_use_tomatoes"],
+          ["Metacritic", "metacritic", "mdblist_use_metacritic"],
+          ["Trakt", "trakt", "mdblist_use_trakt"],
+          ["Letterboxd", "letterboxd", "mdblist_use_letterboxd"],
+          ["Audience score", "audience", "mdblist_use_audience"],
+          ["MyAnimeList", "mal", "mdblist_use_mal"],
+        ].map(([label, provider, key]) => (
+          <SettingToggle
+            key={provider}
+            title={label}
+            description="Include this provider in MDBList rating badges."
+            checked={settings.integrations.mdbListProviders.includes(provider)}
+            disabled={
+              !settingsReady ||
+              !settings.integrations.mdbListEnabled ||
+              !mdbListKey
+            }
+            onChange={(next) =>
+              onTypedSetting("mdblist_settings", key, "boolean", next)
+            }
+          />
+        ))}
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "appearance"}
+      >
         <header>
           <h2>Appearance</h2>
         </header>
-        <div className="theme-row">
+        <SettingToggle
+          title="AMOLED black"
+          description={`Synced with your Nuvio ${settingsPlatform()} settings.`}
+          checked={settings.amoled}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "theme_settings",
+              "amoled_enabled",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <label className="setting-select-row">
           <span>
-            <strong>AMOLED black</strong>
-            <small>
-              Synced with your Nuvio {settingsPlatform()} settings, so it
-              follows this profile across devices.
-            </small>
+            <strong>Accent theme</strong>
+            <small>Uses the same theme names and stored value as Nuvio.</small>
           </span>
-          <label className="switch">
+          <select
+            value={settings.selectedTheme}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "theme_settings",
+                "selected_theme",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            {[
+              "WHITE",
+              "CRIMSON",
+              "OCEAN",
+              "VIOLET",
+              "EMERALD",
+              "AMBER",
+              "ROSE",
+            ].map((theme) => (
+              <option key={theme} value={theme}>
+                {theme[0] + theme.slice(1).toLowerCase()}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="setting-select-row">
+          <span>
+            <strong>Desktop navigation</strong>
+            <small>Choose a side rail or a compact navigation row.</small>
+          </span>
+          <select
+            value={settings.desktopNavigationLayout}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "theme_settings",
+                "desktop_navigation_layout",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            <option value="Sidebar">Sidebar</option>
+            <option value="TopBar">Top bar</option>
+          </select>
+        </label>
+        <div className="setting-grid">
+          <label>
+            <span>Poster width</span>
             <input
-              type="checkbox"
-              checked={amoled}
-              disabled={!amoledReady}
-              onChange={(event) => onAmoled(event.target.checked)}
+              type="number"
+              min="88"
+              max="260"
+              value={settings.poster.widthDp}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onPosterSetting({ widthDp: Number(event.target.value) })
+              }
             />
-            <i />
+          </label>
+          <label>
+            <span>Poster height</span>
+            <input
+              type="number"
+              min="112"
+              max="390"
+              value={settings.poster.heightDp}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onPosterSetting({ heightDp: Number(event.target.value) })
+              }
+            />
+          </label>
+          <label>
+            <span>Corner radius</span>
+            <input
+              type="number"
+              min="0"
+              max="40"
+              value={settings.poster.cornerRadiusDp}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onPosterSetting({ cornerRadiusDp: Number(event.target.value) })
+              }
+            />
           </label>
         </div>
+        <SettingToggle
+          title="Landscape catalog cards"
+          description="Use wide artwork proportions in catalog rows and grids."
+          checked={settings.poster.catalogLandscapeModeEnabled}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onPosterSetting({ catalogLandscapeModeEnabled: next })
+          }
+        />
+        <SettingToggle
+          title="Hide poster labels"
+          description="Hide titles and years below poster cards."
+          checked={settings.poster.hideLabelsEnabled}
+          disabled={!settingsReady}
+          onChange={(next) => onPosterSetting({ hideLabelsEnabled: next })}
+        />
       </div>
-      <div className="setting-card">
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "home"}
+      >
+        <header>
+          <h2>Continue watching</h2>
+          <span>Shared with Nuvio</span>
+        </header>
+        <SettingToggle
+          title="Show Continue Watching"
+          description="Show your synced resume and next-up row on Home."
+          checked={settings.continueWatching.isVisible}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onContinueWatchingSetting({ isVisible: next })
+          }
+        />
+        <label className="setting-select-row">
+          <span>
+            <strong>Card style</strong>
+            <small>Use Nuvio's card, wide, or poster layout.</small>
+          </span>
+          <select
+            value={settings.continueWatching.style}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onContinueWatchingSetting({ style: event.target.value })
+            }
+          >
+            <option value="Card">Card</option>
+            <option value="Wide">Wide</option>
+            <option value="Poster">Poster</option>
+          </select>
+        </label>
+        <label className="setting-select-row">
+          <span>
+            <strong>Sort mode</strong>
+            <small>
+              Streaming keeps upcoming episodes last; split gives them their
+              own row.
+            </small>
+          </span>
+          <select
+            value={settings.continueWatching.sortMode}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onContinueWatchingSetting({ sort_mode: event.target.value })
+            }
+          >
+            <option value="DEFAULT">Default</option>
+            <option value="STREAMING_STYLE">Streaming style</option>
+            <option value="SPLIT_UPCOMING">Split upcoming</option>
+          </select>
+        </label>
+        <SettingToggle
+          title="Continue from furthest episode"
+          description="Choose Next Up after the furthest watched episode instead of the most recently watched one."
+          checked={settings.continueWatching.upNextFromFurthestEpisode}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onContinueWatchingSetting({ upNextFromFurthestEpisode: next })
+          }
+        />
+        <SettingToggle
+          title="Use episode thumbnails"
+          description="Use episode artwork for Card and Wide layouts."
+          checked={settings.continueWatching.useEpisodeThumbnails}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onContinueWatchingSetting({
+              use_episode_thumbnails_in_cw: next,
+            })
+          }
+        />
+        <SettingToggle
+          title="Show unaired Next Up"
+          description="Include a future episode when its release date is known."
+          checked={settings.continueWatching.showUnairedNextUp}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onContinueWatchingSetting({ show_unaired_next_up: next })
+          }
+        />
+        <SettingToggle
+          title="Blur unaired Next Up artwork"
+          description="Blur future episode thumbnails until they are released."
+          checked={settings.continueWatching.blurNextUp}
+          disabled={
+            !settingsReady ||
+            !settings.continueWatching.useEpisodeThumbnails
+          }
+          onChange={(next) =>
+            onContinueWatchingSetting({
+              blur_continue_watching_next_up: next,
+            })
+          }
+        />
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "details"}
+      >
+        <header>
+          <h2>Details screens</h2>
+          <span>Shared with Nuvio</span>
+        </header>
+        <label className="setting-select-row">
+          <span>
+            <strong>Background</strong>
+            <small>Choose how artwork continues behind the detail page.</small>
+          </span>
+          <select
+            value={settings.metaScreen.backgroundMode}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onMetaScreenSetting({ background_mode: event.target.value })
+            }
+          >
+            <option value="normal">Normal</option>
+            <option value="cinematic">Cinematic</option>
+            <option value="dominant_color">Dominant color</option>
+          </select>
+        </label>
+        <label className="setting-select-row">
+          <span>
+            <strong>Episode cards</strong>
+            <small>List is denser; horizontal keeps larger artwork and summaries.</small>
+          </span>
+          <select
+            value={settings.metaScreen.episodeCardStyle}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onMetaScreenSetting({ episodeCardStyle: event.target.value })
+            }
+          >
+            <option value="horizontal">Horizontal</option>
+            <option value="list">List</option>
+          </select>
+        </label>
+        <SettingToggle
+          title="Blur unwatched episodes"
+          description="Hide episode thumbnail spoilers until an episode is marked watched."
+          checked={settings.metaScreen.blurUnwatchedEpisodes}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onMetaScreenSetting({ blur_unwatched_episodes: next })
+          }
+        />
+        <div className="detail-section-settings">
+          <span className="eyebrow">VISIBLE SECTIONS & ORDER</span>
+          {detailSections.map((item, index) => (
+            <div className="detail-section-setting" key={item.key}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={item.enabled}
+                  disabled={!settingsReady}
+                  onChange={(event) =>
+                    onMetaScreenSection(item.key, event.target.checked)
+                  }
+                />
+                <span>{DETAIL_SECTION_LABELS[item.key]}</span>
+              </label>
+              <div className="detail-reorder-buttons">
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`Move ${DETAIL_SECTION_LABELS[item.key]} up`}
+                  disabled={!settingsReady || index === 0}
+                  onClick={() => onMoveMetaScreenSection(item.key, -1)}
+                >
+                  <ArrowUp size={17} />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`Move ${DETAIL_SECTION_LABELS[item.key]} down`}
+                  disabled={!settingsReady || index === detailSections.length - 1}
+                  onClick={() => onMoveMetaScreenSection(item.key, 1)}
+                >
+                  <ArrowDown size={17} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "playback"}
+      >
+        <header>
+          <h2>Playback</h2>
+        </header>
+        <SettingToggle
+          title="Loading overlay"
+          description="Show the buffering spinner while the video is waiting."
+          checked={settings.player.showLoadingOverlay}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "player_settings",
+              "show_loading_overlay",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <SettingToggle
+          title="Parental guide"
+          description="Show the title's age rating in the player overlay."
+          checked={settings.player.showParentalGuide}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "player_settings",
+              "show_parental_guide",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <label className="setting-select-row">
+          <span>
+            <strong>Resize mode</strong>
+            <small>Fit preserves the whole frame; Zoom/Fill crop it.</small>
+          </span>
+          <select
+            value={settings.player.resizeMode}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "player_settings",
+                "resize_mode",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            <option value="Fit">Fit</option>
+            <option value="Zoom">Zoom</option>
+            <option value="Fill">Fill</option>
+            <option value="Stretch">Stretch</option>
+          </select>
+        </label>
+        <label className="setting-select-row">
+          <span>
+            <strong>Automatic source selection</strong>
+            <small>Uses Nuvio's MANUAL, FIRST_STREAM, or REGEX_MATCH value.</small>
+          </span>
+          <select
+            value={settings.player.autoPlayMode}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "player_settings",
+                "stream_auto_play_mode",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            <option value="MANUAL">Choose manually</option>
+            <option value="FIRST_STREAM">First stream</option>
+            <option value="REGEX_MATCH">Regex match</option>
+          </select>
+        </label>
+        {settings.player.autoPlayMode === "REGEX_MATCH" && (
+          <label className="setting-text-row">
+            <span>
+              <strong>Source regex</strong>
+              <small>An invalid expression safely falls back to the source list.</small>
+            </span>
+            <input
+              value={settings.player.autoPlayRegex}
+              disabled={!settingsReady}
+              placeholder="1080p.*WEB-DL"
+              onChange={(event) =>
+                onTypedSetting(
+                  "player_settings",
+                  "stream_auto_play_regex",
+                  "string",
+                  event.target.value,
+                )
+              }
+            />
+          </label>
+        )}
+        <SettingToggle
+          title="Skip intro"
+          description="Syncs Nuvio's skip preference. Web skip-segment fetching is not available yet."
+          checked={settings.player.skipIntroEnabled}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "player_settings",
+              "skip_intro_enabled",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <IntegrationCredentialField
+          label="AnimeSkip client ID"
+          description="Optional provider credential synced through Nuvio's separate credential row."
+          value={animeSkipClientId}
+          ready={credentialsReady}
+          onSave={(value) => onProviderCredential("animeskip", value)}
+        />
+        <IntegrationCredentialField
+          label="IntroDB API key"
+          description="Synced for Nuvio clients that support IntroDB; this web build does not submit segments."
+          value={introDbApiKey}
+          ready={credentialsReady}
+          onSave={(value) => onProviderCredential("introdb", value)}
+        />
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "playback"}
+      >
+        <header>
+          <h2>Audio & subtitles</h2>
+        </header>
+        <label className="setting-select-row">
+          <span>
+            <strong>Preferred audio</strong>
+            <small>Applied to browser and HLS audio tracks when available.</small>
+          </span>
+          <select
+            value={settings.player.preferredAudioLanguage}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "player_settings",
+                "preferred_audio_language",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            <option value="device">Device language</option>
+            <option value="original">Original language</option>
+            {LANGUAGE_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <label className="setting-select-row">
+          <span>
+            <strong>Preferred subtitles</strong>
+            <small>Selects matching embedded browser tracks when present.</small>
+          </span>
+          <select
+            value={settings.player.preferredSubtitleLanguage}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "player_settings",
+                "preferred_subtitle_language",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            <option value="none">Off</option>
+            <option value="device">Device language</option>
+            {LANGUAGE_OPTIONS.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </label>
+        <div className="setting-grid subtitle-grid">
+          <label>
+            <span>Font size</span>
+            <input
+              type="number"
+              min="6"
+              max="40"
+              value={settings.player.subtitleFontSizeSp}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onTypedSetting(
+                  "player_settings",
+                  "subtitle_font_size_sp",
+                  "int",
+                  Number(event.target.value),
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>Bottom offset</span>
+            <input
+              type="number"
+              min="0"
+              max="100"
+              value={settings.player.subtitleBottomOffset}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onTypedSetting(
+                  "player_settings",
+                  "subtitle_bottom_offset",
+                  "int",
+                  Number(event.target.value),
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>Text color (ARGB)</span>
+            <input
+              value={settings.player.subtitleTextColor}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onTypedSetting(
+                  "player_settings",
+                  "subtitle_text_color",
+                  "string",
+                  event.target.value,
+                )
+              }
+            />
+          </label>
+          <label>
+            <span>Background (ARGB)</span>
+            <input
+              value={settings.player.subtitleBackgroundColor}
+              disabled={!settingsReady}
+              onChange={(event) =>
+                onTypedSetting(
+                  "player_settings",
+                  "subtitle_background_color",
+                  "string",
+                  event.target.value,
+                )
+              }
+            />
+          </label>
+        </div>
+        <SettingToggle
+          title="Bold subtitles"
+          description="Uses the synchronized subtitle font weight."
+          checked={settings.player.subtitleBold}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "player_settings",
+              "subtitle_bold",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <SettingToggle
+          title="Subtitle outline"
+          description="Adds a contrast outline around browser-rendered cues."
+          checked={settings.player.subtitleOutlineEnabled}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "player_settings",
+              "subtitle_outline_enabled",
+              "boolean",
+              next,
+            )
+          }
+        />
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "playback"}
+      >
+        <header>
+          <h2>Sources</h2>
+        </header>
+        <SettingToggle
+          title="File-size badges"
+          description="Show the stream's reported size beside imported badges."
+          checked={settings.streamBadges.showFileSizeBadges}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onTypedSetting(
+              "stream_badge_settings",
+              "show_file_size_badges",
+              "boolean",
+              next,
+            )
+          }
+        />
+        <label className="setting-select-row">
+          <span>
+            <strong>Badge placement</strong>
+            <small>
+              {settings.streamBadges.filters.length} enabled imported badge
+              {settings.streamBadges.filters.length === 1 ? "" : "s"} loaded.
+            </small>
+          </span>
+          <select
+            value={settings.streamBadges.placement}
+            disabled={!settingsReady}
+            onChange={(event) =>
+              onTypedSetting(
+                "stream_badge_settings",
+                "stream_badge_placement",
+                "string",
+                event.target.value,
+              )
+            }
+          >
+            <option value="TOP">Above details</option>
+            <option value="BOTTOM">Below details</option>
+          </select>
+        </label>
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "app"}
+      >
         <header>
           <h2>Notifications</h2>
         </header>
-        <div className="theme-row">
+        <SettingToggle
+          title="Episode release alerts"
+          description="Syncs the exact raw notification payload used by Nuvio. Browser delivery still requires notification permission and web push support."
+          checked={settings.episodeReleaseAlerts}
+          disabled={!settingsReady}
+          onChange={(next) =>
+            onRawSetting(
+              "notifications_settings",
+              "episode_release_alerts_enabled",
+              next,
+            )
+          }
+        />
+      </div>
+      <div
+        className="setting-card web-only-card settings-category-card"
+        hidden={category !== "playback"}
+      >
+        <header>
+          <h2>Web-only playback handoff</h2>
+          <span>Stored on this browser only</span>
+        </header>
+        <label className="setting-select-row">
           <span>
-            <strong>Episode release alerts</strong>
+            <strong>Default player</strong>
             <small>
-              Tells Nuvio to alert you when a new episode of a followed series
-              is released. Synced with your profile.
+              {isDesktop()
+                ? "Desktop browsers copy the URL for VLC. The desktop Nuvio app has native playback."
+                : "VLC and Outplayer open through their iOS URL schemes."}
             </small>
           </span>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={releaseAlerts}
-              disabled={!amoledReady}
-              onChange={(event) => onReleaseAlerts(event.target.checked)}
-            />
-            <i />
-          </label>
-        </div>
+          <select
+            value={externalPlayer}
+            onChange={(event) =>
+              onExternalPlayer(event.target.value as ExternalPlayerMode)
+            }
+          >
+            <option value="internal">Nuvio web player</option>
+            {isDesktop() ? (
+              <option value="copy">Copy link for an external player</option>
+            ) : (
+              <>
+                <option value="vlc">VLC</option>
+                <option value="outplayer">Outplayer (iOS/iPadOS)</option>
+              </>
+            )}
+            <option value="m3u">Download M3U playlist</option>
+          </select>
+        </label>
+        <p>
+          The web remux fallback only re-boxes compatible tracks. DTS and
+          TrueHD still require an external player; Nuvio Web does not transcode.
+        </p>
       </div>
-      <div className="setting-card">
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "app"}
+      >
         <header>
           <h2>Account</h2>
         </header>
@@ -1484,51 +3056,20 @@ function SettingsPage({
           <LogOut /> Sign out on this device
         </button>
       </div>
-      <div className="setting-card">
-        <header>
-          <h2>Playback compatibility</h2>
-        </header>
-        <label className="setting-select-row">
-          <span>
-            <strong>Default player</strong>
-            <small>
-              {isDesktop()
-                ? "Desktop browsers cannot launch a local player, so Nuvio copies the stream URL for you to paste into VLC. For proper desktop playback, use the Nuvio desktop app."
-                : "VLC and Outplayer open through their iOS URL schemes."}
-            </small>
-          </span>
-          <select
-            value={externalPlayer}
-            onChange={(event) =>
-              onExternalPlayer(event.target.value as ExternalPlayerMode)
-            }
-          >
-            <option value="internal">Nuvio web player</option>
-            {isDesktop() ? (
-              <option value="copy">Copy link for an external player</option>
-            ) : (
-              <>
-                <option value="vlc">VLC</option>
-                <option value="outplayer">Outplayer (iOS/iPadOS)</option>
-              </>
-            )}
-            <option value="m3u">Download M3U playlist</option>
-          </select>
-        </label>
-        <p>
-          The custom player handles browser-ready MP4/WebM and HLS, including
-          HLS audio-track selection. MKV, torrents, custom-header streams, and
-          unsupported HEVC, TrueHD, EAC3, or DTS audio still need an external
-          player or a future local companion service.
-        </p>
-      </div>
-      <div className="setting-card">
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "app"}
+      >
         <header>
           <h2>App version</h2>
         </header>
         <UpdateRow />
       </div>
-      <button className="setting-link" onClick={onRemuxLab}>
+      <button
+        className="setting-link settings-category-card"
+        hidden={category !== "app"}
+        onClick={onRemuxLab}
+      >
         <FlaskConical />
         <span>
           <strong>Remux probe</strong>
@@ -1538,7 +3079,10 @@ function SettingsPage({
         </span>
         <ChevronRight />
       </button>
-      <div className="setting-card">
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "app"}
+      >
         <header>
           <h2>Install as an app</h2>
         </header>
@@ -1548,6 +3092,8 @@ function SettingsPage({
           icon in the address bar.
         </p>
       </div>
+        </div>
+      </section>
     </section>
   );
 }
