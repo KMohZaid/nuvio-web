@@ -5,7 +5,6 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
-  MoreHorizontal,
   Play,
   Plus,
   X,
@@ -24,6 +23,7 @@ import {
   subscribeSourceProbes,
 } from "../lib/sourceProbe";
 import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
+import { seriesPlaybackTarget } from "../lib/seriesPlayback";
 import type {
   MetaScreenSectionKey,
   MetaScreenSettings,
@@ -43,15 +43,17 @@ import { ContextMenu } from "./ContextMenu";
 
 const DEFAULT_DETAIL_COLOR = "18 22 26";
 
+const publicAsset = (fileName: string) => `${import.meta.env.BASE_URL}${fileName}`;
+
 const RATING_VISUALS = [
-  { source: "imdb", name: "IMDb", icon: "/rating_imdb.png", color: "#f5c518", format: oneDecimal, wide: true },
-  { source: "tmdb", name: "TMDB", icon: "/rating_tmdb.png", color: "#01b4e4", format: whole, wide: false },
-  { source: "trakt", name: "Trakt", icon: "/rating_trakt.png", color: "#ed1c24", format: whole, wide: false },
-  { source: "letterboxd", name: "Letterboxd", icon: "/rating_letterboxd.png", color: "#00e054", format: oneDecimal, wide: false },
-  { source: "mal", name: "MyAnimeList", icon: "/rating_mal.png", color: "#2e51a2", format: oneDecimal, wide: false },
-  { source: "tomatoes", name: "Rotten Tomatoes", icon: "/rating_rotten_tomatoes.png", color: "#fa320a", format: percent, wide: false },
-  { source: "audience", name: "Audience score", icon: "/rating_audience_score.png", color: "#fa320a", format: percent, wide: false },
-  { source: "metacritic", name: "Metacritic", icon: "/rating_metacritic.png", color: "#ffcc33", format: whole, wide: false },
+  { source: "imdb", name: "IMDb", icon: publicAsset("rating_imdb.png"), color: "#f5c518", format: oneDecimal, wide: true },
+  { source: "tmdb", name: "TMDB", icon: publicAsset("rating_tmdb.png"), color: "#01b4e4", format: whole, wide: false },
+  { source: "trakt", name: "Trakt", icon: publicAsset("rating_trakt.png"), color: "#ed1c24", format: whole, wide: false },
+  { source: "letterboxd", name: "Letterboxd", icon: publicAsset("rating_letterboxd.png"), color: "#00e054", format: oneDecimal, wide: false },
+  { source: "mal", name: "MyAnimeList", icon: publicAsset("rating_mal.png"), color: "#2e51a2", format: oneDecimal, wide: false },
+  { source: "tomatoes", name: "Rotten Tomatoes", icon: publicAsset("rating_rotten_tomatoes.png"), color: "#fa320a", format: percent, wide: false },
+  { source: "audience", name: "Audience score", icon: publicAsset("rating_audience_score.png"), color: "#fa320a", format: percent, wide: false },
+  { source: "metacritic", name: "Metacritic", icon: publicAsset("rating_metacritic.png"), color: "#ffcc33", format: whole, wide: false },
 ] as const;
 
 function oneDecimal(value: number) {
@@ -132,62 +134,18 @@ function playbackTarget(meta: Meta, watchIndex: WatchIndex) {
     return { video: undefined, label: resumable ? "Resume" : "Play" };
   }
 
-  const episodes = meta.videos
-    .filter((video) => (video.season ?? 0) > 0)
-    .sort(
-      (left, right) =>
-        (left.season ?? 0) - (right.season ?? 0) ||
-        (left.episode ?? 0) - (right.episode ?? 0),
-    );
-  const selected = episodes.find(
-    (video) => video.id === meta.selectedVideoId,
-  );
-  const resumable = episodes
-    .map((video) => ({
-      video,
-      row: watchIndex.progress.get(
-        watchKey(meta.id, video.season, video.episode),
-      ),
-    }))
-    .filter(
-      (item) =>
-        item.row &&
-        item.row.durationMs > 0 &&
-        item.row.positionMs / item.row.durationMs > 0 &&
-        item.row.positionMs / item.row.durationMs < 0.9,
-    )
-    .sort((left, right) => right.row!.lastWatched - left.row!.lastWatched);
-  const selectedResume = resumable.find(
-    (item) => item.video.id === selected?.id,
-  );
-  const resume = selectedResume ?? resumable[0];
-  if (resume)
-    return {
-      video: resume.video,
-      label: `Resume · ${videoCode(resume.video)}`,
-    };
-
-  const lastWatchedIndex = episodes.reduce(
-    (last, video, index) =>
-      watchIndex.watched.has(
-        watchKey(meta.id, video.season, video.episode),
-      )
-        ? index
-        : last,
-    -1,
-  );
-  const next = episodes[lastWatchedIndex + 1];
-  if (lastWatchedIndex >= 0 && next)
-    return { video: next, label: `Next Up · ${videoCode(next)}` };
-
-  const first =
-    selected ??
-    episodes.find((video) => video.id === meta.defaultVideoId) ??
-    episodes[0] ??
-    meta.videos[0];
+  const target = seriesPlaybackTarget(meta, watchIndex);
+  const first = target.video;
   return {
     video: first,
-    label: first ? `Play · ${videoCode(first) || "Episode"}` : "Play",
+    label:
+      target.kind === "resume"
+        ? `Resume · ${videoCode(first)}`
+        : target.kind === "next"
+          ? `Next Up · ${videoCode(first)}`
+          : first
+            ? `Play · ${videoCode(first) || "Episode"}`
+            : "Play",
   };
 }
 
@@ -362,9 +320,6 @@ export function Details({
   const [menu, setMenu] = useState<{ x: number; y: number; video: Video } | null>(
     null,
   );
-  const [actionMenu, setActionMenu] = useState<{ x: number; y: number } | null>(
-    null,
-  );
   useScrollLock();
   const swipeRef = useSwipeBack<HTMLDivElement>(onClose);
   const heroRef = useRef<HTMLDivElement>(null);
@@ -407,6 +362,8 @@ export function Details({
     () => playbackTarget(meta, watchIndex),
     [meta, watchIndex],
   );
+  const watchIndexRef = useRef(watchIndex);
+  watchIndexRef.current = watchIndex;
   const heroTargetWatched = watchIndex.watched.has(
     watchKey(
       meta.id,
@@ -512,7 +469,11 @@ export function Details({
       const selected = completed.videos.find(
         (video) => video.id === seed.selectedVideoId,
       );
-      setSeason(selected?.season ?? first);
+      const currentEpisode = seriesPlaybackTarget(
+        { ...completed, selectedVideoId: seed.selectedVideoId },
+        watchIndexRef.current,
+      ).video;
+      setSeason(currentEpisode?.season ?? selected?.season ?? first);
 
       // Keep the overlay for two paints after committing. At this point the
       // actual DOM exists, fonts have settled, and layout measurements used by
@@ -702,15 +663,24 @@ export function Details({
               <span>{heroPlayback.label}</span>
             </button>
             <button
-              className="icon-pill detail-more-actions"
-              title="More actions"
-              aria-label="More actions"
-              onClick={(event) => {
-                const bounds = event.currentTarget.getBoundingClientRect();
-                setActionMenu({ x: bounds.right, y: bounds.bottom + 8 });
-              }}
+              className={`icon-pill${inLibrary ? " active" : ""}`}
+              title={inLibrary ? "Remove from library" : "Add to library"}
+              aria-label={inLibrary ? "Remove from library" : "Add to library"}
+              aria-pressed={inLibrary}
+              onClick={() => onLibrary(meta)}
             >
-              <MoreHorizontal size={22} />
+              {inLibrary ? <Check size={22} /> : <Plus size={22} />}
+            </button>
+            <button
+              className={`icon-pill${heroTargetWatched ? " active" : ""}`}
+              title={heroTargetWatched ? "Mark as unwatched" : "Mark as watched"}
+              aria-label={heroTargetWatched ? "Mark as unwatched" : "Mark as watched"}
+              aria-pressed={heroTargetWatched}
+              onClick={() =>
+                onSetWatched(meta, heroPlayback.video, !heroTargetWatched)
+              }
+            >
+              {heroTargetWatched ? <EyeOff size={22} /> : <Eye size={22} />}
             </button>
           </div>
           {sectionEnabled("PRODUCTION") &&
@@ -911,32 +881,6 @@ export function Details({
         </section>
       )}
       </div>
-      {actionMenu && (
-        <ContextMenu
-          x={actionMenu.x}
-          y={actionMenu.y}
-          onClose={() => setActionMenu(null)}
-          items={[
-            {
-              label: inLibrary ? "Remove from library" : "Add to library",
-              icon: inLibrary ? <Check size={16} /> : <Plus size={16} />,
-              onSelect: () => onLibrary(meta),
-            },
-            {
-              label: heroTargetWatched
-                ? "Mark as unwatched"
-                : "Mark as watched",
-              icon: heroTargetWatched ? (
-                <EyeOff size={16} />
-              ) : (
-                <Eye size={16} />
-              ),
-              onSelect: () =>
-                onSetWatched(meta, heroPlayback.video, !heroTargetWatched),
-            },
-          ]}
-        />
-      )}
       {menu &&
         (() => {
           const key = watchKey(meta.id, menu.video.season, menu.video.episode);
