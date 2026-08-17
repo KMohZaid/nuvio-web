@@ -38,20 +38,24 @@ export function ContextMenu({
   }, [x, y]);
 
   useEffect(() => {
-    const dismiss = () => onClose();
+    const dismiss = (event: Event) => {
+      if (ref.current?.contains(event.target as Node)) return;
+      onClose();
+    };
     // `capture` so a click on the page below closes the menu before that
     // element's own handler runs and navigates away underneath it.
     window.addEventListener("pointerdown", dismiss, { capture: true });
-    window.addEventListener("resize", dismiss);
-    window.addEventListener("scroll", dismiss, true);
+    const dismissWithoutTarget = () => onClose();
+    window.addEventListener("resize", dismissWithoutTarget);
+    window.addEventListener("scroll", dismissWithoutTarget, true);
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => {
       window.removeEventListener("pointerdown", dismiss, { capture: true });
-      window.removeEventListener("resize", dismiss);
-      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("resize", dismissWithoutTarget);
+      window.removeEventListener("scroll", dismissWithoutTarget, true);
       window.removeEventListener("keydown", onKey);
     };
   }, [onClose]);
@@ -73,7 +77,7 @@ export function ContextMenu({
           }}
         >
           {item.icon}
-          {item.label}
+          <span>{item.label}</span>
         </button>
       ))}
     </div>

@@ -371,11 +371,15 @@ export function readWebSettings(blob: SettingsBlob | null): WebSettings {
       "boolean",
       false,
     ),
-    selectedTheme: blobTypedValue(
-      blob,
-      "theme_settings",
-      "selected_theme",
-      "string",
+    selectedTheme: enumValue(
+      blobTypedValue(
+        blob,
+        "theme_settings",
+        "selected_theme",
+        "string",
+        "WHITE",
+      ).trim().toUpperCase(),
+      ["CRIMSON", "OCEAN", "VIOLET", "EMERALD", "AMBER", "ROSE", "WHITE"] as const,
       "WHITE",
     ),
     desktopNavigationLayout: enumValue(

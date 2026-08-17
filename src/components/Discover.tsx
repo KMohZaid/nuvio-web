@@ -4,10 +4,11 @@ import {
   loadDiscoverCatalog,
   type DiscoverCatalog,
 } from "../lib/addons";
+import type { AddonSearchGroup } from "../lib/addons";
 import type { WatchIndex } from "../lib/progress";
 import { useProgressiveList } from "../lib/useProgressiveList";
 import type { InstalledAddon, Meta } from "../types";
-import { PosterCard } from "./Media";
+import { MediaRow, PosterCard, type MediaMenuHandler } from "./Media";
 
 const ALL_GENRES = "__all__";
 
@@ -17,6 +18,11 @@ const typeLabel = (value: string) =>
     : value === "series"
       ? "Series"
       : value.charAt(0).toUpperCase() + value.slice(1);
+
+const searchGroupLabel = (group: AddonSearchGroup) =>
+  group.name.trim().toLowerCase() === "search"
+    ? `${typeLabel(group.type)} search`
+    : group.name;
 
 /**
  * Browses addon catalogs without a search term, matching the desktop client:
@@ -28,13 +34,19 @@ export function Discover({
   index,
   query,
   results,
+  resultGroups,
+  searchPending,
   onOpen,
+  onMenu,
 }: {
   addons: InstalledAddon[];
   index: WatchIndex;
   query: string;
   results: Meta[];
+  resultGroups: AddonSearchGroup[];
+  searchPending: boolean;
   onOpen(item: Meta): void;
+  onMenu?: MediaMenuHandler;
 }) {
   const catalogs = useMemo(() => discoverCatalogs(addons), [addons]);
   const [type, setType] = useState<string | null>(null);
@@ -147,7 +159,9 @@ export function Discover({
       <h1>{searching ? `Results for “${query}”` : "Discover"}</h1>
       <p>
         {searching
-          ? `${results.length} titles from searchable addon catalogs`
+          ? searchPending
+            ? "Searching installed addons…"
+            : `${results.length} titles across ${resultGroups.length} searchable ${resultGroups.length === 1 ? "catalog" : "catalogs"}`
           : `${catalog?.addonName ?? "No addon"} · browse installed catalogs`}
       </p>
 
@@ -209,9 +223,55 @@ export function Discover({
         </div>
       )}
 
-      {error && <div className="notice error">{error}</div>}
+      {!searching && error && <div className="notice error">{error}</div>}
 
-      {loading ? (
+      {searching && searchPending ? (
+        <div className="grid-loading" role="status">
+          <i className="mini-spinner" />
+          <span>Searching addon catalogs…</span>
+        </div>
+      ) : searching ? (
+        resultGroups.length === 0 ? (
+          <div className="empty-state">
+            <strong>Nothing returned</strong>
+            <span>No addon matched that search.</span>
+          </div>
+        ) : (
+          <div className="search-result-groups">
+            {resultGroups.map((group) => (
+              group.items.length > 0 ? (
+                <MediaRow
+                  key={group.key}
+                  section={{
+                    key: group.key,
+                    name: searchGroupLabel(group),
+                    type: group.type,
+                    manifestUrl: "",
+                    addonName: group.addonName,
+                    catalogId: group.key,
+                    items: group.items,
+                  }}
+                  subtitle={`${group.addonName} · ${typeLabel(group.type)} · ${group.items.length}`}
+                  index={index}
+                  onOpen={onOpen}
+                  onMenu={onMenu}
+                />
+              ) : (
+                <section className="search-result-group is-empty" key={group.key}>
+                  <header>
+                    <div>
+                      <h2>{searchGroupLabel(group)}</h2>
+                      <span>{group.addonName} · {typeLabel(group.type)}</span>
+                    </div>
+                    <strong>0</strong>
+                  </header>
+                  <span className="search-group-empty">No matches from this catalog</span>
+                </section>
+              )
+            ))}
+          </div>
+        )
+      ) : loading ? (
         /* The grid was rendered empty while a catalog loaded, so the page just
            went black until results arrived. */
         <div className="grid-loading" role="status">
@@ -222,9 +282,7 @@ export function Discover({
         <div className="empty-state">
           <strong>Nothing returned</strong>
           <span>
-            {searching
-              ? "No addon matched that search."
-              : "This catalog produced no titles for that filter."}
+            This catalog produced no titles for that filter.
           </span>
         </div>
       ) : (
@@ -235,6 +293,7 @@ export function Discover({
               item={item}
               index={index}
               onOpen={onOpen}
+              onMenu={onMenu}
             />
           ))}
         </div>

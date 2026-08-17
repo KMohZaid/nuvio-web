@@ -109,6 +109,14 @@ function mapVideo(value: Record<string, unknown>): Video {
     thumbnail: value.thumbnail ? String(value.thumbnail) : undefined,
     overview: value.overview ? String(value.overview) : undefined,
     runtime: value.runtime == null ? undefined : Number(value.runtime),
+    imdbRating:
+      value.imdbRating != null
+        ? String(value.imdbRating)
+        : value.imdb_rating != null
+          ? String(value.imdb_rating)
+          : value.rating != null
+            ? String(value.rating)
+            : undefined,
     available: value.available !== false,
   };
 }
@@ -317,6 +325,19 @@ export async function loadHome(
   onSection?: (section: CatalogSection) => void,
   layout?: HomeLayout | null,
 ): Promise<{ sections: CatalogSection[]; errors: string[] }> {
+  const isKnownFutureRelease = (meta: Meta): boolean => {
+    const now = new Date();
+    const released = meta.released?.trim();
+    if (released && /^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(released)) {
+      const timestamp = Date.parse(released);
+      if (Number.isFinite(timestamp)) return timestamp > now.getTime();
+    }
+    const releaseInfo = meta.releaseInfo?.trim();
+    if (releaseInfo && /^\d{4}$/.test(releaseInfo)) {
+      return Number(releaseInfo) > now.getFullYear();
+    }
+    return false;
+  };
   const targets = addons
     .filter((addon) => addon.enabled && addon.manifest)
     .flatMap((addon) =>
@@ -367,8 +388,13 @@ export async function loadHome(
             addonName: addon.manifest!.name,
             catalogId: catalog.id,
             items: (payload.metas ?? [])
-              .slice(0, 24)
-              .map((meta) => mapMeta(meta, addon.url, addon.manifest!.name)),
+              .map((meta) => mapMeta(meta, addon.url, addon.manifest!.name))
+              .filter(
+                (meta) =>
+                  layout?.hideUnreleasedContent !== true ||
+                  !isKnownFutureRelease(meta),
+              )
+              .slice(0, 24),
           } satisfies CatalogSection;
         } catch (error) {
           errors.push(
@@ -561,10 +587,23 @@ export async function resolveMeta(
   return seed;
 }
 
+export type AddonSearchGroup = {
+  key: string;
+  name: string;
+  type: string;
+  addonName: string;
+  items: Meta[];
+};
+
+export type AddonSearchResult = {
+  items: Meta[];
+  groups: AddonSearchGroup[];
+};
+
 export async function searchAddons(
   query: string,
   addons: InstalledAddon[],
-): Promise<Meta[]> {
+): Promise<AddonSearchResult> {
   const sections = addons
     .filter((addon) => addon.enabled && addon.manifest)
     .flatMap((addon) =>
@@ -585,18 +624,31 @@ export async function searchAddons(
             }) satisfies CatalogSection,
         ),
     );
-  const results = (
-    await Promise.all(
-      sections
-        .slice(0, 12)
-        .map((section) => loadCatalog(section, 0, query).catch(() => [])),
-    )
-  ).flat();
-  return [
+  const groups = await Promise.all(
+      sections.slice(0, 12).map(async (section, index) => {
+        const found = await loadCatalog(section, 0, query).catch(() => []);
+        const items = [
+          ...new Map(
+            found.map((item) => [`${item.type}:${item.id}`, item]),
+          ).values(),
+        ];
+        return {
+          key: `${section.manifestUrl}:${section.type}:${section.catalogId}:${index}`,
+          name: section.name,
+          type: section.type,
+          addonName: section.addonName,
+          items,
+        } satisfies AddonSearchGroup;
+      }),
+    );
+  const items = [
     ...new Map(
-      results.map((item) => [`${item.type}:${item.id}`, item]),
+      groups
+        .flatMap((group) => group.items)
+        .map((item) => [`${item.type}:${item.id}`, item]),
     ).values(),
   ];
+  return { items, groups };
 }
 
 export async function loadStreams(

@@ -13,7 +13,7 @@ import type {
   InstalledAddon,
   Meta,
 } from "../types";
-import { PosterCard } from "./Media";
+import { PosterCard, type MediaMenuHandler } from "./Media";
 
 /**
  * Nuvio's tile shapes. The default is `poster`, not landscape — a folder with
@@ -87,12 +87,14 @@ export function CollectionFolderView({
   index,
   onBack,
   onOpen,
+  onMenu,
 }: {
   folder: CollectionFolder;
   addons: InstalledAddon[];
   index: WatchIndex;
   onBack(): void;
   onOpen(item: Meta): void;
+  onMenu?: MediaMenuHandler;
 }) {
   const sources = useMemo(
     () => describeCollectionSources(folder, addons),
@@ -244,6 +246,7 @@ export function CollectionFolderView({
               item={item}
               index={index}
               onOpen={onOpen}
+              onMenu={onMenu}
             />
           ))}
         </div>

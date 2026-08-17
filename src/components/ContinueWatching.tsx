@@ -2,6 +2,7 @@ import type { ContinueCard } from "../lib/progress";
 import { progressPercent, remainingLabel } from "../lib/progress";
 import type { ContinueWatchingSettings } from "../lib/webSettings";
 import { useDragScroll } from "../lib/useDragScroll";
+import { useLongPress } from "../lib/useLongPress";
 
 const futureNextUp = (card: ContinueCard) => {
   if (!card.nextUp || !card.video?.released) return false;
@@ -32,16 +33,74 @@ function artworkFor(card: ContinueCard, settings: ContinueWatchingSettings) {
   );
 }
 
+function ContinueCardView({
+  card,
+  settings,
+  onOpen,
+  onMenu,
+}: {
+  card: ContinueCard;
+  settings: ContinueWatchingSettings;
+  onOpen(item: ContinueCard["item"]): void;
+  onMenu?(card: ContinueCard, x: number, y: number): void;
+}) {
+  const artwork = artworkFor(card, settings);
+  const progress = progressPercent(card);
+  const selected = card.video
+    ? { ...card.item, selectedVideoId: card.video.id }
+    : card.item;
+  const blur =
+    settings.blurNextUp && settings.useEpisodeThumbnails && card.nextUp;
+  const hold = useLongPress((x, y) => onMenu?.(card, x, y));
+  return (
+    <button
+      className={`continue-card style-${settings.style.toLowerCase()}`}
+      onClick={() => {
+        if (!hold.consumedTap()) onOpen(selected);
+      }}
+      {...(onMenu ? hold : {})}
+    >
+      <span className="continue-art">
+        <span
+          className={`continue-image${blur ? " is-blurred" : ""}`}
+          style={
+            artwork
+              ? { backgroundImage: `url("${artwork.replace(/"/g, "%22")}")` }
+              : undefined
+          }
+        />
+        <i className="continue-badge">
+          {card.nextUp ? "Next up" : remainingLabel(card.progress)}
+        </i>
+        <span className="continue-copy">
+          {card.video?.season != null && card.video?.episode != null && (
+            <small>S{card.video.season} E{card.video.episode}</small>
+          )}
+          <strong>{card.item.name}</strong>
+          {card.video?.title && <em>{card.video.title}</em>}
+        </span>
+        {progress > 0 && (
+          <span className="continue-progress">
+            <b style={{ width: `${progress}%` }} />
+          </span>
+        )}
+      </span>
+    </button>
+  );
+}
+
 function ContinueRow({
   title,
   cards,
   settings,
   onOpen,
+  onMenu,
 }: {
   title: string;
   cards: ContinueCard[];
   settings: ContinueWatchingSettings;
   onOpen(item: ContinueCard["item"]): void;
+  onMenu?(card: ContinueCard, x: number, y: number): void;
 }) {
   const rowRef = useDragScroll<HTMLDivElement>();
   if (!cards.length) return null;
@@ -51,54 +110,15 @@ function ContinueRow({
         <h2>{title}</h2>
       </header>
       <div className="continue-row" ref={rowRef}>
-        {cards.map((card) => {
-          const artwork = artworkFor(card, settings);
-          const progress = progressPercent(card);
-          const selected = card.video
-            ? { ...card.item, selectedVideoId: card.video.id }
-            : card.item;
-          const blur =
-            settings.blurNextUp &&
-            settings.useEpisodeThumbnails &&
-            card.nextUp;
-          return (
-            <button
-              className={`continue-card style-${settings.style.toLowerCase()}`}
-              key={`${card.item.id}:${card.video?.id || card.progress?.videoId || "next"}`}
-              onClick={() => onOpen(selected)}
-            >
-              <span className="continue-art">
-                <span
-                  className={`continue-image${blur ? " is-blurred" : ""}`}
-                  style={
-                    artwork
-                      ? {
-                          backgroundImage: `url("${artwork.replace(/"/g, "%22")}")`,
-                        }
-                      : undefined
-                  }
-                />
-                <i className="continue-badge">
-                  {card.nextUp ? "Next up" : remainingLabel(card.progress)}
-                </i>
-                <span className="continue-copy">
-                  {card.video?.season != null && card.video?.episode != null && (
-                    <small>
-                      S{card.video.season} E{card.video.episode}
-                    </small>
-                  )}
-                  <strong>{card.item.name}</strong>
-                  {card.video?.title && <em>{card.video.title}</em>}
-                </span>
-                {progress > 0 && (
-                  <span className="continue-progress">
-                    <b style={{ width: `${progress}%` }} />
-                  </span>
-                )}
-              </span>
-            </button>
-          );
-        })}
+        {cards.map((card) => (
+          <ContinueCardView
+            key={`${card.item.id}:${card.video?.id || card.progress?.videoId || "next"}`}
+            card={card}
+            settings={settings}
+            onOpen={onOpen}
+            onMenu={onMenu}
+          />
+        ))}
       </div>
     </section>
   );
@@ -108,10 +128,12 @@ export function ContinueWatching({
   cards,
   settings,
   onOpen,
+  onMenu,
 }: {
   cards: ContinueCard[];
   settings: ContinueWatchingSettings;
   onOpen(item: ContinueCard["item"]): void;
+  onMenu?(card: ContinueCard, x: number, y: number): void;
 }) {
   if (!settings.isVisible) return null;
   if (settings.sortMode !== "SPLIT_UPCOMING")
@@ -121,6 +143,7 @@ export function ContinueWatching({
         cards={cards}
         settings={settings}
         onOpen={onOpen}
+        onMenu={onMenu}
       />
     );
   const upcoming = cards.filter(futureNextUp).sort((left, right) => {
@@ -136,12 +159,14 @@ export function ContinueWatching({
         cards={current}
         settings={settings}
         onOpen={onOpen}
+        onMenu={onMenu}
       />
       <ContinueRow
         title="Upcoming"
         cards={upcoming}
         settings={settings}
         onOpen={onOpen}
+        onMenu={onMenu}
       />
     </>
   );

@@ -88,6 +88,12 @@ export type RemuxStreamerOptions = {
   requestHeaders?: Record<string, string>;
   /** Synced Nuvio language preference used when an MKV has several tracks. */
   preferredAudioLanguage?: string;
+  /**
+   * Metadata runtime used only when the Matroska Info element has no usable
+   * Duration. Keeping MediaSource finite prevents its timeline from growing
+   * with each appended fragment.
+   */
+  durationHintSeconds?: number;
 };
 
 export class RemuxStreamer {

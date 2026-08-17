@@ -14,9 +14,11 @@ import {
   shouldManuallyEvict,
   shouldPauseManagedBuffering,
   shouldPauseForRemuxQueue,
+  shouldReportFragmentAppendStall,
   shouldReportNoAppendProgress,
 } from "../src/lib/remuxBufferPolicy.ts";
 import { isMatroskaSource } from "../src/lib/playback.ts";
+import { fetchMediaRange } from "../src/lib/rangeFetch.ts";
 import {
   parseContentRange,
   partialResponseMatches,
@@ -234,4 +236,84 @@ test("no-progress watchdog waits for every append path to become idle", () => {
   assert.equal(shouldReportNoAppendProgress(threshold + 1, true, 0), false);
   assert.equal(shouldReportNoAppendProgress(threshold + 1, false, 1), false);
   assert.equal(shouldReportNoAppendProgress(threshold, false, 0), false);
+});
+
+test("a redirected HTTP 200 range is retried directly against its CDN", async () => {
+  const original = "https://addon.example/playback/token/file.mkv";
+  const final = "https://cdn.example/signed/file.mkv";
+  const calls = [];
+  const redirected = new Response("whole file", { status: 200 });
+  Object.defineProperties(redirected, {
+    redirected: { value: true },
+    url: { value: final },
+  });
+  const partial = new Response(Uint8Array.of(1, 2), {
+    status: 206,
+    headers: { "Content-Range": "bytes 0-1/100" },
+  });
+  const fetchImpl = async (input, init) => {
+    calls.push({ url: String(input), range: new Headers(init?.headers).get("Range") });
+    return calls.length === 1 ? redirected : partial;
+  };
+  const state = { resolvedUrl: null };
+  const capabilities = [];
+
+  const response = await fetchMediaRange(
+    original,
+    { headers: { Range: "bytes=0-" } },
+    state,
+    (capability) => capabilities.push(capability),
+    fetchImpl,
+  );
+
+  assert.equal(response.status, 206);
+  assert.equal(state.resolvedUrl, final);
+  assert.deepEqual(calls, [
+    { url: original, range: "bytes=0-" },
+    { url: final, range: "bytes=0-" },
+  ]);
+  assert.deepEqual(capabilities, ["range"]);
+});
+
+test("range headers carried by a Request object are still validated", async () => {
+  const request = new Request("https://cdn.example/file.mkv", {
+    headers: { Range: "bytes=64-" },
+  });
+  let seenRange = null;
+  const response = await fetchMediaRange(
+    request,
+    undefined,
+    { resolvedUrl: null },
+    undefined,
+    async (_input, init) => {
+      seenRange = new Headers(init?.headers).get("Range");
+      return new Response(Uint8Array.of(1), {
+        status: 206,
+        headers: { "Content-Range": "bytes 64-64/100" },
+      });
+    },
+  );
+  assert.equal(response.status, 206);
+  assert.equal(seenRange, "bytes=64-");
+});
+
+test("a genuinely sequential Matroska host fails before caching the file", async () => {
+  await assert.rejects(
+    fetchMediaRange(
+      "https://cdn.example/file.mkv",
+      { headers: { Range: "bytes=0-" } },
+      { resolvedUrl: null },
+      undefined,
+      async () => new Response("whole file", { status: 200 }),
+    ),
+    /ignored byte-range requests/,
+  );
+});
+
+test("fragment watchdog stops successful appends that never become playable", () => {
+  assert.equal(shouldReportFragmentAppendStall(3, 0, 0, 0), false);
+  assert.equal(shouldReportFragmentAppendStall(4, 0, 0, 0), true);
+  assert.equal(shouldReportFragmentAppendStall(8, 5, 2, 2), false);
+  assert.equal(shouldReportFragmentAppendStall(9, 5, 2, 2), true);
+  assert.equal(shouldReportFragmentAppendStall(9, 5, 3, 2), false);
 });

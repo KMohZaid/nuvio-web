@@ -1,8 +1,17 @@
 import { Check, Play } from "lucide-react";
-import { memo, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { watchKey, type WatchIndex } from "../lib/progress";
 import { useDragScroll } from "../lib/useDragScroll";
+import { useLongPress } from "../lib/useLongPress";
 import type { CatalogSection, Meta } from "../types";
+
+export type MediaMenuHandler = (item: Meta, x: number, y: number) => void;
 
 /**
  * Memoised because the grids re-render whenever the watch index changes, and
@@ -12,6 +21,7 @@ export const PosterCard = memo(function PosterCard({
   item,
   index,
   onOpen,
+  onMenu,
 }: {
   item: Meta;
   index: WatchIndex;
@@ -19,8 +29,12 @@ export const PosterCard = memo(function PosterCard({
   // the call site is a new function on every render, which defeats `memo` and
   // made every already-rendered card re-render on each progressive chunk.
   onOpen(item: Meta): void;
+  onMenu?: MediaMenuHandler;
 }) {
-  const onClick = () => onOpen(item);
+  const hold = useLongPress((x, y) => onMenu?.(item, x, y));
+  const onClick = () => {
+    if (!hold.consumedTap()) onOpen(item);
+  };
   const progress = index.byContent.get(item.id);
   const percentage = progress?.durationMs
     ? Math.min(100, (progress.positionMs / progress.durationMs) * 100)
@@ -34,6 +48,7 @@ export const PosterCard = memo(function PosterCard({
     <button
       className="poster-card"
       onClick={onClick}
+      {...(onMenu ? hold : {})}
       aria-label={`Open ${item.name}`}
     >
       <span className="poster-image-wrap">
@@ -64,18 +79,25 @@ export function MediaRow({
   index,
   onOpen,
   onSeeAll,
+  onMenu,
+  subtitle,
 }: {
   section: CatalogSection;
   index: WatchIndex;
   onOpen(item: Meta): void;
-  onSeeAll(): void;
+  onSeeAll?: () => void;
+  onMenu?: MediaMenuHandler;
+  subtitle?: string;
 }) {
   const rowRef = useDragScroll<HTMLDivElement>();
   return (
     <section className="media-section">
       <header>
-        <h2>{section.name}</h2>
-        <button onClick={onSeeAll}>See all</button>
+        <div>
+          <h2>{section.name}</h2>
+          {subtitle && <span>{subtitle}</span>}
+        </div>
+        {onSeeAll && <button onClick={onSeeAll}>See all</button>}
       </header>
       <div className="media-row" ref={rowRef}>
         {section.items.map((item) => (
@@ -84,6 +106,7 @@ export function MediaRow({
             item={item}
             index={index}
             onOpen={onOpen}
+            onMenu={onMenu}
           />
         ))}
       </div>
@@ -103,17 +126,24 @@ const HERO_ROTATE_MS = 9000;
 export function Hero({
   items,
   onOpen,
+  onMenu,
 }: {
   items: Meta[];
   onOpen(item: Meta): void;
+  onMenu?: MediaMenuHandler;
 }) {
   const [index, setIndex] = useState(0);
   const [paused, setPaused] = useState(false);
   const [transitionDirection, setTransitionDirection] = useState<
     "next" | "previous"
   >("next");
+  const [dragX, setDragX] = useState(0);
+  const [dragging, setDragging] = useState(false);
   const swipe = useRef({ active: false, pointerId: -1, x: 0, y: 0 });
   const active = items[index % Math.max(items.length, 1)];
+  const hold = useLongPress((x, y) => {
+    if (active) onMenu?.(active, x, y);
+  });
   const move = (direction: -1 | 1) => {
     setTransitionDirection(direction > 0 ? "next" : "previous");
     setIndex((current) =>
@@ -145,7 +175,8 @@ export function Hero({
       // Keyed so a slide change restarts the fade rather than cross-fading
       // two backgrounds into mud.
       key={`${active.type}:${active.id}`}
-      className={`hero hero-transition-${transitionDirection}`}
+      className={`hero hero-transition-${transitionDirection}${dragging ? " is-dragging" : ""}`}
+      {...(onMenu ? hold : {})}
       onPointerEnter={() => setPaused(true)}
       onPointerLeave={() => {
         if (!swipe.current.active) setPaused(false);
@@ -162,6 +193,16 @@ export function Hero({
         event.currentTarget.setPointerCapture(event.pointerId);
         setPaused(true);
       }}
+      onPointerMove={(event) => {
+        const start = swipe.current;
+        if (!start.active || start.pointerId !== event.pointerId) return;
+        const x = event.clientX - start.x;
+        const y = event.clientY - start.y;
+        if (!dragging && Math.abs(x) < 7) return;
+        if (!dragging && Math.abs(x) <= Math.abs(y)) return;
+        setDragging(true);
+        setDragX(Math.max(-170, Math.min(170, x)));
+      }}
       onPointerUp={(event) => {
         const start = swipe.current;
         if (!start.active || start.pointerId !== event.pointerId) return;
@@ -170,6 +211,8 @@ export function Hero({
           event.currentTarget.releasePointerCapture(event.pointerId);
         const x = event.clientX - start.x;
         const y = event.clientY - start.y;
+        setDragging(false);
+        setDragX(0);
         if (Math.abs(x) >= 48 && Math.abs(x) > Math.abs(y) * 1.15)
           move(x < 0 ? 1 : -1);
         setPaused(false);
@@ -177,14 +220,20 @@ export function Hero({
       onPointerCancel={(event) => {
         if (swipe.current.pointerId !== event.pointerId) return;
         swipe.current.active = false;
+        setDragging(false);
+        setDragX(0);
         setPaused(false);
       }}
       style={
-        artwork
-          ? {
-              backgroundImage: `linear-gradient(90deg, rgba(5,7,9,.98) 0%, rgba(5,7,9,.67) 46%, rgba(5,7,9,.12) 100%), linear-gradient(0deg, #080a0d 0%, transparent 55%), url("${artwork.replace(/"/g, "%22")}")`,
-            }
-          : undefined
+        {
+          ...(artwork
+            ? {
+                backgroundImage: `linear-gradient(90deg, rgba(5,7,9,.98) 0%, rgba(5,7,9,.67) 46%, rgba(5,7,9,.12) 100%), linear-gradient(0deg, #080a0d 0%, transparent 55%), url("${artwork.replace(/"/g, "%22")}")`,
+              }
+            : {}),
+          "--hero-drag-x": `${dragX}px`,
+          "--hero-drag-opacity": Math.max(0.62, 1 - Math.abs(dragX) / 430),
+        } as CSSProperties
       }
     >
       <div className="hero-copy">

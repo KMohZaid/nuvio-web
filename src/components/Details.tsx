@@ -7,11 +7,13 @@ import {
   ExternalLink,
   Play,
   Plus,
+  Search,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { loadStreams, resolveMeta } from "../lib/addons";
 import { assessPlayback, shouldUseRemuxFallback } from "../lib/playback";
+import { safeHttpUrl } from "../lib/security";
 import {
   enrichMetadata,
   type MetadataEnrichmentConfig,
@@ -64,6 +66,25 @@ function whole(value: number) {
 }
 function percent(value: number) {
   return `${Math.round(value)}%`;
+}
+
+function VideoGlyph({ size = 22 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="2.5" y="4.5" width="19" height="15" rx="2.5" />
+      <path d="M10 9.2v5.6l4.8-2.8z" />
+    </svg>
+  );
 }
 
 function canonicalRatingSource(source: string) {
@@ -303,6 +324,8 @@ export function Details({
   onLibrary,
   onPlay,
   onSetWatched,
+  initialVideoId,
+  openSourcesOnLoad = false,
 }: {
   seed: Meta;
   addons: InstalledAddon[];
@@ -316,6 +339,8 @@ export function Details({
   onLibrary(meta: Meta): void;
   onPlay(stream: Stream, meta: Meta, video?: Video): void;
   onSetWatched(meta: Meta, video: Video | undefined, watched: boolean): void;
+  initialVideoId?: string;
+  openSourcesOnLoad?: boolean;
 }) {
   const [menu, setMenu] = useState<{ x: number; y: number; video: Video } | null>(
     null,
@@ -328,6 +353,8 @@ export function Details({
   const [meta, setMeta] = useState(seed);
   const [dominantColor, setDominantColor] = useState(DEFAULT_DETAIL_COLOR);
   const [selectedTrailerCategory, setSelectedTrailerCategory] = useState("");
+  const [trailerOpen, setTrailerOpen] = useState(false);
+  const initialSourceConsumed = useRef(false);
   const trailerGroups = useMemo(() => {
     const groups = new Map<string, Meta["trailers"]>();
     for (const trailer of meta.trailers) {
@@ -406,6 +433,9 @@ export function Details({
     };
   }, [meta.id, swipeRef]);
   useEffect(() => setDescriptionExpanded(false), [meta.id]);
+  useEffect(() => {
+    initialSourceConsumed.current = false;
+  }, [seed.id, initialVideoId, openSourcesOnLoad]);
   // Probe results live in a module cache, so this only forces a re-render.
   const [, setProbeTick] = useState(0);
   useEffect(
@@ -421,6 +451,20 @@ export function Details({
   );
   const regularSeasonCount = seasons.filter((value) => value > 0).length;
   const [season, setSeason] = useState<number | undefined>();
+  const [episodeQuery, setEpisodeQuery] = useState("");
+  const visibleEpisodes = useMemo(() => {
+    const query = episodeQuery.trim().toLocaleLowerCase();
+    return meta.videos.filter((video) => {
+      if ((video.season ?? 0) !== season) return false;
+      if (!query) return true;
+      return [
+        video.title,
+        video.overview,
+        `episode ${video.episode ?? ""}`,
+        `s${video.season ?? 0}e${video.episode ?? ""}`,
+      ].some((value) => value?.toLocaleLowerCase().includes(query));
+    });
+  }, [episodeQuery, meta.videos, season]);
   useEffect(() => {
     let live = true;
     if (
@@ -485,8 +529,9 @@ export function Details({
       live = false;
     };
   }, [seed, addons, metadataEnrichment]);
-  async function sources(video?: Video) {
+  async function sources(video?: Video, forceManual = false) {
     window.clearTimeout(autoPlayTimer.current);
+    autoPlayTimer.current = undefined;
     sourceAbort.current?.abort();
     const request = ++sourceRequest.current;
     const controller = new AbortController();
@@ -495,25 +540,18 @@ export function Details({
     setSourceOpen(true);
     setSourceBusy(true);
     setStreams([]);
-    try {
-      const next = await loadStreams(
-        meta.type,
-        video?.id || meta.id,
-        addons,
-        controller.signal,
-      );
-      if (request !== sourceRequest.current || controller.signal.aborted) return;
-      setStreams(next);
+    const scheduleAutoPlay = (available: Stream[]) => {
+      if (forceManual || autoPlayTimer.current !== undefined) return;
       let selected: Stream | undefined;
       if (playerSettings.autoPlayMode === "FIRST_STREAM") {
-        selected = next.find((item) => item.url || item.externalUrl);
+        selected = available.find((item) => item.url || item.externalUrl);
       } else if (
         playerSettings.autoPlayMode === "REGEX_MATCH" &&
         playerSettings.autoPlayRegex
       ) {
         try {
           const matcher = new RegExp(playerSettings.autoPlayRegex);
-          selected = next.find(
+          selected = available.find(
             (item) =>
               (item.url || item.externalUrl) &&
               matcher.test(
@@ -532,21 +570,51 @@ export function Details({
           // Nuvio falls back to manual choice for an invalid expression.
         }
       }
-      if (selected) {
-        const choice = selected;
-        autoPlayTimer.current = window.setTimeout(() => {
-          if (!sourceOpenRef.current) return;
-          setSourceOpen(false);
-          onPlay(choice, meta, video);
-        }, playerSettings.autoPlayTimeoutSeconds * 1_000);
-      }
+      if (!selected) return;
+      const choice = selected;
+      autoPlayTimer.current = window.setTimeout(() => {
+        if (!sourceOpenRef.current) return;
+        setSourceOpen(false);
+        onPlay(choice, meta, video);
+      }, playerSettings.autoPlayTimeoutSeconds * 1_000);
+    };
+
+    // Start plugins concurrently, but never make ordinary addon results wait
+    // for them. Browser-only providers commonly hit CORS or host timeouts.
+    const pluginStreamsTask = Promise.resolve([] as Stream[]);
+
+    let addonStreams: Stream[] = [];
+    try {
+      addonStreams = await loadStreams(
+          meta.type,
+          video?.id || meta.id,
+          addons,
+          controller.signal,
+        ).catch(() => []);
+      if (request !== sourceRequest.current || controller.signal.aborted) return;
+      setStreams(addonStreams);
+      scheduleAutoPlay(addonStreams);
     } finally {
       if (request === sourceRequest.current) setSourceBusy(false);
     }
+
+    const pluginStreams = await pluginStreamsTask;
+    if (request !== sourceRequest.current || controller.signal.aborted) return;
+    const combined = [...addonStreams, ...pluginStreams];
+    setStreams(combined);
+    scheduleAutoPlay(combined);
   }
+  useEffect(() => {
+    if (busy || !openSourcesOnLoad || initialSourceConsumed.current) return;
+    const video = initialVideoId
+      ? meta.videos.find((entry) => entry.id === initialVideoId)
+      : undefined;
+    initialSourceConsumed.current = true;
+    void sources(video, true);
+  }, [busy, initialVideoId, meta, openSourcesOnLoad]);
   return (
     <div
-      className={`detail-view background-${metaScreenSettings.backgroundMode}${sourceOpen ? " has-sheet" : ""}${compactHeader ? " has-compact-header" : ""}${busy ? " is-loading" : ""}`}
+      className={`detail-view background-${metaScreenSettings.backgroundMode}${sourceOpen ? " has-sheet" : ""}${compactHeader ? " has-compact-header" : ""}${busy ? " is-loading" : ""}${trailerOpen ? " has-trailer-panel" : ""}${meta.type === "series" && sectionEnabled("EPISODES") ? " has-episode-panel" : ""}`}
       ref={swipeRef}
       style={{ "--detail-dominant": dominantColor } as CSSProperties}
       aria-busy={busy}
@@ -671,88 +739,91 @@ export function Details({
             >
               {inLibrary ? <Check size={22} /> : <Plus size={22} />}
             </button>
-            <button
-              className={`icon-pill${heroTargetWatched ? " active" : ""}`}
-              title={heroTargetWatched ? "Mark as unwatched" : "Mark as watched"}
-              aria-label={heroTargetWatched ? "Mark as unwatched" : "Mark as watched"}
-              aria-pressed={heroTargetWatched}
-              onClick={() =>
-                onSetWatched(meta, heroPlayback.video, !heroTargetWatched)
-              }
-            >
-              {heroTargetWatched ? <EyeOff size={22} /> : <Eye size={22} />}
-            </button>
+            {meta.type !== "series" && (
+              <button
+                className={`icon-pill${heroTargetWatched ? " active" : ""}`}
+                title={heroTargetWatched ? "Mark as unwatched" : "Mark as watched"}
+                aria-label={heroTargetWatched ? "Mark as unwatched" : "Mark as watched"}
+                aria-pressed={heroTargetWatched}
+                onClick={() =>
+                  onSetWatched(meta, heroPlayback.video, !heroTargetWatched)
+                }
+              >
+                {heroTargetWatched ? <EyeOff size={22} /> : <Eye size={22} />}
+              </button>
+            )}
+            {sectionEnabled("TRAILERS") && meta.trailers.length > 0 && (
+              <button
+                className="icon-pill desktop-video-action"
+                title="Trailers and extras"
+                aria-label="Open trailers and extras"
+                aria-expanded={trailerOpen}
+                onClick={() => setTrailerOpen(true)}
+              >
+                <VideoGlyph size={19} />
+              </button>
+            )}
           </div>
-          {sectionEnabled("PRODUCTION") &&
-            (meta.director.length > 0 || meta.writer.length > 0) && (
+          {((sectionEnabled("PRODUCTION") &&
+            (meta.director.length > 0 || meta.writer.length > 0)) ||
+            (sectionEnabled("DETAILS") &&
+              (meta.language ||
+                meta.status))) && (
               <div className="mobile-hero-credits">
-                {meta.director.length > 0 && (
-                  <p>
+                {sectionEnabled("PRODUCTION") && meta.director.length > 0 && (
+                  <p className="mobile-credit-wide">
                     <strong>Director:</strong> {meta.director.join(", ")}
                   </p>
                 )}
-                {meta.writer.length > 0 && (
-                  <p>
+                {sectionEnabled("PRODUCTION") && meta.writer.length > 0 && (
+                  <p className="mobile-credit-wide">
                     <strong>Writer:</strong> {meta.writer.join(", ")}
                   </p>
+                )}
+                {sectionEnabled("DETAILS") && meta.language && (
+                  <p><strong>Language:</strong> {meta.language}</p>
+                )}
+                {sectionEnabled("DETAILS") && meta.status && (
+                  <p><strong>Status:</strong> {meta.status}</p>
                 )}
               </div>
             )}
         </div>
       </div>
       <div className="detail-sections">
-      {sectionEnabled("PRODUCTION") &&
-        (meta.director.length > 0 || meta.writer.length > 0) && (
+      {((sectionEnabled("PRODUCTION") &&
+        (meta.director.length > 0 || meta.writer.length > 0)) ||
+        (sectionEnabled("DETAILS") &&
+          (meta.language ||
+            meta.status))) && (
         <section
-          className="detail-credits"
-          style={{ order: sectionOrder("PRODUCTION") }}
+          className="detail-credits detail-overview-meta"
+          style={{
+            order: Math.min(
+              sectionOrder("PRODUCTION"),
+              sectionOrder("DETAILS"),
+              sectionOrder("CAST") - 0.5,
+            ),
+          }}
         >
-          {meta.director.length > 0 && (
+          {sectionEnabled("PRODUCTION") && meta.director.length > 0 && (
             <div>
               <span className="eyebrow">DIRECTOR</span>
               <strong>{meta.director.join(", ")}</strong>
             </div>
           )}
-          {meta.writer.length > 0 && (
+          {sectionEnabled("PRODUCTION") && meta.writer.length > 0 && (
             <div>
               <span className="eyebrow">WRITER</span>
               <strong>{meta.writer.join(", ")}</strong>
             </div>
           )}
-        </section>
-      )}
-      {sectionEnabled("DETAILS") &&
-        (meta.language ||
-          meta.releaseInfo ||
-          meta.runtime ||
-          meta.status ||
-          meta.ageRating) && (
-        <section
-          className="detail-facts"
-          style={{ order: sectionOrder("DETAILS") }}
-        >
-          <span className="eyebrow">DETAILS</span>
-          <h2>{meta.type === "series" ? "Series details" : "Movie details"}</h2>
-          <div>
-          {meta.releaseInfo && (
-            <div>
-              <span>Released</span>
-              <strong>{meta.releaseInfo}</strong>
-            </div>
+          {sectionEnabled("DETAILS") && meta.language && (
+            <div><span className="eyebrow">LANGUAGE</span><strong>{meta.language}</strong></div>
           )}
-          {meta.runtime && (
-            <div><span>Runtime</span><strong>{meta.runtime}</strong></div>
+          {sectionEnabled("DETAILS") && meta.status && (
+            <div><span className="eyebrow">STATUS</span><strong>{meta.status}</strong></div>
           )}
-          {meta.language && (
-            <div><span>Language</span><strong>{meta.language}</strong></div>
-          )}
-          {meta.status && (
-            <div><span>Status</span><strong>{meta.status}</strong></div>
-          )}
-          {meta.ageRating && (
-            <div><span>Age rating</span><strong>{meta.ageRating}</strong></div>
-          )}
-          </div>
         </section>
       )}
       {sectionEnabled("EPISODES") && meta.type === "series" && (
@@ -765,21 +836,37 @@ export function Details({
               <span className="eyebrow">EPISODES</span>
               <h2>{meta.name}</h2>
             </div>
-            <select
-              value={season ?? ""}
-              onChange={(event) => setSeason(Number(event.target.value))}
-            >
-              {seasons.map((value) => (
-                <option key={value} value={value}>
-                  {value === 0 ? "Specials" : `Season ${value}`}
-                </option>
-              ))}
-            </select>
+            <label className="season-select-wrap">
+              <span>SEASON</span>
+              <select
+                value={season ?? ""}
+                onChange={(event) => {
+                  setSeason(Number(event.target.value));
+                  setEpisodeQuery("");
+                }}
+              >
+                {seasons.map((value) => (
+                  <option key={value} value={value}>
+                    {value === 0 ? "Specials" : `Season ${value}`}
+                  </option>
+                ))}
+              </select>
+            </label>
           </header>
+          <label className="episode-search">
+            <Search size={19} />
+            <input
+              value={episodeQuery}
+              onChange={(event) => setEpisodeQuery(event.target.value)}
+              placeholder="Search this season"
+            />
+          </label>
+          <div className="episode-list-heading">
+            <strong>{season === 0 ? "Specials" : `Season ${season ?? seasons[0] ?? 1}`}</strong>
+            <span>{visibleEpisodes.length} {visibleEpisodes.length === 1 ? "episode" : "episodes"}</span>
+          </div>
           <div className={`episode-list is-${metaScreenSettings.episodeCardStyle}`}>
-            {meta.videos
-              .filter((video) => (video.season ?? 0) === season)
-              .map((video) => (
+            {visibleEpisodes.map((video) => (
                 <EpisodeRow
                   key={video.id}
                   video={video}
@@ -823,11 +910,26 @@ export function Details({
         </section>
       )}
       {sectionEnabled("TRAILERS") && meta.trailers.length > 0 && (
+        <>
+        {trailerOpen && (
+          <button
+            className="detail-trailer-backdrop"
+            aria-label="Close trailers"
+            onClick={() => setTrailerOpen(false)}
+          />
+        )}
         <section
-          className="detail-trailers"
+          className={`detail-trailers${trailerOpen ? " is-open" : ""}`}
           style={{ order: sectionOrder("TRAILERS") }}
         >
-          <span className="eyebrow">VIDEOS</span>
+          <div className="detail-trailer-panel-head">
+            <span className="eyebrow">VIDEOS</span>
+            <button
+              className="circle-button trailer-panel-close"
+              aria-label="Close trailers"
+              onClick={() => setTrailerOpen(false)}
+            ><X /></button>
+          </div>
           <div className="detail-trailer-heading">
             <h2>Trailers</h2>
             {trailerCategories.length > 0 && (
@@ -848,19 +950,20 @@ export function Details({
               </label>
             )}
           </div>
-          <div>
+          <div className="detail-trailer-grid">
             {visibleTrailers.slice(0, 18).map((trailer) => {
               const youtube =
                 !trailer.site || trailer.site.toLowerCase() === "youtube";
               const href = youtube
                 ? `https://www.youtube.com/watch?v=${encodeURIComponent(trailer.key)}`
-                : trailer.key;
+                : safeHttpUrl(trailer.key);
+              if (!href) return null;
               return (
                 <a
                   key={trailer.id || trailer.key}
                   href={href}
                   target="_blank"
-                  rel="noreferrer"
+                  rel="noopener noreferrer"
                 >
                   <span>
                     {youtube && (
@@ -879,6 +982,7 @@ export function Details({
             })}
           </div>
         </section>
+        </>
       )}
       </div>
       {menu &&
@@ -1041,9 +1145,11 @@ export function Details({
                         >
                           <Copy size={16} /> Copy
                         </button>
-                        <a href={stream.url} target="_blank" rel="noreferrer">
-                          <ExternalLink size={16} /> Open
-                        </a>
+                        {safeHttpUrl(stream.url) && (
+                          <a href={safeHttpUrl(stream.url)!} target="_blank" rel="noopener noreferrer">
+                            <ExternalLink size={16} /> Open
+                          </a>
+                        )}
                       </div>
                     )}
                   </article>
@@ -1113,6 +1219,9 @@ function EpisodeRow({
         {percent > 0 && percent < 90 && (
           <i className="episode-progress" style={{ width: `${percent}%` }} />
         )}
+        {video.imdbRating && (
+          <i className="episode-imdb">IMDb {video.imdbRating}</i>
+        )}
       </span>
       <span>
         <small>
@@ -1122,7 +1231,6 @@ function EpisodeRow({
         <strong>{video.title}</strong>
         <p>{video.overview}</p>
       </span>
-      <Play size={20} />
     </button>
   );
 }

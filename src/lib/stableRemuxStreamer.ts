@@ -5,8 +5,14 @@ import type {
 } from "./remuxStreamer";
 import {
   remuxLanguageRoot,
-  selectRemuxTrackPair,
+  selectBrowserRemuxPlan,
 } from "./remuxTrackSelection";
+import { shouldReportFragmentAppendStall } from "./remuxBufferPolicy";
+import {
+  fetchMediaRange,
+  type RangeCapability,
+  type RangeFetchState,
+} from "./rangeFetch";
 
 /**
  * Matroska -> fragmented MP4 playback for MSE/MMS.
@@ -20,9 +26,10 @@ import {
  *
  * This production path delegates Matroska parsing and ISO-BMFF writing to
  * Mediabunny. It emits multiplexed, keyframe-aligned fMP4 fragments and keeps
- * the conversion paused only a few seconds ahead of the playhead. Nothing is
- * decoded or re-encoded: compatible H.264/HEVC/AAC/AC-3/E-AC-3 packets are
- * copied into a browser-native MP4 stream.
+ * the conversion paused only a few seconds ahead of the playhead. Compatible
+ * H.264/HEVC and AAC packets are copied into a browser-native MP4 stream. When
+ * the only usable audio is AC-3/E-AC-3, that audio alone is converted to AAC
+ * in-browser; the video is still copied without re-encoding.
  */
 
 type MediaSourceConstructor = {
@@ -44,6 +51,7 @@ type ManagedMediaSourceLike = MediaSource & {
 type QueuedAppend = {
   bytes: Uint8Array<ArrayBuffer>;
   label: string;
+  generation: number;
 };
 
 const INITIAL_OUTPUT_SECONDS = 3;
@@ -52,8 +60,10 @@ const IOS_TARGET_AHEAD_SECONDS = 5;
 const DESKTOP_TARGET_AHEAD_SECONDS = 12;
 const MAX_QUEUE_BYTES = 20 * 1024 * 1024;
 const MAX_QUEUE_ITEMS = 12;
-const SOURCE_CACHE_BYTES = 4 * 1024 * 1024;
+const SOURCE_CACHE_BYTES = 12 * 1024 * 1024;
 const SOURCE_OPEN_TIMEOUT_MS = 15_000;
+const SOURCE_INSPECTION_TIMEOUT_MS = 60_000;
+const CONVERSION_STEP_TIMEOUT_MS = 45_000;
 const KEEP_DESKTOP_HISTORY_SECONDS = 12;
 
 function join(
@@ -96,30 +106,41 @@ function sourceConstructor() {
   return { Source: managed ?? standard, managed: Boolean(managed) };
 }
 
-async function fetchMediaRange(input: RequestInfo | URL, init?: RequestInit) {
-  const response = await fetch(input, init);
-  if (response.status !== 416) return response;
+function combinedAbortSignal(...signals: Array<AbortSignal | null | undefined>) {
+  const active = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  if (active.length <= 1) return active[0];
+  const AbortSignalWithAny = AbortSignal as typeof AbortSignal & {
+    any?: (signals: AbortSignal[]) => AbortSignal;
+  };
+  if (AbortSignalWithAny.any) return AbortSignalWithAny.any(active);
 
-  // A few signed media hosts reject every Range request even though the same
-  // URL streams correctly as HTTP 200. UrlSource already has a bounded
-  // sequential mode for a 200 response, so retry once without Range and let
-  // it switch modes instead of surfacing the opaque "invalid byte range".
-  const headers = new Headers(init?.headers);
-  if (!headers.has("Range")) return response;
-  headers.delete("Range");
-  try {
-    await response.body?.cancel();
-  } catch {
-    // The rejected response normally has no body.
+  // Safari versions predating AbortSignal.any still need both the UrlSource
+  // worker cancellation and the player-wide teardown signal.
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of active) {
+    if (signal.aborted) {
+      abort();
+      break;
+    }
+    signal.addEventListener("abort", abort, { once: true });
   }
-  return fetch(input, { ...init, headers });
+  return controller.signal;
 }
 
 export class StableRemuxStreamer {
   private source: MediaSource | null = null;
   private buffer: SourceBuffer | null = null;
   private input: Input | null = null;
+  private seekInput: Input | null = null;
   private conversion: Conversion | null = null;
+  /** A new generation is created whenever an unbuffered seek restarts conversion. */
+  private conversionGeneration = 0;
+  /** Absolute presentation time represented by timestamp zero in the active conversion. */
+  private outputStart = 0;
+  private restartConversion: ((startSeconds: number) => Promise<void>) | null = null;
+  private rangeCapability: RangeCapability = "unknown";
+  private durationSeconds = 0;
   private objectUrl = "";
   private stopped = false;
   private failed = false;
@@ -128,16 +149,16 @@ export class StableRemuxStreamer {
   private triedPlay = false;
   private queue: QueuedAppend[] = [];
   private queuedBytes = 0;
-  private ftyp: Uint8Array | null = null;
-  private moov: Uint8Array | null = null;
-  private initQueued = false;
-  private pendingMoofs: Array<{ bytes: Uint8Array; timestamp: number }> = [];
   private mime = "";
   private readBytes = 0;
   private processedTime = 0;
   private fragmentCount = 0;
   private lastAppend = "nothing yet";
   private evicting = false;
+  private appendedMediaSegments = 0;
+  private segmentsAtLastProgress = 0;
+  private lastBufferedEnd = 0;
+  private readonly abortController = new AbortController();
   private cleanups: Array<() => void> = [];
 
   constructor(
@@ -150,9 +171,11 @@ export class StableRemuxStreamer {
   stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this.abortController.abort();
     this.queue = [];
     this.queuedBytes = 0;
-    this.pendingMoofs = [];
+    this.conversionGeneration += 1;
+    this.restartConversion = null;
 
     for (const cleanup of this.cleanups.splice(0)) {
       try {
@@ -169,6 +192,8 @@ export class StableRemuxStreamer {
     }
     this.input?.dispose();
     this.input = null;
+    this.seekInput?.dispose();
+    this.seekInput = null;
 
     if (this.objectUrl) {
       if (this.element.src === this.objectUrl) {
@@ -181,6 +206,45 @@ export class StableRemuxStreamer {
     }
     this.buffer = null;
     this.source = null;
+  }
+
+  /**
+   * Seeks a remuxed file without pretending the sequential output is a native
+   * random-access stream. Buffered targets are immediate. For an unbuffered
+   * target, a range-capable source starts a fresh conversion at the nearest
+   * Matroska cue and appends it at the requested presentation timestamp.
+   */
+  async seek(targetSeconds: number) {
+    const duration = this.durationSeconds || this.element.duration;
+    const target = Math.max(
+      0,
+      Math.min(
+        Number.isFinite(duration) && duration > 0 ? duration - 0.05 : targetSeconds,
+        targetSeconds,
+      ),
+    );
+    if (!Number.isFinite(target)) return false;
+    if (this.isBuffered(target)) {
+      this.element.currentTime = target;
+      return true;
+    }
+    if (this.rangeCapability !== "range" || !this.restartConversion) {
+      this.report(
+        "ready",
+        this.rangeCapability === "sequential"
+          ? "This media host does not support byte-range seeking; only buffered playback can be scrubbed."
+          : "The source is not ready for random seeking yet.",
+      );
+      return false;
+    }
+    try {
+      await this.restartConversion(target);
+      return true;
+    } catch (error) {
+      if (!this.stopped)
+        this.fail(`Could not seek to ${target.toFixed(1)}s: ${errorMessage(error)}`);
+      return false;
+    }
   }
 
   async start() {
@@ -221,140 +285,297 @@ export class StableRemuxStreamer {
       Mp4OutputFormat,
       NullTarget,
       Output,
+      Source: ByteSource,
       UrlSource,
+      canEncodeAudio,
     } = await mediaKitPromise;
-    const urlSource = new UrlSource(this.url, {
-      requestInit: {
-        cache: "no-store",
-        headers: this.options.requestHeaders,
-      },
-      maxCacheSize: SOURCE_CACHE_BYTES,
-      parallelism: 1,
-      fetchFn: fetchMediaRange,
-      getRetryDelay: (attempt) => (attempt <= 3 ? 0.35 * 2 ** attempt : null),
-    });
-    urlSource.onread = (start, end) => {
-      this.readBytes += Math.max(0, end - start);
+    const rangeFetchState: RangeFetchState = { resolvedUrl: null };
+    const makeUrlSource = () => {
+      const source = new UrlSource(this.url, {
+        requestInit: {
+          cache: "no-store",
+          headers: this.options.requestHeaders,
+        },
+        maxCacheSize: SOURCE_CACHE_BYTES,
+        parallelism: 1,
+        fetchFn: (resource, init) =>
+          fetchMediaRange(
+            resource,
+            {
+              ...init,
+              signal: combinedAbortSignal(
+                init?.signal,
+                this.abortController.signal,
+              ),
+            },
+            rangeFetchState,
+            (capability) => {
+              // Once a host has fallen back to one sequential HTTP 200
+              // response, later requests cannot make random access safe.
+              if (this.rangeCapability !== "sequential")
+                this.rangeCapability = capability;
+            },
+          ),
+        getRetryDelay: (attempt) =>
+          attempt <= 3 ? 0.35 * 2 ** attempt : null,
+      });
+      source.onread = (start, end) => {
+        this.readBytes += Math.max(0, end - start);
+      };
+      return source;
     };
-    const input = new InputClass({ source: urlSource, formats: [MATROSKA] });
+
+    const initialUrlSource = makeUrlSource();
+    type InternalSourceRead = {
+      bytes: Uint8Array;
+      view: DataView;
+      offset: number;
+    };
+    const initialDelegate = initialUrlSource as unknown as {
+      _read(
+        start: number,
+        end: number,
+        minimum: number,
+        maximum: number,
+      ): InternalSourceRead | null | Promise<InternalSourceRead | null>;
+      _dispose(): void;
+    };
+    // WebKit's ManagedMediaSource does not need the complete Matroska Cues
+    // table to start playing. Presenting the initial source as unsized makes
+    // the demuxer stop metadata inspection at the first Cluster rather than
+    // following a far-away/large Cues entry before it returns Tracks. The
+    // delegate remains range-backed; a separate sized Input is created lazily
+    // only when the user requests an unbuffered seek.
+    class InitialPlaybackSource extends ByteSource {
+      _getFileSize() {
+        return null;
+      }
+
+      _read(
+        start: number,
+        end: number,
+        minimum: number,
+        maximum: number,
+      ) {
+        return initialDelegate._read(start, end, minimum, maximum);
+      }
+
+      _dispose() {
+        initialDelegate._dispose();
+      }
+    }
+    const initialSource = managed
+      ? new InitialPlaybackSource()
+      : initialUrlSource;
+    const input = new InputClass({ source: initialSource, formats: [MATROSKA] });
     this.input = input;
+    const indexedInput = async () => {
+      if (this.seekInput) return this.seekInput;
+      const next = new InputClass({
+        source: makeUrlSource(),
+        formats: [MATROSKA],
+      });
+      // Force the seek table to load while the UI says "Seeking" rather than
+      // making every Safari startup pay this cost.
+      await this.withTimeout(
+        next.getTracks(),
+        SOURCE_INSPECTION_TIMEOUT_MS * 2,
+        "The Matroska seek index could not be loaded in time.",
+      );
+      this.seekInput = next;
+      return next;
+    };
 
     // A large release often puts TrueHD/DTS first and AAC/E-AC-3 second. The
     // old `primary` choice therefore rejected the whole source (or produced
     // silent video) even when a browser-compatible alternate track existed.
     // Inspect the small track header up front and pick exactly one compatible
     // video/audio pair, honoring the synced audio language when possible.
-    const tracks = await input.getTracks();
-    const primaryVideo = await input.getPrimaryVideoTrack();
-    const primaryAudio = await input.getPrimaryAudioTrack();
-    const trackInfo = await Promise.all(
-      tracks.map(async (track) => ({
-        track,
-        codec: await track.getCodec(),
-        language: remuxLanguageRoot(await track.getLanguageCode()),
-        primary:
-          track.id === primaryVideo?.id || track.id === primaryAudio?.id,
-      })),
+    const tracks = await this.withTimeout(
+      input.getTracks(),
+      SOURCE_INSPECTION_TIMEOUT_MS,
+      `The media host did not return the Matroska track headers within ${SOURCE_INSPECTION_TIMEOUT_MS / 1000}s (${(this.readBytes / 1024 / 1024).toFixed(1)} MB read, ${this.rangeCapability} access).`,
     );
-    const { videoId, audioId } = selectRemuxTrackPair(
-      trackInfo.map(({ track, codec, language, primary }) => ({
-        id: track.id,
-        type: track.type,
-        codec,
-        language,
-        primary,
-      })),
-      this.options.preferredAudioLanguage,
-      navigator.languages?.[0] || navigator.language,
+    const [primaryVideo, primaryAudio] = await this.withTimeout(
+      Promise.all([
+        input.getPrimaryVideoTrack(),
+        input.getPrimaryAudioTrack(),
+      ]),
+      SOURCE_INSPECTION_TIMEOUT_MS,
+      "The media host stalled while the primary tracks were being read.",
     );
+    const trackInfo = await this.withTimeout(
+      Promise.all(
+        tracks.map(async (track) => ({
+          track,
+          codec: await track.getCodec(),
+          codecParameter: await track.getCodecParameterString(),
+          language: remuxLanguageRoot(await track.getLanguageCode()),
+          primary:
+            track.id === primaryVideo?.id || track.id === primaryAudio?.id,
+        })),
+      ),
+      SOURCE_INSPECTION_TIMEOUT_MS,
+      "The media host stalled while the codec information was being read.",
+    );
+    const { videoId, audioId, transcodeAudio, mime: plannedMime } =
+      selectBrowserRemuxPlan(
+        trackInfo.map(
+          ({ track, codec, codecParameter, language, primary }) => ({
+            id: track.id,
+            type: track.type,
+            codec,
+            codecParameter,
+            language,
+            primary,
+          }),
+        ),
+        this.options.preferredAudioLanguage,
+        navigator.languages?.[0] || navigator.language,
+        (mime) => Source.isTypeSupported(mime),
+      );
 
     if (videoId === null || audioId === null) {
       const found = trackInfo
         .map(({ track, codec }) => `${track.type}:${codec || "unknown"}`)
         .join(", ");
       this.fail(
-        `This source has no browser-compatible video/audio pair (${found || "no tracks"}). Try an AAC/E-AC-3 source or an external player.`,
+        `This source has no browser-compatible video/audio pair (${found || "no tracks"}). Try an H.264/HEVC source with AAC or Dolby audio, or use an external player.`,
       );
       return;
     }
 
-    let lastMoof: { bytes: Uint8Array; timestamp: number } | null = null;
-    const format = new Mp4OutputFormat({
-      fastStart: "fragmented",
-      // Short fragments bound memory and let MMS begin after one keyframe.
-      minimumFragmentDuration: 1,
-      onFtyp: (bytes) => {
-        if (this.stopped) return;
-        this.ftyp = bytes.slice();
-        this.maybeQueueInit();
-      },
-      onMoov: (bytes) => {
-        if (this.stopped) return;
-        this.moov = bytes.slice();
-        this.maybeQueueInit();
-      },
-      onMoof: (bytes, _position, timestamp) => {
-        if (this.stopped) return;
-        lastMoof = { bytes: bytes.slice(), timestamp };
-        this.pendingMoofs.push(lastMoof);
-      },
-      onMdat: (bytes) => {
-        if (this.stopped) return;
-        // The fragmented writer emits one mdat immediately after each moof.
-        // Pairing the two into a single append also follows the ISO-BMFF MSE
-        // media-segment definition exactly.
-        const moof = this.pendingMoofs.shift() ?? lastMoof;
-        lastMoof = null;
-        if (!moof) {
-          this.fail("The MP4 writer emitted media without a fragment header.");
-          return;
-        }
-        this.fragmentCount += 1;
-        this.enqueue(
-          join(moof.bytes, bytes),
-          `fragment ${this.fragmentCount} at ${moof.timestamp.toFixed(2)}s`,
-        );
-      },
-    });
-    const output = new Output({ format, target: new NullTarget() });
+    if (transcodeAudio) {
+      this.report("starting", "Preparing Dolby audio conversion to AAC…");
+      const [{ registerAc3Decoder }, aacEncoder] = await Promise.all([
+        import("@mediabunny/ac3"),
+        canEncodeAudio("aac", {
+          numberOfChannels: 2,
+          sampleRate: 48_000,
+        }).then(async (supported) =>
+          supported ? null : import("@mediabunny/aac-encoder"),
+        ),
+      ]);
+      registerAc3Decoder();
+      aacEncoder?.registerAacEncoder();
+    }
 
-    let conversion: Conversion;
-    try {
-      conversion = await ConversionClass.init({
-        input,
+    const buildConversion = async (
+      startSeconds: number,
+      generation: number,
+      conversionInput: Input = input,
+    ) => {
+      let ftyp: Uint8Array | null = null;
+      let moov: Uint8Array | null = null;
+      let initQueued = false;
+      let lastMoof: { bytes: Uint8Array; timestamp: number } | null = null;
+      const pendingMoofs: Array<{ bytes: Uint8Array; timestamp: number }> = [];
+      const maybeQueueInit = () => {
+        if (initQueued || !ftyp || !moov) return;
+        initQueued = true;
+        this.enqueue(join(ftyp, moov), "initialization segment", generation);
+        ftyp = null;
+        moov = null;
+      };
+      const format = new Mp4OutputFormat({
+        fastStart: "fragmented",
+        // Short fragments bound memory and let MMS begin after one keyframe.
+        minimumFragmentDuration: 1,
+        onFtyp: (bytes) => {
+          if (this.stopped || generation !== this.conversionGeneration) return;
+          ftyp = bytes.slice();
+          maybeQueueInit();
+        },
+        onMoov: (bytes) => {
+          if (this.stopped || generation !== this.conversionGeneration) return;
+          moov = bytes.slice();
+          maybeQueueInit();
+        },
+        onMoof: (bytes, _position, timestamp) => {
+          if (this.stopped || generation !== this.conversionGeneration) return;
+          lastMoof = { bytes: bytes.slice(), timestamp };
+          pendingMoofs.push(lastMoof);
+        },
+        onMdat: (bytes) => {
+          if (this.stopped || generation !== this.conversionGeneration) return;
+          // The fragmented writer emits one mdat immediately after each moof.
+          // Pairing the two into a single append follows the ISO-BMFF MSE
+          // media-segment definition exactly.
+          const moof = pendingMoofs.shift() ?? lastMoof;
+          lastMoof = null;
+          if (!moof) {
+            this.fail("The MP4 writer emitted media without a fragment header.");
+            return;
+          }
+          this.fragmentCount += 1;
+          this.enqueue(
+            join(moof.bytes, bytes),
+            `fragment ${this.fragmentCount} at ${(startSeconds + moof.timestamp).toFixed(2)}s`,
+            generation,
+          );
+        },
+      });
+      const output = new Output({ format, target: new NullTarget() });
+      const conversion = await ConversionClass.init({
+        input: conversionInput,
         output,
         tracks: "all",
         video: (track) => ({ discard: track.id !== videoId }),
-        audio: (track) => ({ discard: track.id !== audioId }),
+        audio: (track) =>
+          track.id !== audioId
+            ? { discard: true }
+            : transcodeAudio
+              ? {
+                  codec: "aac",
+                  forceTranscode: true,
+                  numberOfChannels: 2,
+                  sampleRate: 48_000,
+                }
+              : {},
+        trim: startSeconds > 0 ? { start: startSeconds } : undefined,
         showWarnings: false,
       });
+
+      const hasVideo = conversion.utilizedTracks.some(
+        (track) => track.type === "video",
+      );
+      const hasAudio = conversion.utilizedTracks.some(
+        (track) => track.type === "audio",
+      );
+      if (!conversion.isValid || !hasVideo || !hasAudio) {
+        const discarded = describeDiscarded(conversion);
+        throw new Error(
+          discarded
+            ? `This source could not be prepared (${discarded}).`
+            : "This source does not contain a compatible video and audio pair.",
+        );
+      }
+      conversion.onProgress = (_ratio, processedTime) => {
+        if (generation !== this.conversionGeneration) return;
+        this.processedTime = Math.max(this.processedTime, processedTime);
+      };
+      await this.withTimeout(
+        conversion.execute({ until: INITIAL_OUTPUT_SECONDS }),
+        CONVERSION_STEP_TIMEOUT_MS,
+        "The first playable segment could not be prepared in time.",
+      );
+      return { conversion, output };
+    };
+
+    const initialGeneration = ++this.conversionGeneration;
+    let conversion: Conversion;
+    let output: InstanceType<typeof Output>;
+    try {
+      const built = await buildConversion(0, initialGeneration);
+      conversion = built.conversion;
+      output = built.output;
     } catch (error) {
       this.fail(`Could not read this Matroska file: ${errorMessage(error)}`);
       return;
     }
     this.conversion = conversion;
 
-    const hasVideo = conversion.utilizedTracks.some((track) => track.type === "video");
-    const hasAudio = conversion.utilizedTracks.some((track) => track.type === "audio");
-    if (!conversion.isValid || !hasVideo || !hasAudio) {
-      const discarded = describeDiscarded(conversion);
-      this.fail(
-        discarded
-          ? `This source cannot be remuxed without transcoding (${discarded}). Try an AAC/E-AC-3 source or an external player.`
-          : "This source does not contain a compatible video and audio pair.",
-      );
-      return;
-    }
-
-    conversion.onProgress = (_ratio, processedTime) => {
-      this.processedTime = Math.max(this.processedTime, processedTime);
-    };
-
     try {
-      // Producing the first tiny window discovers the exact codec strings and
-      // emits ftyp/moov. It is deliberately bounded; the old path could read
-      // tens of megabytes before Safari had accepted a single segment.
-      await conversion.execute({ until: INITIAL_OUTPUT_SECONDS });
       if (this.stopped) return;
       this.mime = await output.getMimeType();
       await opened;
@@ -363,7 +584,9 @@ export class StableRemuxStreamer {
         throw new Error("Media Source closed before its buffer was ready.");
       }
       if (!Source.isTypeSupported(this.mime)) {
-        throw new Error(`Safari does not support ${this.mime}.`);
+        throw new Error(
+          `This browser does not support ${this.mime} (planned ${plannedMime || "unknown"}).`,
+        );
       }
 
       const sourceBuffer = mediaSource.addSourceBuffer(this.mime);
@@ -373,32 +596,99 @@ export class StableRemuxStreamer {
       const duration = await input
         .getDurationFromMetadata(conversion.utilizedTracks)
         .catch(() => null);
-      if (duration && Number.isFinite(duration)) {
+      const durationHint = this.options.durationHintSeconds;
+      const stableDuration =
+        duration && Number.isFinite(duration) && duration > 0
+          ? duration
+          : durationHint && Number.isFinite(durationHint) && durationHint > 0
+            ? durationHint
+            : null;
+      if (stableDuration) {
+        this.durationSeconds = stableDuration;
         try {
-          mediaSource.duration = duration;
+          mediaSource.duration = stableDuration;
         } catch {
-          // Duration is cosmetic; an MMS implementation may own it.
+          // ManagedMediaSource implementations may own the duration.
         }
       }
+      this.restartConversion = async (startSeconds: number) => {
+        const sourceBuffer = this.buffer;
+        if (!sourceBuffer || !this.source || this.source.readyState !== "open")
+          throw new Error("The media buffer is no longer available.");
+
+        const generation = ++this.conversionGeneration;
+        const previous = this.conversion;
+        this.conversion = null;
+        if (previous && previous.state !== "done")
+          await previous.cancel().catch(() => undefined);
+        if (this.stopped || generation !== this.conversionGeneration) return;
+
+        await this.waitForBufferIdle(sourceBuffer);
+        if (this.stopped || generation !== this.conversionGeneration) return;
+        this.queue = [];
+        this.queuedBytes = 0;
+        this.evicting = false;
+        this.processedTime = 0;
+        this.outputStart = startSeconds;
+        this.segmentsAtLastProgress = this.appendedMediaSegments;
+        try {
+          sourceBuffer.abort();
+        } catch {
+          // ManagedSourceBuffer may already have reset its parser state.
+        }
+        if (sourceBuffer.buffered.length) {
+          const finalRange = sourceBuffer.buffered.end(
+            sourceBuffer.buffered.length - 1,
+          );
+          sourceBuffer.remove(
+            0,
+            Math.max(finalRange, this.durationSeconds || finalRange),
+          );
+          await this.waitForBufferIdle(sourceBuffer);
+        }
+        this.lastBufferedEnd = 0;
+        sourceBuffer.timestampOffset = startSeconds;
+
+        this.report("buffering", `Seeking to ${startSeconds.toFixed(0)}s…`);
+        const conversionInput = managed ? await indexedInput() : input;
+        const built = await buildConversion(
+          startSeconds,
+          generation,
+          conversionInput,
+        );
+        if (this.stopped || generation !== this.conversionGeneration) {
+          if (built.conversion.state !== "done")
+            await built.conversion.cancel().catch(() => undefined);
+          return;
+        }
+        const nextMime = await built.output.getMimeType();
+        if (nextMime !== this.mime)
+          throw new Error(`The stream changed codec while seeking (${nextMime}).`);
+        this.conversion = built.conversion;
+        this.element.currentTime = startSeconds;
+        this.pump();
+        void this.fillLoop(built.conversion, generation, startSeconds);
+      };
       this.pump();
       this.report("buffering", "Preparing the first playable fragment…");
-      void this.fillLoop();
+      void this.fillLoop(conversion, initialGeneration, 0);
     } catch (error) {
       this.fail(`The browser could not start the remuxed stream: ${errorMessage(error)}`);
     }
   }
 
-  private maybeQueueInit() {
-    if (this.initQueued || !this.ftyp || !this.moov) return;
-    this.initQueued = true;
-    this.enqueue(join(this.ftyp, this.moov), "initialization segment");
-    this.ftyp = null;
-    this.moov = null;
-  }
-
-  private enqueue(bytes: Uint8Array<ArrayBuffer>, label: string) {
-    if (this.stopped || this.failed) return;
-    this.queue.push({ bytes, label });
+  private enqueue(
+    bytes: Uint8Array<ArrayBuffer>,
+    label: string,
+    generation = this.conversionGeneration,
+  ) {
+    if (
+      this.stopped ||
+      this.failed ||
+      generation !== this.conversionGeneration
+    )
+      return;
+    this.queue.push({ bytes, label, generation });
     this.queuedBytes += bytes.byteLength;
     this.pump();
   }
@@ -420,8 +710,14 @@ export class StableRemuxStreamer {
       this.tryPlay();
       return;
     }
+    if (next.generation !== this.conversionGeneration) {
+      this.queuedBytes = Math.max(0, this.queuedBytes - next.bytes.byteLength);
+      this.pump();
+      return;
+    }
     this.queuedBytes -= next.bytes.byteLength;
     this.lastAppend = `${next.label} (${(next.bytes.byteLength / 1024).toFixed(0)} KB)`;
+    if (next.label.startsWith("fragment ")) this.appendedMediaSegments += 1;
     try {
       this.buffer.appendBuffer(next.bytes);
     } catch (error) {
@@ -434,7 +730,7 @@ export class StableRemuxStreamer {
         return;
       }
       this.fail(
-        `Safari rejected ${this.lastAppend}: ${errorMessage(error)} · ${this.rangeDescription()}`,
+        `The browser rejected ${this.lastAppend}: ${errorMessage(error)} · ${this.rangeDescription()}`,
       );
     }
   }
@@ -442,6 +738,23 @@ export class StableRemuxStreamer {
   private watchSourceBuffer(buffer: SourceBuffer) {
     const onUpdateEnd = () => {
       this.evicting = false;
+      const bufferedEnd = this.bufferedEnd();
+      if (bufferedEnd > this.lastBufferedEnd + 0.05) {
+        this.lastBufferedEnd = bufferedEnd;
+        this.segmentsAtLastProgress = this.appendedMediaSegments;
+      } else if (
+        shouldReportFragmentAppendStall(
+          this.appendedMediaSegments,
+          this.segmentsAtLastProgress,
+          bufferedEnd,
+          this.lastBufferedEnd,
+        )
+      ) {
+        this.fail(
+          `The browser accepted ${this.appendedMediaSegments} MP4 fragments but did not expose playable audio/video (${this.mime || "codec unknown"}). Try another source or an external player.`,
+        );
+        return;
+      }
       this.tryPlay();
       const ahead = this.bufferedAhead();
       this.report(
@@ -454,7 +767,7 @@ export class StableRemuxStreamer {
     };
     const onError = () => {
       this.fail(
-        `Safari rejected ${this.lastAppend} · ${mediaErrorMessage(this.element)} · ${this.rangeDescription()}`,
+        `The browser rejected ${this.lastAppend} · ${mediaErrorMessage(this.element)} · ${this.rangeDescription()}`,
       );
     };
     buffer.addEventListener("updateend", onUpdateEnd);
@@ -518,11 +831,19 @@ export class StableRemuxStreamer {
     });
   }
 
-  private async fillLoop() {
-    const conversion = this.conversion;
-    if (!conversion) return;
+  private async fillLoop(
+    conversion: Conversion,
+    generation: number,
+    outputStart: number,
+  ) {
     try {
-      while (!this.stopped && !this.failed && conversion.state !== "done") {
+      while (
+        !this.stopped &&
+        !this.failed &&
+        generation === this.conversionGeneration &&
+        this.conversion === conversion &&
+        conversion.state !== "done"
+      ) {
         this.pump();
         const ahead = this.bufferedAhead();
         const queueFull =
@@ -537,22 +858,38 @@ export class StableRemuxStreamer {
 
         const target = Math.max(
           this.processedTime + OUTPUT_STEP_SECONDS,
-          this.element.currentTime + this.targetAhead(),
+          Math.max(0, this.element.currentTime - outputStart) +
+            this.targetAhead(),
         );
         this.report(
           ahead > 0 ? "ready" : "buffering",
           `Remuxing · ${ahead.toFixed(1)}s buffered · ${(this.readBytes / 1024 / 1024).toFixed(1)} MB read`,
         );
-        await conversion.execute({ until: target });
+        await this.withTimeout(
+          conversion.execute({ until: target }),
+          CONVERSION_STEP_TIMEOUT_MS,
+          `The media host stalled while preparing playback near ${target.toFixed(0)} seconds.`,
+        );
         // Let SourceBuffer dispatch updateend before producing another window.
         await this.wait(0);
       }
 
-      if (this.stopped || this.failed) return;
-      while (this.queue.length || this.buffer?.updating) {
+      if (
+        this.stopped ||
+        this.failed ||
+        generation !== this.conversionGeneration ||
+        this.conversion !== conversion
+      )
+        return;
+      while (
+        generation === this.conversionGeneration &&
+        (this.queue.some((item) => item.generation === generation) ||
+          this.buffer?.updating)
+      ) {
         this.pump();
         await this.wait(50);
       }
+      if (generation !== this.conversionGeneration) return;
       if (this.source?.readyState === "open") {
         try {
           this.source.endOfStream();
@@ -562,9 +899,9 @@ export class StableRemuxStreamer {
       }
       this.report("ended", "The complete stream is buffered.");
     } catch (error) {
-      if (this.stopped) return;
+      if (this.stopped || generation !== this.conversionGeneration) return;
       this.fail(
-        `Remuxing stopped at ${this.processedTime.toFixed(1)}s: ${errorMessage(error)}. Try another source or an external player.`,
+        `Remuxing stopped at ${(outputStart + this.processedTime).toFixed(1)}s: ${errorMessage(error)}. Try another source or an external player.`,
       );
     }
   }
@@ -588,6 +925,47 @@ export class StableRemuxStreamer {
       // A detached SourceBuffer throws while WebKit is tearing MMS down.
     }
     return 0;
+  }
+
+  private bufferedEnd() {
+    try {
+      const ranges = this.buffer?.buffered;
+      if (!ranges?.length) return 0;
+      let end = 0;
+      for (let index = 0; index < ranges.length; index += 1) {
+        end = Math.max(end, ranges.end(index));
+      }
+      return end;
+    } catch {
+      return 0;
+    }
+  }
+
+  private isBuffered(targetSeconds: number) {
+    try {
+      const ranges = this.buffer?.buffered;
+      if (!ranges?.length) return false;
+      for (let index = 0; index < ranges.length; index += 1) {
+        if (
+          targetSeconds >= ranges.start(index) - 0.05 &&
+          targetSeconds <= ranges.end(index) - 0.05
+        )
+          return true;
+      }
+    } catch {
+      // A detached SourceBuffer is never seekable.
+    }
+    return false;
+  }
+
+  private async waitForBufferIdle(buffer: SourceBuffer) {
+    const startedAt = performance.now();
+    while (buffer.updating) {
+      if (this.stopped) throw new Error("Playback was closed.");
+      if (performance.now() - startedAt >= SOURCE_OPEN_TIMEOUT_MS)
+        throw new Error("The browser did not finish its previous media append.");
+      await this.wait(25);
+    }
   }
 
   private rangeDescription() {
@@ -643,9 +1021,39 @@ export class StableRemuxStreamer {
     if (this.stopped || this.failed) return;
     this.failed = true;
     this.report("error", message);
+    this.abortController.abort();
+    const conversion = this.conversion;
+    if (conversion && conversion.state !== "done") {
+      void conversion.cancel().catch(() => undefined);
+    }
+  }
+
+  private withTimeout<T>(
+    promise: Promise<T>,
+    milliseconds: number,
+    message: string,
+  ) {
+    return new Promise<T>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        this.abortController.abort();
+        reject(new Error(message));
+      }, milliseconds);
+      promise.then(
+        (value) => {
+          window.clearTimeout(timeout);
+          resolve(value);
+        },
+        (error) => {
+          window.clearTimeout(timeout);
+          reject(error);
+        },
+      );
+    });
   }
 
   private wait(milliseconds: number) {
-    return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+    return new Promise<void>((resolve) =>
+      window.setTimeout(resolve, milliseconds),
+    );
   }
 }

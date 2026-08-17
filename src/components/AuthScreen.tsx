@@ -40,7 +40,7 @@ export function AuthScreen({ onSession }: { onSession(session: Session): void })
       </form>
       {message && <div className="notice error">{message}</div>}
       <a className="text-button" href="https://nuvio.tv/account/signup?next=%2Faccount" target="_blank" rel="noreferrer">New to Nuvio? Create an account</a>
-      <small className="security-note">Your session stays on this device. No media passes through the Nuvio web host.</small>
+      <small className="security-note">Secure session mode: access tokens stay inside an isolated browser Worker. A rotating refresh credential keeps you signed in until you sign out. No media passes through the Nuvio web host.</small>
     </section>
   </main>;
 }

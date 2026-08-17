@@ -121,6 +121,17 @@ async function resolveTmdbId(
   return number(rows[0]?.id);
 }
 
+/** Resolve the identifier expected by Nuvio plugin getStreams handlers. */
+export async function resolvePluginTmdbId(
+  meta: Meta,
+  config: MetadataEnrichmentConfig["tmdb"],
+): Promise<string> {
+  const direct = tmdbIdFrom(meta.id);
+  if (direct) return String(direct);
+  if (!config.enabled || !config.apiKey) return meta.id;
+  return String((await resolveTmdbId(meta, config)) ?? meta.id);
+}
+
 function selectedLogo(rows: Json[], language: string): Json | undefined {
   const normalized = normalizeLanguage(language);
   const code = normalized.split("-")[0];

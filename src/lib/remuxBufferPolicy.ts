@@ -57,3 +57,22 @@ export function shouldReportNoAppendProgress(
     queuedSegments === 0
   );
 }
+
+/**
+ * SourceBuffer can report successful updateend events while declining to add
+ * a playable range (usually an unsupported or malformed track pairing). Do
+ * not keep downloading forever in that state: four complete media fragments
+ * without any forward movement is already conclusive.
+ */
+export function shouldReportFragmentAppendStall(
+  appendedSegments: number,
+  segmentsAtLastProgress: number,
+  bufferedEndSeconds: number,
+  lastBufferedEndSeconds: number,
+  segmentThreshold = 4,
+) {
+  return (
+    appendedSegments - segmentsAtLastProgress >= segmentThreshold &&
+    bufferedEndSeconds <= lastBufferedEndSeconds + 0.05
+  );
+}

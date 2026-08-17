@@ -1,4 +1,5 @@
 import type { ExternalPlayerMode } from "../types";
+import { safeHttpUrl } from "./security.ts";
 
 export const isAppleMobile = () =>
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
@@ -61,25 +62,29 @@ export function launchExternalPlayer(
   url: string,
   title: string,
 ) {
-  if (!/^https?:\/\//i.test(url)) {
-    window.location.href = url;
-    return;
-  }
-  if (mode === "copy") {
+  const safeUrl = safeHttpUrl(url);
+  if (!safeUrl) {
+    // Never navigate to an addon-supplied custom scheme (especially
+    // javascript:). Copying keeps unusual sources usable without executing
+    // them in the PWA origin.
     void copyStreamUrl(url);
     return;
   }
+  if (mode === "copy") {
+    void copyStreamUrl(safeUrl);
+    return;
+  }
   if (mode === "vlc") {
-    window.location.href = `vlc-x-callback://x-callback-url/stream?url=${encodeURIComponent(url)}`;
+    window.location.href = `vlc-x-callback://x-callback-url/stream?url=${encodeURIComponent(safeUrl)}`;
     return;
   }
   if (mode === "outplayer") {
-    window.location.href = `outplayer://${url}`;
+    window.location.href = `outplayer://${safeUrl}`;
     return;
   }
   if (mode === "infuse") {
-    window.location.href = infusePlaybackUrl(url, title);
+    window.location.href = infusePlaybackUrl(safeUrl, title);
     return;
   }
-  if (mode === "m3u") download(m3uFor(url, title), title, "m3u");
+  if (mode === "m3u") download(m3uFor(safeUrl, title), title, "m3u");
 }

@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="referrer" content="no-referrer" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src https: http:; script-src 'unsafe-inline' 'unsafe-eval'; script-src-attr 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <script>"use strict";let started=false;const token=decodeURIComponent(location.hash.slice(1));parent.postMessage({source:"nuvio-plugin-sandbox-ready",token},"*");addEventListener("message",event=>{const data=event.data;if(started||event.source!==parent||!data||data.source!=="nuvio-plugin-sandbox-run"||data.token!==token||typeof data.code!=="string")return;started=true;try{(0,eval)(data.code)}catch(error){parent.postMessage({source:"nuvio-plugin-sandbox",token,ok:false,value:error&&error.message?error.message:"Plugin script could not be parsed or started."},"*")}});</script>
+  </head>
+  <body></body>
+</html>

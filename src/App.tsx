@@ -2,24 +2,28 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  CalendarDays,
   ChevronRight,
   Eye,
   EyeOff,
   FlaskConical,
+  Info,
+  Plus,
   RefreshCw,
+  RotateCcw,
   X,
   Compass,
   Home,
   Library,
   LayoutGrid,
   Link2,
+  Lock,
   LogOut,
   Palette,
   Play,
   Puzzle,
   Search,
   Settings,
-  SlidersHorizontal,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -34,6 +38,8 @@ import {
 } from "react";
 import { AuthScreen } from "./components/AuthScreen";
 import { ContinueWatching } from "./components/ContinueWatching";
+import { ContextMenu } from "./components/ContextMenu";
+import { CalendarView } from "./components/Calendar";
 import { Details } from "./components/Details";
 import { Discover } from "./components/Discover";
 import { ExternalWatchPrompt } from "./components/ExternalWatchPrompt";
@@ -53,6 +59,7 @@ import {
   addToLibrary,
   loadCollections,
   loadHomeLayout,
+  pushHomeLayout,
   loadProgress,
   COLLECTION_KEY_PREFIX,
   type HomeLayout,
@@ -84,6 +91,7 @@ import {
   normalizeManifestUrl,
   resolveMeta,
   searchAddons,
+  type AddonSearchGroup,
 } from "./lib/addons";
 import {
   applyUpdate,
@@ -103,6 +111,7 @@ import {
   continueWatchingCandidates,
   watchKey,
   type WatchIndex,
+  type ContinueCard,
 } from "./lib/progress";
 import { useProgressiveList } from "./lib/useProgressiveList";
 import { useSwipeBack } from "./lib/useSwipeBack";
@@ -144,6 +153,7 @@ const nav: Array<{ key: NavKey; label: string; icon: typeof Home }> = [
   { key: "home", label: "Home", icon: Home },
   { key: "discover", label: "Discover", icon: Compass },
   { key: "library", label: "Library", icon: Library },
+  { key: "calendar", label: "Calendar", icon: CalendarDays },
   { key: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -207,6 +217,7 @@ const SETTINGS_CATEGORIES: Array<{
 ];
 
 const AMOLED_CACHE_KEY = "nuvio-web-amoled";
+const ACCENT_CACHE_KEY = "nuvio-web-accent";
 const WEB_DETAIL_SECTION_KEYS = [
   "EPISODES",
   "PRODUCTION",
@@ -230,6 +241,8 @@ const DETAIL_SECTION_LABELS: Record<
 // theme immediately avoids a flash of the wrong background on every launch.
 document.documentElement.dataset.theme =
   localStorage.getItem(AMOLED_CACHE_KEY) === "true" ? "amoled" : "default";
+document.documentElement.dataset.nuvioAccent =
+  localStorage.getItem(ACCENT_CACHE_KEY) ?? "white";
 
 export function App() {
   const [booting, setBooting] = useState(true);
@@ -238,6 +251,12 @@ export function App() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [addonRows, setAddonRows] = useState<AddonRow[]>([]);
   const [addons, setAddons] = useState<InstalledAddon[]>([]);
+  const addonRowsRef = useRef(addonRows);
+  addonRowsRef.current = addonRows;
+  const addonsRef = useRef(addons);
+  addonsRef.current = addons;
+  const addonWriteQueue = useRef<Promise<void>>(Promise.resolve());
+  const addonRevision = useRef(0);
   const [sections, setSections] = useState<CatalogSection[]>([]);
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [progress, setProgress] = useState<ProgressRow[]>([]);
@@ -266,6 +285,10 @@ export function App() {
   const hydratedProfileIndexRef = useRef<number | null>(null);
   const [collections, setCollections] = useState<Collection[]>([]);
   const [homeLayout, setHomeLayout] = useState<HomeLayout | null>(null);
+  const homeLayoutRef = useRef(homeLayout);
+  homeLayoutRef.current = homeLayout;
+  const homeLayoutWriteQueue = useRef<Promise<void>>(Promise.resolve());
+  const homeLayoutRevision = useRef(0);
   const [folder, setFolder] = useState<CollectionFolder | null>(null);
   // Raised after a hand-off to another player, which reports nothing back.
   const [externalWatch, setExternalWatch] = useState<{
@@ -291,6 +314,21 @@ export function App() {
   // render happens in a later, interruptible pass instead of blocking it.
   const deferredActive = useDeferredValue(active);
   const [selected, setSelected] = useState<Meta | null>(null);
+  const [detailLaunch, setDetailLaunch] = useState<{
+    videoId?: string;
+    openSources?: boolean;
+    startAtBeginning?: boolean;
+  } | null>(null);
+  const [titleMenu, setTitleMenu] = useState<{
+    item: Meta;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [continueMenu, setContinueMenu] = useState<{
+    card: ContinueCard;
+    x: number;
+    y: number;
+  } | null>(null);
   const [catalog, setCatalog] = useState<CatalogSection | null>(null);
   // The sub-views are deferred for the same reason as the tab: leaving "See
   // all" rebuilds every home row, and without this the tap registered nothing
@@ -309,6 +347,7 @@ export function App() {
     stream: Stream;
     meta: Meta;
     video?: Video;
+    startAtBeginning?: boolean;
   } | null>(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -321,7 +360,9 @@ export function App() {
   }, [message]);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Meta[]>([]);
+  const [searchGroups, setSearchGroups] = useState<AddonSearchGroup[]>([]);
   const [searching, setSearching] = useState(false);
+  const searchGeneration = useRef(0);
   const [hasUpdate, setHasUpdate] = useState(updateReady);
   useEffect(() => subscribeUpdate(() => setHasUpdate(true)), []);
   // Ask once at startup rather than waiting for the browser's own schedule,
@@ -353,8 +394,13 @@ export function App() {
     setFolder(null);
     setCatalog(null);
     setSelected(null);
+    setDetailLaunch(null);
+    setTitleMenu(null);
+    setContinueMenu(null);
     setQuery("");
     setResults([]);
+    setSearchGroups([]);
+    searchGeneration.current += 1;
     setSearching(false);
     setPlayback(null);
     setExternalWatch(null);
@@ -577,34 +623,102 @@ export function App() {
   }, [loadProfileData]);
   async function runSearch() {
     if (!query.trim()) return;
+    const request = ++searchGeneration.current;
     const generation = profileGeneration.current;
     const profileIndex = activeProfileIndexRef.current;
+    setResults([]);
+    setSearchGroups([]);
     setSearching(true);
     setActive("discover");
     try {
       const next = await searchAddons(query.trim(), addons);
       if (
+        request === searchGeneration.current &&
         generation === profileGeneration.current &&
         profileIndex === activeProfileIndexRef.current
-      )
-        setResults(next);
+      ) {
+        setResults(next.items);
+        setSearchGroups(next.groups);
+      }
     } finally {
       if (
+        request === searchGeneration.current &&
         generation === profileGeneration.current &&
         profileIndex === activeProfileIndexRef.current
       )
         setSearching(false);
     }
   }
-  async function updateAddons(next: AddonRow[]) {
+  async function updateAddons(
+    next: AddonRow[],
+    { refreshContent = false }: { refreshContent?: boolean } = {},
+  ) {
     if (!profile) return;
     if (hydratedProfileIndexRef.current !== profile.profileIndex) {
       setMessage("Wait for this profile to finish loading before changing addons.");
       return;
     }
-    setAddonRows(next);
-    await saveAddons(profile.profileIndex, next);
-    await loadProfileData();
+    const profileIndex = profile.profileIndex;
+    const generation = profileGeneration.current;
+    const revision = ++addonRevision.current;
+    const previousRows = addonRowsRef.current;
+    const previousAddons = addonsRef.current;
+    const normalized = next.map((row, sortOrder) => ({ ...row, sortOrder }));
+    const existing = new Map(
+      previousAddons.map((addon) => [normalizeManifestUrl(addon.url), addon]),
+    );
+    const optimistic = normalized.map((row) => ({
+      ...existing.get(normalizeManifestUrl(row.url)),
+      ...row,
+    })) as InstalledAddon[];
+
+    // The list moves now. Network persistence and manifest refresh happen
+    // behind it; waiting here made every arrow feel as if it had missed.
+    addonRowsRef.current = normalized;
+    addonsRef.current = optimistic;
+    setAddonRows(normalized);
+    setAddons(optimistic);
+
+    const write = addonWriteQueue.current
+      .catch(() => undefined)
+      .then(() => saveAddons(profileIndex, normalized));
+    addonWriteQueue.current = write.catch(() => undefined);
+    const installedTask = refreshContent
+      ? loadInstalledAddons(normalized)
+      : Promise.resolve(optimistic);
+    try {
+      const [, installed] = await Promise.all([write, installedTask]);
+      if (
+        generation !== profileGeneration.current ||
+        activeProfileIndexRef.current !== profileIndex ||
+        revision !== addonRevision.current
+      )
+        return;
+      addonsRef.current = installed;
+      setAddons(installed);
+      if (refreshContent) {
+        const home = await loadHome(installed, undefined, homeLayoutRef.current);
+        if (
+          generation === profileGeneration.current &&
+          activeProfileIndexRef.current === profileIndex &&
+          revision === addonRevision.current
+        )
+          setSections(home.sections);
+      }
+    } catch (error) {
+      if (
+        generation !== profileGeneration.current ||
+        activeProfileIndexRef.current !== profileIndex ||
+        revision !== addonRevision.current
+      )
+        throw error;
+      addonRowsRef.current = previousRows;
+      addonsRef.current = previousAddons;
+      setAddonRows(previousRows);
+      setAddons(previousAddons);
+      setMessage(error instanceof Error ? error.message : "Could not sync addons");
+      throw error;
+    }
   }
   async function addAddon(url: string) {
     const normalized = normalizeManifestUrl(url);
@@ -613,21 +727,24 @@ export function App() {
     await updateAddons([
       ...addonRows,
       { url: normalized, enabled: true, sortOrder: addonRows.length },
-    ]);
+    ], { refreshContent: true });
   }
   function toggleAddon(index: number) {
     void updateAddons(
       addonRows.map((row, rowIndex) =>
         rowIndex === index ? { ...row, enabled: !row.enabled } : row,
       ),
-    );
+      { refreshContent: true },
+    ).catch(() => undefined);
   }
   function moveAddon(index: number, direction: -1 | 1) {
     const destination = index + direction;
     if (destination < 0 || destination >= addonRows.length) return;
     const next = [...addonRows];
     [next[index], next[destination]] = [next[destination], next[index]];
-    void updateAddons(next.map((row, sortOrder) => ({ ...row, sortOrder })));
+    void updateAddons(next.map((row, sortOrder) => ({ ...row, sortOrder }))).catch(
+      () => undefined,
+    );
   }
   function removeAddon(index: number) {
     const addon = addons[index];
@@ -641,7 +758,8 @@ export function App() {
       addonRows
         .filter((_, rowIndex) => rowIndex !== index)
         .map((row, sortOrder) => ({ ...row, sortOrder })),
-    );
+      { refreshContent: true },
+    ).catch(() => undefined);
   }
   const webSettings = useMemo(
     () => readWebSettings(settingsBlob),
@@ -841,7 +959,9 @@ export function App() {
   }, [amoled]);
   useEffect(() => {
     const root = document.documentElement;
-    root.dataset.nuvioAccent = webSettings.selectedTheme.toLowerCase();
+    const accent = webSettings.selectedTheme.toLowerCase();
+    root.dataset.nuvioAccent = accent;
+    localStorage.setItem(ACCENT_CACHE_KEY, accent);
     root.dataset.navLayout = webSettings.desktopNavigationLayout.toLowerCase();
     root.dataset.navStyle = webSettings.navBarStyle.toLowerCase();
     root.dataset.posterLandscape = String(
@@ -862,6 +982,50 @@ export function App() {
     );
   }, [webSettings]);
 
+  const saveHomeLayout = useCallback(
+    async (next: HomeLayout) => {
+      if (!profile) return;
+      const profileIndex = profile.profileIndex;
+      const generation = profileGeneration.current;
+      const revision = ++homeLayoutRevision.current;
+      homeLayoutRef.current = next;
+      setHomeLayout(next);
+      const write = homeLayoutWriteQueue.current
+        .catch(() => undefined)
+        .then(() => pushHomeLayout(profileIndex, next));
+      homeLayoutWriteQueue.current = write.then(() => undefined, () => undefined);
+      try {
+        const saved = await write;
+        if (
+          generation !== profileGeneration.current ||
+          activeProfileIndexRef.current !== profileIndex ||
+          revision !== homeLayoutRevision.current
+        )
+          return;
+        homeLayoutRef.current = saved;
+        setHomeLayout(saved);
+        setMessage("Home layout synced.");
+      } catch (error) {
+        if (
+          generation !== profileGeneration.current ||
+          activeProfileIndexRef.current !== profileIndex ||
+          revision !== homeLayoutRevision.current
+        )
+          return;
+        const restored = await loadHomeLayout(profileIndex).catch(() => null);
+        if (restored) {
+          homeLayoutRef.current = restored;
+          setHomeLayout(restored);
+        }
+        setMessage(
+          error instanceof Error ? error.message : "Could not sync Home layout",
+        );
+        throw error;
+      }
+    },
+    [profile],
+  );
+
   /**
    * Catalogs and collections in one list, ordered the way Nuvio stores them.
    *
@@ -875,10 +1039,14 @@ export function App() {
       | { key: string; kind: "catalog"; section: CatalogSection }
       | { key: string; kind: "collection"; collection: Collection };
     const rows: Row[] = [
-      ...sections.map(
-        (section) =>
-          ({ key: section.key, kind: "catalog", section }) satisfies Row,
-      ),
+      ...sections.map((section) => {
+        const customTitle = homeLayout?.customTitleOf.get(section.key);
+        return {
+          key: section.key,
+          kind: "catalog",
+          section: customTitle ? { ...section, name: customTitle } : section,
+        } satisfies Row;
+      }),
       ...collections
         .filter(
           (collection) =>
@@ -905,6 +1073,17 @@ export function App() {
         : (homeLayout.orderOf.get(row.key) ?? Number.MAX_SAFE_INTEGER);
     return [...rows].sort((a, b) => rank(a) - rank(b));
   }, [collections, homeLayout, sections]);
+  const homeLayoutLabels = useMemo(
+    () =>
+      new Map<string, string>([
+        ...sections.map((section) => [section.key, section.name] as const),
+        ...collections.map(
+          (collection) =>
+            [`${COLLECTION_KEY_PREFIX}${collection.id}`, collection.title] as const,
+        ),
+      ]),
+    [collections, sections],
+  );
 
   /**
    * Stores a resume point for whatever is playing.
@@ -1106,6 +1285,40 @@ export function App() {
       );
     }
   }
+  const openDetails = useCallback((item: Meta) => {
+    setDetailLaunch(null);
+    setSelected(item);
+  }, []);
+
+  const openContinueSources = useCallback(
+    (card: ContinueCard, startAtBeginning: boolean) => {
+      setDetailLaunch({
+        videoId: card.video?.id,
+        openSources: true,
+        startAtBeginning,
+      });
+      setSelected(
+        card.video
+          ? { ...card.item, selectedVideoId: card.video.id }
+          : card.item,
+      );
+    },
+    [],
+  );
+
+  const dismissContinueCard = useCallback(
+    (card: ContinueCard) => {
+      const dismissKey = `${card.item.id}|${card.video?.season ?? -1}|${card.video?.episode ?? -1}`;
+      const dismissed = new Set(webSettings.continueWatching.dismissedNextUpKeys);
+      dismissed.add(dismissKey);
+      void updateContinueWatchingSetting({ dismissedNextUpKeys: [...dismissed] });
+      // A resumable title is not a "next up" row, so also clear its resume
+      // point exactly as Nuvio's Remove action does.
+      if (!card.nextUp && card.progress)
+        void toggleWatched(card.item, card.video, false);
+    },
+    [updateContinueWatchingSetting, webSettings.continueWatching.dismissedNextUpKeys],
+  );
 
   const continueItems = useMemo(
     () =>
@@ -1227,14 +1440,16 @@ export function App() {
             addons={addons}
             index={watchIndex}
             onBack={() => setFolder(null)}
-            onOpen={setSelected}
+            onOpen={openDetails}
+            onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
           />
         ) : deferredCatalog ? (
           <CatalogView
             section={deferredCatalog}
             index={watchIndex}
             onBack={() => setCatalog(null)}
-            onOpen={setSelected}
+            onOpen={openDetails}
+            onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
           />
         ) : deferredActive === "home" ? (
           <HomeView
@@ -1243,7 +1458,9 @@ export function App() {
             continueItems={continueItems}
             continueSettings={webSettings.continueWatching}
             index={watchIndex}
-            onOpen={setSelected}
+            onOpen={openDetails}
+            onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
+            onContinueMenu={(card, x, y) => setContinueMenu({ card, x, y })}
             onSeeAll={setCatalog}
             onOpenFolder={setFolder}
           />
@@ -1253,13 +1470,25 @@ export function App() {
             index={watchIndex}
             query={query}
             results={results}
-            onOpen={setSelected}
+            resultGroups={searchGroups}
+            searchPending={searching}
+            onOpen={openDetails}
+            onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
           />
         ) : deferredActive === "library" ? (
           <LibraryView
             items={library}
             index={watchIndex}
-            onOpen={setSelected}
+            onOpen={openDetails}
+            onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
+          />
+        ) : deferredActive === "calendar" ? (
+          <CalendarView
+            items={library}
+            addons={addons}
+            enrichment={metadataEnrichment}
+            scope={`${profile?.profileIndex ?? 0}:${addons.map((addon) => `${addon.enabled}:${addon.url}`).join("|")}`}
+            onOpen={openDetails}
           />
         ) : deferredActive === "remuxLab" ? (
           <RemuxLab onBack={() => setActive("settings")} />
@@ -1288,6 +1517,9 @@ export function App() {
             profile={profile}
             settings={webSettings}
             settingsReady={settingsBlob != null}
+            homeLayout={homeLayout}
+            homeLayoutLabels={homeLayoutLabels}
+            onHomeLayout={saveHomeLayout}
             onTypedSetting={updateTypedSetting}
             onPosterSetting={updatePosterSetting}
             onContinueWatchingSetting={updateContinueWatchingSetting}
@@ -1320,6 +1552,7 @@ export function App() {
               0,
               nav.findIndex((item) => item.key === active),
             ),
+            "--nav-count": nav.length,
           } as CSSProperties
         }
       >
@@ -1365,6 +1598,7 @@ export function App() {
           {...playback}
           settings={webSettings.player}
           startPositionMs={(() => {
+            if (playback.startAtBeginning) return 0;
             const row = watchIndex.progress.get(
               watchKey(
                 playback.meta.id,
@@ -1383,6 +1617,51 @@ export function App() {
           }
         />
       )}
+      {titleMenu && (() => {
+        const present = library.some(
+          (item) => item.id === titleMenu.item.id && item.type === titleMenu.item.type,
+        );
+        const watched = watchIndex.watched.has(watchKey(titleMenu.item.id));
+        return (
+          <ContextMenu
+            x={titleMenu.x}
+            y={titleMenu.y}
+            onClose={() => setTitleMenu(null)}
+            items={[
+              { label: "View details", icon: <Info size={18} />, onSelect: () => openDetails(titleMenu.item) },
+              {
+                label: present ? "Remove from library" : "Add to library",
+                icon: present ? <Trash2 size={18} /> : <Plus size={18} />,
+                onSelect: () => void toggleLibrary(titleMenu.item),
+              },
+              {
+                label: watched ? "Mark as unwatched" : "Mark as watched",
+                icon: watched ? <EyeOff size={18} /> : <Eye size={18} />,
+                onSelect: () => void toggleWatched(titleMenu.item, undefined, !watched),
+              },
+            ]}
+          />
+        );
+      })()}
+      {continueMenu && (
+        <ContextMenu
+          x={continueMenu.x}
+          y={continueMenu.y}
+          onClose={() => setContinueMenu(null)}
+          items={[
+            {
+              label: "Go to details",
+              icon: <Info size={18} />,
+              onSelect: () => openDetails(continueMenu.card.video
+                ? { ...continueMenu.card.item, selectedVideoId: continueMenu.card.video.id }
+                : continueMenu.card.item),
+            },
+            { label: "Play manually", icon: <Play size={18} />, onSelect: () => openContinueSources(continueMenu.card, false) },
+            { label: "Start from beginning", icon: <RotateCcw size={18} />, onSelect: () => openContinueSources(continueMenu.card, true) },
+            { label: "Remove", icon: <Trash2 size={18} />, danger: true, onSelect: () => dismissContinueCard(continueMenu.card) },
+          ]}
+        />
+      )}
       {selected && (
         <Details
           seed={selected}
@@ -1392,11 +1671,16 @@ export function App() {
           streamBadgeSettings={webSettings.streamBadges}
           metaScreenSettings={webSettings.metaScreen}
           watchIndex={watchIndex}
+          initialVideoId={detailLaunch?.videoId}
+          openSourcesOnLoad={detailLaunch?.openSources}
           onSetWatched={toggleWatched}
           inLibrary={library.some(
             (item) => item.id === selected.id && item.type === selected.type,
           )}
-          onClose={() => setSelected(null)}
+          onClose={() => {
+            setSelected(null);
+            setDetailLaunch(null);
+          }}
           onLibrary={toggleLibrary}
           onPlay={(stream, meta, video) => {
             const url = stream.url || stream.externalUrl;
@@ -1425,7 +1709,12 @@ export function App() {
               setExternalWatch({ meta, video });
               return;
             }
-            setPlayback({ stream, meta, video });
+            setPlayback({
+              stream,
+              meta,
+              video,
+              startAtBeginning: detailLaunch?.startAtBeginning,
+            });
           }}
         />
       )}
@@ -1455,6 +1744,8 @@ function HomeView({
   onOpen,
   onSeeAll,
   onOpenFolder,
+  onMenu,
+  onContinueMenu,
 }: {
   heroItems: Meta[];
   rows: HomeRow[];
@@ -1464,6 +1755,8 @@ function HomeView({
   onOpen(item: Meta): void;
   onSeeAll(section: CatalogSection): void;
   onOpenFolder(folder: CollectionFolder): void;
+  onMenu(item: Meta, x: number, y: number): void;
+  onContinueMenu(card: ContinueCard, x: number, y: number): void;
 }) {
   const { visible } = useProgressiveList(rows, {
     resetKey: "home",
@@ -1472,12 +1765,13 @@ function HomeView({
   });
   return (
     <>
-      <Hero items={heroItems} onOpen={onOpen} />
+      <Hero items={heroItems} onOpen={onOpen} onMenu={onMenu} />
       {continueItems.length > 0 && (
         <ContinueWatching
           cards={continueItems}
           settings={continueSettings}
           onOpen={onOpen}
+          onMenu={onContinueMenu}
         />
       )}
       {visible.map((row) =>
@@ -1493,6 +1787,7 @@ function HomeView({
             section={row.section}
             index={index}
             onOpen={onOpen}
+            onMenu={onMenu}
             onSeeAll={() => onSeeAll(row.section)}
           />
         ),
@@ -1505,10 +1800,12 @@ function LibraryView({
   items,
   index,
   onOpen,
+  onMenu,
 }: {
   items: LibraryItem[];
   index: WatchIndex;
   onOpen(item: Meta): void;
+  onMenu(item: Meta, x: number, y: number): void;
 }) {
   const [tab, setTab] = useState<"all" | "movie" | "series">("all");
   const counts = useMemo(() => {
@@ -1566,6 +1863,7 @@ function LibraryView({
               item={item}
               index={index}
               onOpen={onOpen}
+              onMenu={onMenu}
             />
           ))}
         </div>
@@ -1579,11 +1877,13 @@ function CatalogView({
   index,
   onBack,
   onOpen,
+  onMenu,
 }: {
   section: CatalogSection;
   index: WatchIndex;
   onBack(): void;
   onOpen(item: Meta): void;
+  onMenu(item: Meta, x: number, y: number): void;
 }) {
   const [items, setItems] = useState<Meta[]>(section.items);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -1664,6 +1964,7 @@ function CatalogView({
             item={item}
             index={index}
             onOpen={onOpen}
+            onMenu={onMenu}
           />
         ))}
       </div>
@@ -1769,58 +2070,97 @@ function AddonSettings({
         <button className="primary">Install</button>
       </form>
       {error && <div className="notice error">{error}</div>}
-      <div className="setting-card">
-        <header>
-          <h2>Installed addons</h2>
-          <button className="secondary" onClick={onRefresh}>
-            Refresh
-          </button>
-        </header>
-        {addons.map((addon, index) => (
-          <article className="addon-row" key={`${addon.url}:${index}`}>
-            {addon.manifest?.logo ? (
-              <img src={addon.manifest.logo} alt="" />
-            ) : (
-              <span>
-                <Puzzle />
-              </span>
-            )}
-            <div>
-              <strong>
-                {addon.manifest?.name || addon.name || "Unavailable addon"}
-              </strong>
-              <small>
-                {addon.error ||
-                  `${addon.manifest?.catalogs?.length ?? 0} catalogs · ${addon.manifest?.version ?? "Unknown version"}`}
-              </small>
-              <code>{addon.url}</code>
-            </div>
-            <div className="addon-controls">
-              {(addon.manifest?.behaviorHints?.configurable || addon.manifest?.behaviorHints?.configurationRequired) && (
-                <button
-                  className="addon-action"
-                  title="Configure addon"
-                  aria-label={`Configure ${addon.manifest?.name || addon.name || "addon"}`}
-                  onClick={() => window.open(addonConfigureUrl(addon.url), "_blank", "noopener,noreferrer")}
-                >
-                  <SlidersHorizontal />
-                </button>
+      <div className="addon-list-heading">
+        <h2>Installed addons</h2>
+        <button className="secondary" onClick={onRefresh}>
+          Refresh
+        </button>
+      </div>
+      <div className="addon-card-list">
+        {addons.map((addon, index) => {
+          const label = addon.manifest?.name || addon.name || "Unavailable addon";
+          const enabled = rows[index]?.enabled ?? false;
+          // A manifest lists resources either as bare names or as objects.
+          const resources = (addon.manifest?.resources ?? []).map((resource) =>
+            typeof resource === "string" ? resource : resource.name,
+          );
+          const types = addon.manifest?.types ?? [];
+          const configurable =
+            addon.manifest?.behaviorHints?.configurable ||
+            addon.manifest?.behaviorHints?.configurationRequired;
+          return (
+            <article
+              className={enabled ? "addon-card" : "addon-card is-disabled"}
+              key={`${addon.url}:${index}`}
+            >
+              <header className="addon-card-head">
+                {addon.manifest?.logo ? (
+                  <img src={addon.manifest.logo} alt="" />
+                ) : (
+                  <span className="addon-card-icon">
+                    <Puzzle />
+                  </span>
+                )}
+                <div>
+                  <strong>{label}</strong>
+                  <small>
+                    {addon.manifest?.version
+                      ? `Version ${addon.manifest.version}`
+                      : "Unknown version"}
+                  </small>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    aria-label={`Enable ${label}`}
+                    checked={enabled}
+                    onChange={() => onToggle(index)}
+                  />
+                  <i />
+                </label>
+              </header>
+              <div className="addon-card-actions">
+                <button className="addon-action reorder-action" title="Move up" aria-label="Move addon up" disabled={index === 0} onClick={() => onMove(index, -1)}><ArrowUp /></button>
+                <button className="addon-action reorder-action" title="Move down" aria-label="Move addon down" disabled={index === rows.length - 1} onClick={() => onMove(index, 1)}><ArrowDown /></button>
+                <button className="addon-action refresh-icon" title="Refresh addon" aria-label={`Refresh ${label}`} onClick={onRefresh}><RefreshCw /></button>
+                {configurable && (
+                  <button
+                    className="addon-action"
+                    title="Configure addon"
+                    aria-label={`Configure ${label}`}
+                    onClick={() => window.open(addonConfigureUrl(addon.url), "_blank", "noopener,noreferrer")}
+                  >
+                    <Settings />
+                  </button>
+                )}
+                <button className="addon-action danger-icon" title="Remove" aria-label={`Remove ${label}`} onClick={() => {
+                  if (window.confirm(`Remove ${label}? Its catalogs and streams will stop appearing.`))
+                    onRemove(index);
+                }}><Trash2 /></button>
+              </div>
+              <div className="addon-card-badges">
+                <em>{enabled ? "Active" : "Disabled"}</em>
+                <em>{resources.length} resource{resources.length === 1 ? "" : "s"}</em>
+                <em>{addon.manifest?.catalogs?.length ?? 0} catalog{(addon.manifest?.catalogs?.length ?? 0) === 1 ? "" : "s"}</em>
+                {configurable && <em>Configurable</em>}
+                {addon.error && <em className="bad">Unreachable</em>}
+              </div>
+              {/* The description says what the addon is for; the URL said only
+                  where it lives, which is not what you pick an addon by. */}
+              {addon.manifest?.description && (
+                <p className="addon-card-description">{addon.manifest.description}</p>
               )}
-              <button className="addon-action" title="Refresh addon" aria-label={`Refresh ${addon.manifest?.name || addon.name || "addon"}`} onClick={onRefresh}><RefreshCw /></button>
-              <button className="addon-action" title="Move up" aria-label="Move addon up" disabled={index === 0} onClick={() => onMove(index, -1)}><ArrowUp /></button>
-              <button className="addon-action" title="Move down" aria-label="Move addon down" disabled={index === rows.length - 1} onClick={() => onMove(index, 1)}><ArrowDown /></button>
-              <button className="addon-action danger-icon" title="Remove" aria-label={`Remove ${addon.manifest?.name || addon.name || "addon"}`} onClick={() => onRemove(index)}><Trash2 /></button>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  checked={rows[index]?.enabled ?? false}
-                  onChange={() => onToggle(index)}
-                />
-                <i />
-              </label>
-            </div>
-          </article>
-        ))}
+              {(types.length > 0 || resources.length > 0) && (
+                <small className="addon-card-meta">
+                  {types.map((type) => type.charAt(0).toUpperCase() + type.slice(1)).join(" / ")}
+                  {types.length > 0 && resources.length > 0 ? " • " : ""}
+                  {resources.join(", ")}
+                </small>
+              )}
+              {addon.error && <p className="addon-card-error">{addon.error}</p>}
+            </article>
+          );
+        })}
       </div>
     </>
   );
@@ -1943,6 +2283,153 @@ function SettingToggle({
   );
 }
 
+function HomeLayoutSettings({
+  layout,
+  labels,
+  disabled,
+  onChange,
+}: {
+  layout: HomeLayout | null;
+  labels: Map<string, string>;
+  disabled?: boolean;
+  onChange(next: HomeLayout): Promise<void>;
+}) {
+  const [error, setError] = useState<string | null>(null);
+
+  const rebuild = useCallback(
+    (
+      items: HomeLayout["items"],
+      patch: Partial<Pick<HomeLayout, "showCatalogType" | "hideUnreleasedContent">> = {},
+    ): HomeLayout => ({
+      ...(layout as HomeLayout),
+      ...patch,
+      items,
+      orderOf: new Map(items.map((item, index) => [item.key, index])),
+      enabledOf: new Map(items.map((item) => [item.key, item.enabled])),
+      customTitleOf: new Map(
+        items
+          .filter((item) => item.customTitle.trim())
+          .map((item) => [item.key, item.customTitle.trim()]),
+      ),
+    }),
+    [layout],
+  );
+
+  async function apply(next: HomeLayout) {
+    setError(null);
+    try {
+      await onChange(next);
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : "Could not sync Home layout",
+      );
+    }
+  }
+
+  if (!layout)
+    return <div className="home-layout-loading"><i className="mini-spinner" /> Loading Home layout…</div>;
+
+  return (
+    <>
+      <SettingToggle
+        title="Show catalog type"
+        description="Append Movies, Series, or another media type to catalog names."
+        checked={layout.showCatalogType}
+        disabled={disabled}
+        onChange={(showCatalogType) =>
+          void apply(rebuild(layout.items, { showCatalogType }))
+        }
+      />
+      <SettingToggle
+        title="Hide unreleased content"
+        description="Hide catalog titles whose known release date is still in the future."
+        checked={layout.hideUnreleasedContent}
+        disabled={disabled}
+        onChange={(hideUnreleasedContent) =>
+          void apply(rebuild(layout.items, { hideUnreleasedContent }))
+        }
+      />
+      {error && <p className="addon-card-error">{error}</p>}
+      <details className="home-layout-disclosure">
+        <summary>
+          <span>
+            <strong>Catalogs &amp; collections</strong>
+            <small>{layout.items.length} Home sections</small>
+          </span>
+          <ChevronRight aria-hidden="true" />
+        </summary>
+        <div className="home-layout-list-web">
+          {layout.items.map((item, index) => (
+            <div className={item.enabled ? "" : "is-hidden"} key={item.key}>
+              <span className="home-layout-copy">
+                <strong>
+                  {item.customTitle.trim() || labels.get(item.key) || String(item.raw.catalog_id ?? item.raw.collection_id ?? item.key)}
+                </strong>
+                <small>{item.isCollection ? "Collection" : "Catalog"}</small>
+              </span>
+              <label className="home-layout-title-input">
+                <span>Custom title</span>
+                <input
+                  key={`${item.key}:${item.customTitle}`}
+                  defaultValue={item.customTitle}
+                  disabled={disabled}
+                  placeholder="Default"
+                  onBlur={(event) => {
+                    const customTitle = event.currentTarget.value.trim();
+                    if (customTitle === item.customTitle) return;
+                    const items = layout.items.map((entry, row) =>
+                      row === index ? { ...entry, customTitle } : entry,
+                    );
+                    void apply(rebuild(items));
+                  }}
+                />
+              </label>
+              <div className="home-layout-actions">
+                <button
+                  type="button"
+                  className="icon-button reorder-action"
+                  title="Move up"
+                  disabled={disabled || index === 0}
+                  onClick={() => {
+                    const items = [...layout.items];
+                    [items[index - 1], items[index]] = [items[index], items[index - 1]];
+                    void apply(rebuild(items));
+                  }}
+                ><ArrowUp /></button>
+                <button
+                  type="button"
+                  className="icon-button reorder-action"
+                  title="Move down"
+                  disabled={disabled || index === layout.items.length - 1}
+                  onClick={() => {
+                    const items = [...layout.items];
+                    [items[index], items[index + 1]] = [items[index + 1], items[index]];
+                    void apply(rebuild(items));
+                  }}
+                ><ArrowDown /></button>
+                <label className="switch" title={item.enabled ? "Visible on Home" : "Hidden from Home"}>
+                  <input
+                    type="checkbox"
+                    checked={item.enabled}
+                    disabled={disabled}
+                    onChange={(event) => {
+                      const items = layout.items.map((entry, row) =>
+                        row === index ? { ...entry, enabled: event.target.checked } : entry,
+                      );
+                      void apply(rebuild(items));
+                    }}
+                  />
+                  <i />
+                </label>
+              </div>
+            </div>
+          ))}
+        </div>
+      </details>
+    </>
+  );
+}
+
 const LANGUAGE_OPTIONS = [
   ["en", "English"],
   ["es", "Spanish"],
@@ -2039,6 +2526,9 @@ function SettingsPage({
   profile,
   settings,
   settingsReady,
+  homeLayout,
+  homeLayoutLabels,
+  onHomeLayout,
   onTypedSetting,
   onPosterSetting,
   onContinueWatchingSetting,
@@ -2065,6 +2555,9 @@ function SettingsPage({
   profile: Profile | null;
   settings: WebSettings;
   settingsReady: boolean;
+  homeLayout: HomeLayout | null;
+  homeLayoutLabels: Map<string, string>;
+  onHomeLayout(next: HomeLayout): Promise<void>;
   onTypedSetting(
     feature: string,
     key: string,
@@ -2109,6 +2602,20 @@ function SettingsPage({
     };
   }, [closeMobilePanel, mobilePanelOpen]);
 
+  // Each settings page starts at its own top. Swapping the category only
+  // replaces the content — the document on desktop and the panel on mobile
+  // both keep whatever offset they had, so opening a short page from halfway
+  // down a long one landed below its own heading.
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+    if (mobilePanelRef.current) {
+      mobilePanelRef.current.scrollTop = 0;
+      mobilePanelRef.current
+        .querySelector<HTMLElement>(".mobile-settings-panel-content")
+        ?.scrollTo({ top: 0 });
+    }
+  }, [category, mobilePanelOpen]);
+
   const openMobileCategory = (next: SettingsCategory) => {
     setCategory(next);
     setMobilePanelOpen(true);
@@ -2144,16 +2651,20 @@ function SettingsPage({
         This preview keeps media traffic off the Nuvio host and uses the browser
         whenever possible.
       </p>
+      <div className="settings-desktop-layout">
       <nav className="settings-category-nav" aria-label="Settings categories">
-        {SETTINGS_CATEGORIES.map(({ key, label }) => (
+        {SETTINGS_CATEGORIES.map(({ key, label, icon: Icon }) => (
           <button
             key={key}
             type="button"
+            title={label}
+            aria-label={label}
             className={category === key ? "active" : ""}
             aria-current={category === key ? "page" : undefined}
             onClick={() => setCategory(key)}
           >
-            {label}
+            <Icon />
+            <span>{label}</span>
           </button>
         ))}
       </nav>
@@ -2226,21 +2737,44 @@ function SettingsPage({
         hidden={category !== "addons"}
       >
         <div className="settings-category-heading">
-          <h2>Addons</h2>
+          <h2>Content & discovery</h2>
           <p>
-            Synced with this Nuvio profile. Catalog and metadata requests go
-            directly from this device to each Stremio addon.
+            Manage the Stremio addons used for catalogs, metadata, subtitles,
+            and streams. Browser plugin providers are disabled for now.
           </p>
         </div>
-        <AddonSettings
-          addons={addons}
-          rows={addonRows}
-          onToggle={onToggleAddon}
-          onMove={onMoveAddon}
-          onRemove={onRemoveAddon}
-          onAdd={onAddAddon}
-          onRefresh={onRefreshAddons}
-        />
+        <div className="content-discovery-tabs" role="tablist" aria-label="Content source type">
+          <button
+            type="button"
+            role="tab"
+            aria-selected="true"
+            className="active"
+          >
+            <Puzzle /> Addons
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-disabled="true"
+            className="is-locked"
+            disabled
+            title="Plugins are unavailable in the web app"
+          >
+            <Lock /> Plugins <small>Unavailable</small>
+          </button>
+        </div>
+        <div>
+          <AddonSettings
+            addons={addons}
+            rows={addonRows}
+            onToggle={onToggleAddon}
+            onMove={onMoveAddon}
+            onRemove={onRemoveAddon}
+            onAdd={onAddAddon}
+            onRefresh={onRefreshAddons}
+          />
+        </div>
       </div>
       <div
         className="setting-card integrations-card settings-category-card"
@@ -2499,6 +3033,24 @@ function SettingsPage({
           checked={settings.poster.hideLabelsEnabled}
           disabled={!settingsReady}
           onChange={(next) => onPosterSetting({ hideLabelsEnabled: next })}
+        />
+      </div>
+      <div
+        className="setting-card settings-category-card"
+        hidden={category !== "home"}
+      >
+        <header>
+          <h2>Home layout</h2>
+          <span>Shared with Nuvio</span>
+        </header>
+        <p>
+          Reorder, rename, show, or hide synced catalogs and collections.
+        </p>
+        <HomeLayoutSettings
+          layout={homeLayout}
+          labels={homeLayoutLabels}
+          disabled={!profile}
+          onChange={onHomeLayout}
         />
       </div>
       <div
@@ -3147,6 +3699,7 @@ function SettingsPage({
       </div>
         </div>
       </section>
+      </div>
     </section>
   );
 }

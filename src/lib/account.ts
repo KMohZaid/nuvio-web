@@ -7,11 +7,12 @@ import type {
   LibraryItem,
   Meta,
   Profile,
+  PluginRow,
   ProgressRow,
   Session,
   WatchedItem,
 } from "../types";
-import { deleteValue, getValue, setValue } from "./idb";
+import { setValue } from "./idb";
 import {
   blobRawValue,
   blobStringPayload,
@@ -43,141 +44,55 @@ export {
 export type { SettingsBlob, SyncPreferenceType, SyncPreferenceValue };
 
 const CONFIG_KEY = "backend-config";
-const REFRESH_KEY = "refresh-session";
-const AUTH_LOCK_KEY = "nuvio-web-auth-session";
-const AUTH_CHANNEL_NAME = "nuvio-web-auth-session-v1";
 const CLIENT_ID = `nuvio-web-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
-const TAB_ID = `tab-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
 let activeSession: Session | null = null;
-let sessionGeneration = 0;
-let sessionAbortController = new AbortController();
-let refreshFlight: { generation: number; promise: Promise<string> } | null =
-  null;
 
-type StoredRefreshSession = {
-  backendUrl: string;
-  refreshToken: string;
-  /** Shared only within this origin so another tab can reuse a rotation. */
-  accessToken?: string;
-  userId?: string;
-  email?: string;
-  updatedAt?: number;
-};
-
-type AuthChannelMessage =
-  | { source: string; type: "invalidate" }
+type VaultCommand =
+  | { type: "signIn"; backend: BackendConfig; email: string; password: string }
+  | { type: "signOut" }
+  | { type: "restore" }
   | {
-      source: string;
-      type: "token";
-      backendUrl: string;
-      accessToken: string;
-      userId: string;
-      email?: string;
+      type: "request";
+      path: string;
+      init: { method?: string; body?: string; headers?: Record<string, string> };
     };
-type AuthChannelPayload =
-  | { type: "invalidate" }
-  | {
-      type: "token";
-      backendUrl: string;
-      accessToken: string;
-      userId: string;
-      email?: string;
-    };
+type VaultResponse =
+  | { id: number; ok: true; value: unknown }
+  | { id: number; ok: false; error: string };
+const tokenVault = new Worker(
+  new URL("../workers/authWorker.ts", import.meta.url),
+  { type: "module", name: "nuvio-token-vault" },
+);
+let vaultMessageId = 0;
+const vaultPending = new Map<
+  number,
+  { resolve(value: unknown): void; reject(error: Error): void }
+>();
 
-class BackendRequestError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
-    super(message);
-    this.name = "BackendRequestError";
-  }
-}
-
-class StaleSessionError extends Error {
-  constructor() {
-    super("The Nuvio session changed while this request was running.");
-    this.name = "StaleSessionError";
-  }
-}
-
-class InvalidSessionPayloadError extends Error {
-  constructor(message = "The backend did not return a usable session.") {
-    super(message);
-    this.name = "InvalidSessionPayloadError";
-  }
-}
-
-const authChannel =
-  typeof globalThis.BroadcastChannel === "function"
-    ? new BroadcastChannel(AUTH_CHANNEL_NAME)
-    : null;
-
-function broadcastAuth(message: AuthChannelPayload): void {
-  authChannel?.postMessage({ ...message, source: TAB_ID });
-}
-
-function invalidateLocalSession(): number {
-  sessionAbortController.abort();
-  sessionAbortController = new AbortController();
-  sessionGeneration += 1;
+tokenVault.addEventListener("message", (event: MessageEvent<VaultResponse>) => {
+  const pending = vaultPending.get(event.data.id);
+  if (!pending) return;
+  vaultPending.delete(event.data.id);
+  if (event.data.ok) pending.resolve(event.data.value);
+  else pending.reject(new Error(event.data.error));
+});
+tokenVault.addEventListener("error", () => {
+  for (const pending of vaultPending.values())
+    pending.reject(new Error("The secure session worker stopped unexpectedly."));
+  vaultPending.clear();
   activeSession = null;
-  refreshFlight = null;
-  return sessionGeneration;
-}
-
-function invalidateSessionAcrossTabs(): number {
-  const generation = invalidateLocalSession();
-  broadcastAuth({ type: "invalidate" });
-  return generation;
-}
-
-function assertCurrentGeneration(generation: number): void {
-  if (generation !== sessionGeneration) throw new StaleSessionError();
-}
-
-authChannel?.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const message = event.data as Partial<AuthChannelMessage> | null;
-  if (!message || message.source === TAB_ID) return;
-  if (message.type === "invalidate") {
-    invalidateLocalSession();
-    return;
-  }
-  if (
-    message.type === "token" &&
-    activeSession &&
-    message.backendUrl === activeSession.backend.url &&
-    message.userId === activeSession.user.id &&
-    typeof message.accessToken === "string" &&
-    message.accessToken
-  ) {
-    activeSession = {
-      ...activeSession,
-      accessToken: message.accessToken,
-      user: {
-        ...activeSession.user,
-        email: message.email ?? activeSession.user.email,
-      },
-    };
-  }
 });
 
-async function withAuthLock<T>(work: () => Promise<T>): Promise<T> {
-  // Web Locks are origin-wide rather than tab-local, so refresh-token rotation,
-  // sign-out, and backend changes cannot interleave. Current Chromium, Firefox,
-  // and Safari/iOS releases implement this. The fallback still keeps the
-  // in-tab promise single-flight on older embedded browsers.
-  if (typeof navigator !== "undefined" && navigator.locks) {
-    return navigator.locks.request(AUTH_LOCK_KEY, { mode: "exclusive" }, work);
-  }
-  return work();
+function vaultCall<T>(command: VaultCommand): Promise<T> {
+  const id = ++vaultMessageId;
+  return new Promise<T>((resolve, reject) => {
+    vaultPending.set(id, {
+      resolve: (value) => resolve(value as T),
+      reject,
+    });
+    tokenVault.postMessage({ id, ...command });
+  });
 }
-
-type TokenPayload = {
-  access_token?: string;
-  refresh_token?: string;
-  user?: { id: string; email?: string };
-};
 
 export function officialBackend(): BackendConfig | null {
   const url = import.meta.env.VITE_NUVIO_SUPABASE_URL?.trim().replace(
@@ -221,337 +136,69 @@ export function normalizeBackend(
   };
 }
 
-async function request<T>(
-  backend: BackendConfig,
-  path: string,
-  init: RequestInit = {},
-  token?: string,
-): Promise<T> {
-  const controller = new AbortController();
-  const abortFromCaller = () => controller.abort();
-  if (init.signal?.aborted) controller.abort();
-  else init.signal?.addEventListener("abort", abortFromCaller, { once: true });
-  const timeout = setTimeout(() => controller.abort(), 20_000);
-  try {
-    const response = await fetch(`${backend.url}${path}`, {
-      ...init,
-      signal: controller.signal,
-      headers: {
-        apikey: backend.key,
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-        ...init.headers,
-      },
-    });
-    const text = await response.text();
-    if (!response.ok) {
-      let message = `Backend request failed (${response.status})`;
-      try {
-        message = JSON.parse(text).msg || JSON.parse(text).message || message;
-      } catch {
-        if (text.trim()) message = text.slice(0, 240);
-      }
-      throw new BackendRequestError(message, response.status);
-    }
-    return (text ? JSON.parse(text) : null) as T;
-  } finally {
-    clearTimeout(timeout);
-    init.signal?.removeEventListener("abort", abortFromCaller);
-  }
-}
-
-function sessionFromToken(
-  backend: BackendConfig,
-  payload: TokenPayload,
-): Session {
-  if (!payload.access_token || !payload.refresh_token || !payload.user?.id)
-    throw new InvalidSessionPayloadError();
-  return {
-    accessToken: payload.access_token,
-    user: payload.user,
-    backend,
-  };
-}
-
-async function installToken(
-  backend: BackendConfig,
-  payload: TokenPayload,
-  generation: number,
-): Promise<Session> {
-  const session = sessionFromToken(backend, payload);
-  return withAuthLock(async () => {
-    assertCurrentGeneration(generation);
-    // The refresh credential is durable before the access token is visible to
-    // callers. A failed IndexedDB write therefore cannot create a session that
-    // silently dies on reload.
-    await Promise.all([
-      setValue(CONFIG_KEY, backend),
-      setValue<StoredRefreshSession>(REFRESH_KEY, {
-        backendUrl: backend.url,
-        refreshToken: payload.refresh_token!,
-        accessToken: session.accessToken,
-        userId: session.user.id,
-        email: session.user.email,
-        updatedAt: Date.now(),
-      }),
-    ]);
-    assertCurrentGeneration(generation);
-    activeSession = session;
-    broadcastAuth({
-      type: "token",
-      backendUrl: backend.url,
-      accessToken: session.accessToken,
-      userId: session.user.id,
-      email: session.user.email,
-    });
-    return session;
-  });
-}
-
+/**
+ * Signs in inside the dedicated token vault. The Window receives identity and
+ * backend metadata only; credentials never cross the Worker message boundary.
+ */
 export async function signIn(
   backend: BackendConfig,
   email: string,
   password: string,
 ): Promise<Session> {
-  // Changing account or backend invalidates every pending request before the
-  // new password exchange starts. A slow response from the old session can no
-  // longer publish state after this transition.
-  const generation = invalidateSessionAcrossTabs();
-  const signal = sessionAbortController.signal;
-  const payload = await request<TokenPayload>(
+  activeSession = null;
+  const session = await vaultCall<Session>({
+    type: "signIn",
     backend,
-    "/auth/v1/token?grant_type=password",
-    {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-      signal,
-    },
-  );
-  return installToken(backend, payload, generation);
+    email,
+    password,
+  });
+  await setValue(CONFIG_KEY, backend);
+  activeSession = session;
+  return activeSession;
 }
 
+/**
+ * Restores by rotating the persisted refresh credential inside the Worker.
+ * The Window receives identity/backend metadata, never either credential.
+ */
 export async function restoreSession(): Promise<Session | null> {
-  const generation = invalidateLocalSession();
-  const signal = sessionAbortController.signal;
+  activeSession = null;
   try {
-    return await withAuthLock(async () => {
-      assertCurrentGeneration(generation);
-      const [savedBackend, savedRefresh] = await Promise.all([
-        getValue<BackendConfig>(CONFIG_KEY),
-        getValue<StoredRefreshSession>(REFRESH_KEY),
-      ]);
-      const backend = savedBackend ?? officialBackend();
-      if (
-        !backend ||
-        !savedRefresh ||
-        savedRefresh.backendUrl !== backend.url
-      )
-        return null;
-      const payload = await request<TokenPayload>(
-        backend,
-        "/auth/v1/token?grant_type=refresh_token",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            refresh_token: savedRefresh.refreshToken,
-          }),
-          signal,
-        },
-      );
-      assertCurrentGeneration(generation);
-      const session = sessionFromToken(backend, payload);
-      await setValue<StoredRefreshSession>(REFRESH_KEY, {
-        backendUrl: backend.url,
-        refreshToken: payload.refresh_token!,
-        accessToken: payload.access_token!,
-        userId: payload.user!.id,
-        email: payload.user!.email,
-        updatedAt: Date.now(),
-      });
-      assertCurrentGeneration(generation);
-      activeSession = session;
-      broadcastAuth({
-        type: "token",
-        backendUrl: backend.url,
-        accessToken: session.accessToken,
-        userId: session.user.id,
-        email: session.user.email,
-      });
-      return session;
-    });
-  } catch (error) {
-    // Invalid refresh credentials are terminal. Network/timeout failures are
-    // not: retain the backend-scoped token so a reload can try again.
-    const terminal =
-      (error instanceof BackendRequestError &&
-        [400, 401, 403].includes(error.status)) ||
-      error instanceof InvalidSessionPayloadError;
-    if (generation === sessionGeneration && terminal) {
-      invalidateSessionAcrossTabs();
-      await withAuthLock(async () => {
-        await deleteValue(REFRESH_KEY);
-      });
-    }
+    const session = await vaultCall<Session>({ type: "restore" });
+    activeSession = session;
+    return session;
+  } catch {
     return null;
   }
 }
 
 export async function signOut(): Promise<void> {
-  const session = activeSession;
-  invalidateSessionAcrossTabs();
-  if (session) {
-    request(
-      session.backend,
-      "/auth/v1/logout",
-      { method: "POST" },
-      session.accessToken,
-    ).catch(() => undefined);
-  }
-  await withAuthLock(() => deleteValue(REFRESH_KEY));
+  activeSession = null;
+  await vaultCall({ type: "signOut" });
 }
 
-function isRefreshableUnauthorized(error: unknown): boolean {
-  return error instanceof BackendRequestError && error.status === 401;
-}
-
-async function refreshAccessToken(
-  session: Session,
-  generation: number,
-  rejectedAccessToken: string,
-  signal: AbortSignal,
-): Promise<string> {
-  assertCurrentGeneration(generation);
-  if (refreshFlight?.generation === generation) return refreshFlight.promise;
-
-  const run = withAuthLock(async () => {
-    assertCurrentGeneration(generation);
-    const saved = await getValue<StoredRefreshSession>(REFRESH_KEY);
-    if (
-      !saved ||
-      saved.backendUrl !== session.backend.url ||
-      !saved.refreshToken.trim()
-    ) {
-      invalidateSessionAcrossTabs();
-      throw new Error("The saved Nuvio session has expired. Sign in again.");
-    }
-
-    // A different tab may have rotated the token while this tab waited for the
-    // origin-wide lock. Its persisted access token is authoritative for the
-    // same backend/user and avoids a second refresh request.
-    if (
-      saved.accessToken &&
-      saved.accessToken !== rejectedAccessToken &&
-      saved.userId === session.user.id
-    ) {
-      assertCurrentGeneration(generation);
-      activeSession = { ...session, accessToken: saved.accessToken };
-      return saved.accessToken;
-    }
-
-    let payload: TokenPayload;
-    try {
-      payload = await request<TokenPayload>(
-        session.backend,
-        "/auth/v1/token?grant_type=refresh_token",
-        {
-          method: "POST",
-          body: JSON.stringify({ refresh_token: saved.refreshToken }),
-          signal,
-        },
-      );
-    } catch (error) {
-      if (
-        error instanceof BackendRequestError &&
-        [400, 401, 403].includes(error.status)
-      ) {
-        invalidateSessionAcrossTabs();
-        await deleteValue(REFRESH_KEY);
-      }
-      throw error;
-    }
-
-    const accessToken = payload.access_token?.trim();
-    const refreshToken = payload.refresh_token?.trim();
-    if (!accessToken || !refreshToken) {
-      invalidateSessionAcrossTabs();
-      await deleteValue(REFRESH_KEY);
-      throw new InvalidSessionPayloadError(
-        "The backend did not return a refreshed Nuvio session.",
-      );
-    }
-    assertCurrentGeneration(generation);
-    await setValue<StoredRefreshSession>(REFRESH_KEY, {
-      backendUrl: session.backend.url,
-      refreshToken,
-      accessToken,
-      userId: session.user.id,
-      email: payload.user?.email ?? session.user.email,
-      updatedAt: Date.now(),
-    });
-    // Persist the rotated refresh token before publishing the access token.
-    assertCurrentGeneration(generation);
-    activeSession = {
-      ...session,
-      accessToken,
-      user: {
-        ...session.user,
-        email: payload.user?.email ?? session.user.email,
-      },
-    };
-    broadcastAuth({
-      type: "token",
-      backendUrl: session.backend.url,
-      accessToken,
-      userId: session.user.id,
-      email: activeSession.user.email,
-    });
-    return accessToken;
+async function secureAuthorized<T>(
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  if (!activeSession) throw new Error("Sign in first.");
+  const headers: Record<string, string> = {};
+  new Headers(init.headers).forEach((value, key) => {
+    headers[key] = value;
   });
-  const tracked = run.finally(() => {
-    if (refreshFlight?.promise === tracked) refreshFlight = null;
+  return vaultCall<T>({
+    type: "request",
+    path,
+    init: {
+      method: init.method,
+      body: typeof init.body === "string" ? init.body : undefined,
+      headers,
+    },
   });
-  refreshFlight = { generation, promise: tracked };
-  return tracked;
-}
-
-async function authorized<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const session = activeSession;
-  if (!session) throw new Error("Sign in first.");
-  const generation = sessionGeneration;
-  const signal = sessionAbortController.signal;
-  try {
-    const value = await request<T>(
-      session.backend,
-      path,
-      { ...init, signal },
-      session.accessToken,
-    );
-    assertCurrentGeneration(generation);
-    return value;
-  } catch (error) {
-    if (!isRefreshableUnauthorized(error)) throw error;
-    assertCurrentGeneration(generation);
-    const accessToken = await refreshAccessToken(
-      session,
-      generation,
-      session.accessToken,
-      signal,
-    );
-    // Exactly one replay: a second 401 is returned to the caller and never
-    // recursively enters refreshAccessToken.
-    const value = await request<T>(
-      session.backend,
-      path,
-      { ...init, signal },
-      accessToken,
-    );
-    assertCurrentGeneration(generation);
-    return value;
-  }
 }
 
 export async function rpc<T>(name: string, body: unknown): Promise<T> {
-  return authorized<T>(`/rest/v1/rpc/${name}`, {
+  return secureAuthorized<T>(`/rest/v1/rpc/${name}`, {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -567,6 +214,8 @@ function camelProfile(row: Record<string, unknown>): Profile {
       row.avatar_color_hex ?? row.avatarColorHex ?? "#397a63",
     ),
     avatarId: row.avatar_id ? String(row.avatar_id) : undefined,
+    usesPrimaryPlugins:
+      row.uses_primary_plugins === true || row.usesPrimaryPlugins === true,
     avatarUrl: row.avatar_url ? String(row.avatar_url) : undefined,
   };
 }
@@ -617,7 +266,7 @@ export async function loadAddons(profileIndex: number): Promise<AddonRow[]> {
     select: "url,name,enabled,sort_order",
     order: "sort_order.asc",
   });
-  const rows = await authorized<Array<Record<string, unknown>>>(
+  const rows = await secureAuthorized<Array<Record<string, unknown>>>(
     `/rest/v1/addons?${query}`,
   );
   return rows.map((row) => ({
@@ -753,8 +402,16 @@ export async function loadSettingsBlob(
     { p_profile_id: profileIndex, p_platform: settingsPlatform() },
   );
   const value = rows?.[0]?.settings_json;
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as SettingsBlob)
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return emptySettingsBlob();
+    }
+  }
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as SettingsBlob)
     : emptySettingsBlob();
 }
 
@@ -1142,8 +799,8 @@ export async function loadCollections(
 
 /**
  * The home layout: which catalogs and collections are shown, and in what
- * order. Read-only here — this client never pushes it, so it cannot rewrite
- * what another device saved.
+ * order. Writes use the same shared payload as Nuvio and merge a fresh remote
+ * copy first so fields introduced by another client are not discarded.
  *
  * Nuvio keeps this in a `home_catalog_shared` row, with `mobile` and `tv` rows
  * left over from before it was shared. The shared row wins; the legacy ones
@@ -1158,6 +815,8 @@ export type HomeLayoutItem = {
   order: number;
   isCollection: boolean;
   customTitle: string;
+  /** Original synced row, retained so newer Nuvio fields survive edits. */
+  raw: Record<string, unknown>;
 };
 export type HomeLayout = {
   items: HomeLayoutItem[];
@@ -1168,6 +827,7 @@ export type HomeLayout = {
   customTitleOf: Map<string, string>;
   /** Appends " - Movies"/" - Series" to catalog rows. Defaults on. */
   showCatalogType: boolean;
+  hideUnreleasedContent: boolean;
 };
 
 /** Mirrors the desktop client's `media_type_label`. */
@@ -1222,6 +882,7 @@ export async function loadHomeLayout(
     const payload = parsed as {
       items?: Array<Record<string, unknown>>;
       show_catalog_type?: boolean;
+      hide_unreleased_content?: boolean;
     };
     if (!Array.isArray(payload?.items) || payload.items.length === 0) continue;
 
@@ -1231,6 +892,7 @@ export async function loadHomeLayout(
       order: Number(item.order ?? 0),
       isCollection: !!item.is_collection,
       customTitle: String(item.custom_title ?? ""),
+      raw: { ...item },
     }));
     items.sort((a, b) => a.order - b.order);
     return {
@@ -1244,9 +906,104 @@ export async function loadHomeLayout(
       ),
       // Absent means older payload; the other clients default this on.
       showCatalogType: payload.show_catalog_type !== false,
+      hideUnreleasedContent: payload.hide_unreleased_content === true,
     };
   }
   return null;
+}
+
+/** Plugin repositories use the same authoritative ordered-list model as Nuvio. */
+export async function loadPlugins(profileIndex: number): Promise<PluginRow[]> {
+  const query = new URLSearchParams({
+    profile_id: `eq.${profileIndex}`,
+    select: "url,name,enabled,sort_order",
+    order: "sort_order.asc",
+  });
+  const rows = await secureAuthorized<Array<Record<string, unknown>>>(
+    `/rest/v1/plugins?${query}`,
+  );
+  return rows.map((row) => ({
+    url: String(row.url ?? ""),
+    name: row.name ? String(row.name) : undefined,
+    enabled: row.enabled !== false,
+    sortOrder: Number(row.sort_order ?? 0),
+  }));
+}
+
+export async function savePlugins(
+  profileIndex: number,
+  plugins: PluginRow[],
+): Promise<void> {
+  await rpc("sync_push_plugins", {
+    p_profile_id: profileIndex,
+    p_plugins: plugins.map((plugin, index) => ({
+      url: plugin.url,
+      name: plugin.name ?? "",
+      // The official client syncs repository installation, not local scraper
+      // switches. Repositories therefore remain enabled in the server row.
+      enabled: true,
+      sort_order: index,
+    })),
+  });
+}
+
+/**
+ * Pushes the shared Home organizer without dropping fields introduced by a
+ * newer Nuvio client. Home settings are a separate whole-payload sync (not a
+ * profile-settings feature), so the shared row is re-read immediately before
+ * each merge and write.
+ */
+export async function pushHomeLayout(
+  profileIndex: number,
+  next: HomeLayout,
+): Promise<HomeLayout> {
+  const rows = await rpc<Array<Record<string, unknown>>>(
+    "sync_pull_home_catalog_settings",
+    { p_profile_id: profileIndex, p_platform: "home_catalog_shared" },
+  );
+  const rawPayload = rows?.[0]?.settings_json;
+  let remote: Record<string, unknown> = {};
+  try {
+    const parsed =
+      typeof rawPayload === "string" ? JSON.parse(rawPayload) : rawPayload;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+      remote = { ...(parsed as Record<string, unknown>) };
+  } catch {
+    throw new Error("The synced Home layout could not be read safely.");
+  }
+
+  const remoteItems = Array.isArray(remote.items)
+    ? remote.items.filter(
+        (item): item is Record<string, unknown> =>
+          !!item && typeof item === "object" && !Array.isArray(item),
+      )
+    : [];
+  const nextKeys = new Set(next.items.map((item) => item.key));
+  const items: Record<string, unknown>[] = next.items.map((item, order) => ({
+    ...item.raw,
+    enabled: item.enabled,
+    order,
+    custom_title: item.customTitle,
+    key: item.raw.key ?? item.key,
+  }));
+  // A catalog installed by another device since this screen loaded is unknown
+  // here, not deleted. Preserve it after the edited rows.
+  for (const item of remoteItems) {
+    if (!nextKeys.has(preferenceKey(item))) items.push(item);
+  }
+
+  await rpc("sync_push_home_catalog_settings", {
+    p_profile_id: profileIndex,
+    p_platform: "home_catalog_shared",
+    p_settings_json: {
+      ...remote,
+      show_catalog_type: next.showCatalogType,
+      hide_unreleased_content: next.hideUnreleasedContent,
+      items,
+    },
+    p_origin_client_id: CLIENT_ID,
+  });
+  return (await loadHomeLayout(profileIndex)) ?? next;
 }
 
 // ---------------------------------------------------------------------------

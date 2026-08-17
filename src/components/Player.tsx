@@ -1,5 +1,6 @@
 import type Hls from "hls.js";
 import { copyStreamUrl } from "../lib/externalPlayer";
+import { safeHttpUrl } from "../lib/security";
 import {
   assessPlayback,
   audioIsSilent,
@@ -54,6 +55,21 @@ function formatTime(value: number) {
     : `${minutes}:${seconds}`;
 }
 
+/** Runtime reported by Stremio metadata, normalized to seconds. */
+function runtimeHintSeconds(meta: Meta, video?: Video) {
+  if (typeof video?.runtime === "number" && video.runtime > 0)
+    return video.runtime * 60;
+  const value = meta.runtime?.trim() ?? "";
+  if (!value) return undefined;
+  const hours = /(\d+(?:\.\d+)?)\s*h/i.exec(value);
+  const minutes = /(\d+(?:\.\d+)?)\s*m/i.exec(value);
+  const seconds =
+    Number(hours?.[1] ?? 0) * 3600 + Number(minutes?.[1] ?? 0) * 60;
+  if (seconds > 0) return seconds;
+  const bareMinutes = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : 0;
+  return bareMinutes > 0 ? bareMinutes * 60 : undefined;
+}
+
 export function Player({
   stream,
   meta,
@@ -76,6 +92,7 @@ export function Player({
   const playerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const remuxerRef = useRef<StableRemuxStreamer | null>(null);
   const hideTimer = useRef<number | undefined>(undefined);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
@@ -90,6 +107,8 @@ export function Player({
   }, [warning]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [seekPreview, setSeekPreview] = useState<number | null>(null);
+  const seekPreviewRef = useRef<number | null>(null);
   // Kept in a ref so the reporting effect can run once for the whole session
   // rather than resubscribing on every timeupdate.
   const reportRef = useRef(onProgress);
@@ -106,6 +125,10 @@ export function Player({
   const [selectedAudio, setSelectedAudio] = useState(-1);
   const url = stream.url;
   const externalUrl = stream.externalUrl || url;
+  const navigableExternalUrl = useMemo(
+    () => safeHttpUrl(externalUrl),
+    [externalUrl],
+  );
   const sourceText = `${stream.name} ${stream.title} ${stream.description} ${stream.behaviorHints?.filename ?? ""}`;
   const riskyAudio = useMemo(
     () => /truehd|dts(?:-hd)?|e-?ac-?3|dd\+|atmos|\.mkv\b/i.test(sourceText),
@@ -153,35 +176,45 @@ export function Player({
       }
     } else element.pause();
   }, [showControls]);
+  const seekTo = useCallback(
+    async (requested: number) => {
+      const element = videoRef.current;
+      if (!element) return;
+      const maximum = Number.isFinite(element.duration)
+        ? Math.max(0, element.duration - 0.05)
+        : Math.max(0, requested);
+      const target = clamp(requested, 0, maximum);
+      seekPreviewRef.current = null;
+      setSeekPreview(null);
+      showControls();
+
+      const remuxer = remuxerRef.current;
+      if (!remuxActive || !remuxer) {
+        element.currentTime = target;
+        setCurrentTime(target);
+        return;
+      }
+
+      setWaiting(true);
+      const accepted = await remuxer.seek(target);
+      if (!accepted) {
+        setWaiting(false);
+        setWarning(
+          "This source cannot seek outside the part already buffered. Its media host did not provide usable byte-range access.",
+        );
+        return;
+      }
+      setCurrentTime(target);
+    },
+    [showControls, remuxActive],
+  );
   const seekBy = useCallback(
     (amount: number) => {
       const element = videoRef.current;
       if (!element) return;
-      let minimum = 0;
-      let maximum = Number.isFinite(element.duration)
-        ? element.duration
-        : element.currentTime + Math.max(amount, 0);
-      if (remuxActive && element.buffered.length) {
-        for (let index = 0; index < element.buffered.length; index += 1) {
-          if (
-            element.currentTime >= element.buffered.start(index) - 0.5 &&
-            element.currentTime <= element.buffered.end(index) + 0.5
-          ) {
-            minimum = element.buffered.start(index);
-            maximum = Math.max(minimum, element.buffered.end(index) - 0.05);
-            break;
-          }
-        }
-      }
-      element.currentTime = clamp(
-        element.currentTime + amount,
-        minimum,
-        maximum,
-      );
-      setCurrentTime(element.currentTime);
-      showControls();
+      void seekTo(element.currentTime + amount);
     },
-    [showControls, remuxActive],
+    [seekTo],
   );
   const toggleFullscreen = useCallback(async () => {
     const container = playerRef.current;
@@ -345,18 +378,28 @@ export function Player({
     };
     // Seek once, on the first metadata event: setting currentTime before the
     // duration is known is silently ignored, and re-seeking on every event
-    // would fight the user.
+    // would fight the user. Remuxed playback restarts conversion from the
+    // Matroska cue instead of downloading linearly from zero to the resume
+    // point.
     let resumed = startPositionMs <= 0;
     const onResume = () => {
-      // The sequential remux prototype does not have cue-based seeking yet.
-      // Jumping to an unbuffered resume point makes it download from byte zero
-      // until it reaches that point and looks like a permanent stall.
-      if (remuxer || resumed || !Number.isFinite(element.duration)) return;
+      if (resumed || !Number.isFinite(element.duration)) return;
       resumed = true;
       const target = startPositionMs / 1000;
       // Never seek past the end; a stale row from a different cut of the same
       // episode would otherwise drop playback at the credits.
-      if (target < element.duration - 5) element.currentTime = target;
+      if (target >= element.duration - 5) return;
+      if (remuxer) {
+        setWaiting(true);
+        void remuxer.seek(target).then((accepted) => {
+          if (!disposed && !accepted) {
+            setWaiting(false);
+            setWarning(
+              "Resume is unavailable for this source because its host does not support byte-range seeking.",
+            );
+          }
+        });
+      } else element.currentTime = target;
     };
     element.addEventListener("loadedmetadata", onResume);
     element.addEventListener("canplay", onResume);
@@ -384,6 +427,7 @@ export function Player({
     const cleanup = () => {
       disposed = true;
       remuxer?.stop();
+      if (remuxerRef.current === remuxer) remuxerRef.current = null;
       setRemuxActive(false);
       window.clearTimeout(hideTimer.current);
       element.removeEventListener("playing", onPlaying);
@@ -431,10 +475,13 @@ export function Player({
           {
             requestHeaders: stream.behaviorHints?.proxyHeaders?.request,
             preferredAudioLanguage: settings.preferredAudioLanguage,
+            durationHintSeconds: runtimeHintSeconds(meta, video),
           },
         );
+        remuxerRef.current = remuxer;
         void remuxer.start().catch((reason: unknown) => {
           if (disposed) return;
+          remuxer?.stop();
           setWaiting(false);
           setError(
             reason instanceof Error
@@ -605,17 +652,14 @@ export function Player({
     element.volume = next;
     element.muted = next === 0;
   };
-  const seekLimit = (() => {
-    const element = videoRef.current;
-    if (!remuxActive || !element?.buffered.length) return duration || 0;
-    for (let index = 0; index < element.buffered.length; index += 1)
-      if (
-        currentTime >= element.buffered.start(index) - 0.5 &&
-        currentTime <= element.buffered.end(index) + 0.5
-      )
-        return element.buffered.end(index);
-    return Math.max(currentTime, 0);
-  })();
+  const seekLimit = duration || 0;
+  const displayedTime = seekPreview ?? currentTime;
+  const commitSeekPreview = (fallback: number) => {
+    const target = seekPreviewRef.current ?? fallback;
+    if (seekPreviewRef.current === null) return;
+    seekPreviewRef.current = null;
+    void seekTo(target);
+  };
 
   return (
     <div
@@ -692,38 +736,36 @@ export function Player({
       )}
       <div className="player-controls">
         <div className="player-timeline">
-          <span>{formatTime(currentTime)}</span>
+          <span>{formatTime(displayedTime)}</span>
           <input
             aria-label="Seek"
             type="range"
             min="0"
             max={seekLimit}
             step="0.1"
-            value={Math.min(currentTime, seekLimit)}
+            value={Math.min(displayedTime, seekLimit)}
             onChange={(event) => {
-              const next = Number(event.target.value);
-              const element = videoRef.current;
-              if (!element) return;
-              let target = next;
-              if (remuxActive && element.buffered.length) {
-                let allowed = false;
-                for (let index = 0; index < element.buffered.length; index += 1) {
-                  if (
-                    target >= element.buffered.start(index) &&
-                    target <= element.buffered.end(index)
-                  ) {
-                    allowed = true;
-                    break;
-                  }
-                }
-                if (!allowed) target = element.currentTime;
-              }
-              element.currentTime = target;
-              setCurrentTime(target);
+              const target = Number(event.target.value);
+              seekPreviewRef.current = target;
+              setSeekPreview(target);
+            }}
+            onPointerUp={(event) =>
+              commitSeekPreview(Number(event.currentTarget.value))
+            }
+            onKeyUp={(event) => {
+              if (
+                event.key.startsWith("Arrow") ||
+                event.key === "Home" ||
+                event.key === "End"
+              )
+                commitSeekPreview(Number(event.currentTarget.value));
+            }}
+            onBlur={(event) => {
+              commitSeekPreview(Number(event.currentTarget.value));
             }}
             style={
               {
-                "--played": `${seekLimit ? (currentTime / seekLimit) * 100 : 0}%`,
+                "--played": `${seekLimit ? (displayedTime / seekLimit) * 100 : 0}%`,
               } as CSSProperties
             }
           />
@@ -804,8 +846,8 @@ export function Player({
                       stays silent.
                     </small>
                   )}
-                  {externalUrl && (
-                    <a href={externalUrl} target="_blank" rel="noreferrer">
+                  {navigableExternalUrl && (
+                    <a href={navigableExternalUrl} target="_blank" rel="noopener noreferrer">
                       <ExternalLink /> Open externally
                     </a>
                   )}
@@ -825,9 +867,11 @@ export function Player({
           <div>
             {externalUrl && (
               <>
-                <a href={externalUrl} target="_blank" rel="noreferrer">
-                  <ExternalLink /> Open stream
-                </a>
+                {navigableExternalUrl && (
+                  <a href={navigableExternalUrl} target="_blank" rel="noopener noreferrer">
+                    <ExternalLink /> Open stream
+                  </a>
+                )}
                 <button
                   onClick={() => navigator.clipboard.writeText(externalUrl)}
                 >

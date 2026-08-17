@@ -1,7 +1,6 @@
 export type BackendConfig = { url: string; key: string; selfHosted: boolean };
 export type AuthUser = { id: string; email?: string };
 export type Session = {
-  accessToken: string;
   user: AuthUser;
   backend: BackendConfig;
 };
@@ -13,6 +12,8 @@ export type Profile = {
   avatarColorHex: string;
   avatarId?: string;
   avatarUrl?: string;
+  /** Secondary profiles can deliberately share profile 1's plugin list. */
+  usesPrimaryPlugins?: boolean;
 };
 export type AvatarCatalogItem = {
   id: string;
@@ -38,6 +39,8 @@ export type AddonManifest = {
   id: string;
   name: string;
   version?: string;
+  /** Present in every real manifest; the addon list shows it instead of the URL. */
+  description?: string;
   logo?: string;
   types?: string[];
   idPrefixes?: string[];
@@ -63,7 +66,68 @@ export type Video = {
   thumbnail?: string;
   overview?: string;
   runtime?: number;
+  imdbRating?: string;
   available?: boolean;
+};
+export type PluginRow = {
+  url: string;
+  name?: string;
+  enabled: boolean;
+  sortOrder: number;
+};
+export type PluginManifestScraper = {
+  id: string;
+  name: string;
+  description?: string;
+  version: string;
+  filename: string;
+  supportedTypes?: string[];
+  enabled?: boolean;
+  hasSettings?: boolean;
+  logo?: string;
+  contentLanguage?: string[];
+  supportedPlatforms?: string[];
+  disabledPlatforms?: string[];
+  formats?: string[];
+  supportedFormats?: string[];
+};
+export type PluginManifest = {
+  name: string;
+  version: string;
+  description?: string;
+  author?: string;
+  scrapers: PluginManifestScraper[];
+};
+export type PluginRepository = {
+  manifestUrl: string;
+  name: string;
+  description?: string;
+  version?: string;
+  scraperCount: number;
+  lastUpdated: number;
+  error?: string;
+};
+export type PluginScraper = {
+  id: string;
+  repositoryUrl: string;
+  name: string;
+  description: string;
+  version: string;
+  filename: string;
+  supportedTypes: string[];
+  enabled: boolean;
+  manifestEnabled: boolean;
+  hasSettings: boolean;
+  logo?: string;
+  contentLanguage: string[];
+  formats?: string[];
+  code: string;
+};
+export type PluginState = {
+  pluginsEnabled: boolean;
+  groupStreamsByRepository: boolean;
+  repositories: PluginRepository[];
+  scrapers: PluginScraper[];
 };
 export type Person = {
   name: string;
@@ -169,6 +233,7 @@ export type ExternalPlayerMode =
 export type NavKey =
   | "home"
   | "discover"
+  | "calendar"
   | "library"
   | "addons"
   | "remuxLab"

@@ -12,6 +12,9 @@
     "verify:remux": "node scripts/verify-remux.mjs"
   },
   "dependencies": {
+    "@mediabunny/aac-encoder": "^1.54.0",
+    "@mediabunny/ac3": "^1.54.0",
+    "crypto-js": "^4.2.0",
     "hls.js": "^1.6.13",
     "lucide-react": "^0.468.0",
     "mediabunny": "^1.54.0",
