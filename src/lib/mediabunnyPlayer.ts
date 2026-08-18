@@ -98,18 +98,32 @@ const normalizeLanguage = (value: string) => {
 /**
  * Picks the track to open with.
  *
- * Language first, in the order asked for. Nothing matching leaves the file's
- * own choice alone, which is the best guess available.
+ * Playable first, then language. A disc-sourced release commonly leads with a
+ * TrueHD or Atmos track that nothing in a browser can decode, followed by the
+ * AC-3 mix that everything can — so choosing on language alone lands on the
+ * one that produces silence. A track that cannot be decoded is not a candidate
+ * at all, whatever language it claims.
+ *
+ * `decodable` is optional so the choice can still be reasoned about without
+ * it; where it is absent every track is treated as a candidate.
  */
 export function chooseAudioTrack(
   languages: string[],
   preferred: string[],
+  decodable?: boolean[],
 ): number {
   const available = languages.map(normalizeLanguage);
+  const playable = languages
+    .map((_, index) => index)
+    .filter((index) => decodable?.[index] !== false);
+
   for (const want of preferred.map(normalizeLanguage).filter(Boolean)) {
-    const match = available.indexOf(want);
-    if (match >= 0) return match;
+    const match = playable.find((index) => available[index] === want);
+    if (match !== undefined) return match;
   }
+  // No preferred language among the playable ones: the file's own order
+  // decides, but still only among tracks that will actually make a sound.
+  if (playable.length) return playable[0];
   return 0;
 }
 
@@ -188,6 +202,9 @@ export class MediabunnyPlayer {
   private videoTrack: InputVideoTrack | null = null;
   private audioTrack: InputAudioTrack | null = null;
   private audioOptions: InputAudioTrack[] = [];
+  private audioDecodable: boolean[] = [];
+  private audioCodecs: (string | null)[] = [];
+  private audioChannels: number[] = [];
   private audioIndex = 0;
   private videoSink: CanvasSink | null = null;
   private audioSink: AudioBufferSink | null = null;
@@ -263,11 +280,27 @@ export class MediabunnyPlayer {
       input.getAudioTracks(),
     ]);
     this.audioOptions = audioTracks;
+    // Asked of every track up front rather than of the chosen one afterwards:
+    // it is what decides the choice, not a check on it.
+    this.audioDecodable = await Promise.all(
+      audioTracks.map((track) => track.canDecode().catch(() => false)),
+    );
+    this.audioCodecs = await Promise.all(
+      audioTracks.map((track) =>
+        track.getCodec().catch(() => null),
+      ),
+    );
+    this.audioChannels = await Promise.all(
+      audioTracks.map((track) => track.getNumberOfChannels().catch(() => 0)),
+    );
     this.audioIndex = chooseAudioTrack(
       audioTracks.map((track) => track.languageCode || ""),
       this.options.preferredLanguages ?? [],
+      this.audioDecodable,
     );
-    const audio = audioTracks[this.audioIndex] ?? null;
+    const audio = this.audioDecodable[this.audioIndex]
+      ? (audioTracks[this.audioIndex] ?? null)
+      : null;
 
     // Asked before anything is decoded, so an unplayable track is reported as
     // such rather than as a stall.
@@ -275,9 +308,8 @@ export class MediabunnyPlayer {
     this.videoTrack =
       video && (await video.canDecode().catch(() => false)) ? video : null;
     if (video && !this.videoTrack) trouble.push("its video");
-    this.audioTrack =
-      audio && (await audio.canDecode().catch(() => false)) ? audio : null;
-    if (audio && !this.audioTrack) trouble.push("its audio");
+    this.audioTrack = audio;
+    if (audioTracks.length && !audio) trouble.push("its audio");
 
     if (!this.videoTrack && !this.audioTrack) {
       this.report(
@@ -376,11 +408,18 @@ export class MediabunnyPlayer {
   private describeAudioTracks(): AudioTrackChoice[] {
     return this.audioOptions.map((track, id) => {
       const language = track.languageCode?.trim();
-      const name = track.name?.trim();
-      const parts = [name, language && language !== "und" ? language.toUpperCase() : ""]
-        .filter(Boolean)
-        .join(" · ");
-      return { id, label: parts || `Track ${id + 1}` };
+      const channels = this.audioChannels[id];
+      const parts = [
+        track.name?.trim(),
+        language && language !== "und" ? language.toUpperCase() : "",
+        this.audioCodecs[id]?.toUpperCase() ?? "",
+        // 6 and 8 are the counts anyone recognises by name.
+        channels === 6 ? "5.1" : channels === 8 ? "7.1" : channels === 2 ? "Stereo" : "",
+        // Said outright, because an unplayable track that looks like the right
+        // one is how this went wrong in the first place.
+        this.audioDecodable[id] === false ? "unsupported here" : "",
+      ].filter(Boolean);
+      return { id, label: parts.join(" · ") || `Track ${id + 1}` };
     });
   }
 
@@ -400,9 +439,7 @@ export class MediabunnyPlayer {
     this.silence();
 
     this.audioIndex = id;
-    this.audioTrack = (await track.canDecode().catch(() => false))
-      ? track
-      : null;
+    this.audioTrack = this.audioDecodable[id] === false ? null : track;
     await this.context?.close().catch(() => undefined);
     this.context = null;
     this.gain = null;

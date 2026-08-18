@@ -41,3 +41,33 @@ test("three-letter codes map to the language, not their first two letters", () =
   assert.equal(chooseAudioTrack(["eng", "deu"], ["de"]), 1);
   assert.equal(chooseAudioTrack(["eng", "fra"], ["fr"]), 1);
 });
+
+// The case that sent this back a second time: a disc rip leading with an
+// Atmos/TrueHD track nothing in a browser decodes, followed by the AC-3 mix
+// that everything does. Both are English, so language alone chooses silence.
+test("an undecodable track is never chosen, whatever language it claims", () => {
+  assert.equal(
+    chooseAudioTrack(["eng", "eng"], ["en"], [false, true]),
+    1,
+  );
+  assert.equal(
+    chooseAudioTrack(["eng", "fre", "eng"], ["en"], [false, true, true]),
+    2,
+  );
+});
+
+test("language still decides among the tracks that can be played", () => {
+  assert.equal(
+    chooseAudioTrack(["fre", "eng", "ger"], ["de"], [true, true, true]),
+    2,
+  );
+});
+
+test("with no preferred language the first playable track wins", () => {
+  assert.equal(chooseAudioTrack(["eng", "eng"], [], [false, true]), 1);
+  assert.equal(chooseAudioTrack(["fre", "ger"], ["ja"], [false, true]), 1);
+});
+
+test("nothing playable falls back rather than throwing", () => {
+  assert.equal(chooseAudioTrack(["eng", "fre"], ["en"], [false, false]), 0);
+});
