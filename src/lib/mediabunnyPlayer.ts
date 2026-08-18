@@ -405,8 +405,17 @@ export class MediabunnyPlayer {
   }
 
   /** The audio tracks the file offers, named as helpfully as it allows. */
+  /**
+   * The tracks worth offering, which is the ones that will make a sound.
+   *
+   * What a browser can decode differs between browsers — Safari and Chrome do
+   * not agree — so this is what this browser can do, asked of it rather than
+   * assumed. A listed track that turns out to be silent is worse than one that
+   * was never listed.
+   */
   private describeAudioTracks(): AudioTrackChoice[] {
-    return this.audioOptions.map((track, id) => {
+    return this.audioOptions.flatMap((track, id) => {
+      if (this.audioDecodable[id] === false) return [];
       const language = track.languageCode?.trim();
       const channels = this.audioChannels[id];
       const parts = [
@@ -415,11 +424,8 @@ export class MediabunnyPlayer {
         this.audioCodecs[id]?.toUpperCase() ?? "",
         // 6 and 8 are the counts anyone recognises by name.
         channels === 6 ? "5.1" : channels === 8 ? "7.1" : channels === 2 ? "Stereo" : "",
-        // Said outright, because an unplayable track that looks like the right
-        // one is how this went wrong in the first place.
-        this.audioDecodable[id] === false ? "unsupported here" : "",
       ].filter(Boolean);
-      return { id, label: parts.join(" · ") || `Track ${id + 1}` };
+      return [{ id, label: parts.join(" · ") || `Track ${id + 1}` }];
     });
   }
 

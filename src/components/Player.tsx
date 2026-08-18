@@ -651,16 +651,25 @@ export function Player({
   useEffect(() => {
     const element = videoRef.current;
     if (!element) return;
+    // Read from whichever is playing. The decoding player never touches the
+    // video element, so reading the element reported a position of zero and
+    // nothing was ever saved for the streams that need it most.
     const report = (ended: boolean) => {
-      const position = element.currentTime * 1000;
-      const total = Number.isFinite(element.duration)
-        ? element.duration * 1000
-        : 0;
+      const engine = engineRef.current;
+      const position = (engine ? engine.currentTime : element.currentTime) * 1000;
+      const total = engine
+        ? engine.duration * 1000
+        : Number.isFinite(element.duration)
+          ? element.duration * 1000
+          : 0;
       if (position > 0 || ended) reportRef.current(position, total, ended);
     };
     // Every 15s while playing, plus the moments a position actually matters.
     const timer = window.setInterval(() => {
-      if (!element.paused) report(false);
+      const running = engineRef.current
+        ? !engineRef.current.paused
+        : !element.paused;
+      if (running) report(false);
     }, 15_000);
     const onPause = () => report(false);
     const onEnded = () => report(true);
@@ -676,7 +685,7 @@ export function Player({
       element.removeEventListener("ended", onEnded);
       window.removeEventListener("pagehide", onHide);
       // Closing the player is the most important report of all.
-      report(element.ended);
+      report(engineRef.current ? false : element.ended);
     };
   }, []);
 

@@ -2222,18 +2222,21 @@ body,
   background: none;
   transition: opacity 0.2s ease;
 }
+/* The glyph alone, larger. A filled circle in the middle of the picture is a
+   lot of furniture for a control that is only a hint — a drop shadow separates
+   it from a bright scene without covering any of it. */
 .player-center {
   position: absolute;
   z-index: 3;
   left: 50%;
   top: 50%;
-  width: 72px;
-  height: 72px;
+  width: 96px;
+  height: 96px;
   transform: translate(-50%, -50%);
-  border: 1px solid #ffffff30;
-  border-radius: 50%;
-  background: #111820e8;
+  border: 0;
+  background: none;
   color: #fff;
+  filter: drop-shadow(0 2px 14px #000c);
   display: grid;
   place-items: center;
   cursor: pointer;
@@ -2245,8 +2248,8 @@ body,
   transform: translate(-50%, -50%) scale(1.05);
 }
 .player-center svg {
-  width: 30px;
-  height: 30px;
+  width: 64px;
+  height: 64px;
 }
 .player-status {
   z-index: 4;
@@ -2340,7 +2343,7 @@ body,
   padding: 0 12px;
   border: 0;
   border-radius: 13px;
-  background: #15191de8;
+  background: none;
   color: #fff;
   display: flex;
   align-items: center;
@@ -2350,7 +2353,7 @@ body,
 }
 .player-control-group button:hover,
 .player-control-group button.active {
-  background: #2b3138;
+  background: #ffffff1f;
 }
 .player-control-group button svg {
   width: 21px;
