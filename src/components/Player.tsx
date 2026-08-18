@@ -6,7 +6,7 @@ import {
   audioIsSilent,
   shouldUseRemuxFallback,
 } from "../lib/playback";
-import { StableRemuxStreamer } from "../lib/stableRemuxStreamer";
+import { MediabunnyPlayer } from "../lib/mediabunnyPlayer";
 import {
   browserColor,
   type WebPlayerSettings,
@@ -103,7 +103,13 @@ export function Player({
   const playerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const remuxerRef = useRef<StableRemuxStreamer | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  /**
+   * The decoding player, when the browser will not take the file directly.
+   * While it is set it owns playback entirely, and the <video> element is
+   * neither playing nor asked anything.
+   */
+  const engineRef = useRef<MediabunnyPlayer | null>(null);
   const [errorCopied, setErrorCopied] = useState(false);
   const hideTimer = useRef<number | undefined>(undefined);
   const [status, setStatus] = useState("");
@@ -111,6 +117,8 @@ export function Player({
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(true);
   const [remuxActive, setRemuxActive] = useState(false);
+  /** True while the decoding player owns playback, and the canvas is shown. */
+  const [decoding, setDecoding] = useState(false);
   const [warning, setWarning] = useState("");
   useEffect(() => {
     if (!warning) return;
@@ -170,7 +178,10 @@ export function Player({
   const showControls = useCallback(() => {
     setControlsVisible(true);
     window.clearTimeout(hideTimer.current);
-    if (videoRef.current && !videoRef.current.paused)
+    const running = engineRef.current
+      ? !engineRef.current.paused
+      : videoRef.current && !videoRef.current.paused;
+    if (running)
       hideTimer.current = window.setTimeout(() => {
         setAudioOpen(false);
         setExternalPlayerOpen(false);
@@ -178,9 +189,18 @@ export function Player({
       }, 3000);
   }, []);
   const togglePlayback = useCallback(async () => {
+    showControls();
+    const engine = engineRef.current;
+    if (engine) {
+      // Reached from a real tap, which is what lets Safari start the audio
+      // context at all.
+      if (engine.paused) await engine.play();
+      else engine.pause();
+      setPlaying(!engine.paused);
+      return;
+    }
     const element = videoRef.current;
     if (!element) return;
-    showControls();
     if (element.paused) {
       try {
         await element.play();
@@ -192,41 +212,34 @@ export function Player({
   }, [showControls]);
   const seekTo = useCallback(
     async (requested: number) => {
+      const engine = engineRef.current;
       const element = videoRef.current;
-      if (!element) return;
-      const maximum = Number.isFinite(element.duration)
-        ? Math.max(0, element.duration - 0.05)
+      const total = engine ? engine.duration : element?.duration ?? 0;
+      const maximum = Number.isFinite(total)
+        ? Math.max(0, total - 0.05)
         : Math.max(0, requested);
       const target = clamp(requested, 0, maximum);
       seekPreviewRef.current = null;
       setSeekPreview(null);
       showControls();
 
-      const remuxer = remuxerRef.current;
-      if (!remuxActive || !remuxer) {
-        element.currentTime = target;
+      if (engine) {
         setCurrentTime(target);
+        await engine.seek(target);
         return;
       }
+      if (!element) return;
 
-      setWaiting(true);
-      const accepted = await remuxer.seek(target);
-      if (!accepted) {
-        setWaiting(false);
-        setWarning(
-          "This source cannot seek outside the part already buffered. Its media host did not provide usable byte-range access.",
-        );
-        return;
-      }
+      element.currentTime = target;
       setCurrentTime(target);
     },
     [showControls, remuxActive],
   );
   const seekBy = useCallback(
     (amount: number) => {
-      const element = videoRef.current;
-      if (!element) return;
-      void seekTo(element.currentTime + amount);
+      const from = engineRef.current?.currentTime ?? videoRef.current?.currentTime;
+      if (from === undefined) return;
+      void seekTo(from + amount);
     },
     [seekTo],
   );
@@ -248,15 +261,11 @@ export function Player({
       return;
     }
     let disposed = false;
-    let remuxer: StableRemuxStreamer | null = null;
     let audioWatch: number | undefined;
     let preferredAudioApplied = false;
     let preferredSubtitleApplied = false;
     const isHls = /\.m3u8(?:$|\?)/i.test(url);
     const fail = () => {
-      // The remuxer listens to the media element itself and can report the
-      // rejected codec/segment. Do not replace that with the generic error.
-      if (remuxer) return;
       setWaiting(false);
       setStatus("");
       setError(
@@ -403,17 +412,7 @@ export function Player({
       // Never seek past the end; a stale row from a different cut of the same
       // episode would otherwise drop playback at the credits.
       if (target >= element.duration - 5) return;
-      if (remuxer) {
-        setWaiting(true);
-        void remuxer.seek(target).then((accepted) => {
-          if (!disposed && !accepted) {
-            setWaiting(false);
-            setWarning(
-              "Resume is unavailable for this source because its host does not support byte-range seeking.",
-            );
-          }
-        });
-      } else element.currentTime = target;
+      element.currentTime = target;
     };
     element.addEventListener("loadedmetadata", onResume);
     element.addEventListener("canplay", onResume);
@@ -440,8 +439,6 @@ export function Player({
 
     const cleanup = () => {
       disposed = true;
-      remuxer?.stop();
-      if (remuxerRef.current === remuxer) remuxerRef.current = null;
       setRemuxActive(false);
       window.clearTimeout(hideTimer.current);
       element.removeEventListener("playing", onPlaying);
@@ -463,47 +460,72 @@ export function Player({
       element.load();
     };
 
-    // Re-box Matroska into fMP4 before native playback on every MSE-capable
-    // browser. Chromium otherwise accepts the video and silently drops common
-    // Dolby audio, so waiting for `playable === false` is too late.
+    // Decode it ourselves rather than asking the browser to accept the file.
+    // Media Source refuses these streams for reasons unrelated to whether the
+    // machine can decode them, so the container is skipped entirely: frames go
+    // to a canvas and audio to Web Audio.
     const verdict = assessPlayback(url, sourceText);
     if (shouldUseRemuxFallback(url, sourceText)) {
-        setRemuxActive(true);
-        remuxer = new StableRemuxStreamer(
-          url,
-          element,
-          (next) => {
-            if (disposed) return;
-            if (next.state === "error") {
-              setWaiting(false);
-              setStatus("");
-              setError(next.message);
-            } else if (next.state === "ready" || next.state === "ended") {
-              setWaiting(false);
-              setStatus("");
-            } else {
-              setWaiting(true);
-              setStatus("");
-            }
-          },
-          {
-            requestHeaders: stream.behaviorHints?.proxyHeaders?.request,
-            preferredAudioLanguage: settings.preferredAudioLanguage,
-            durationHintSeconds: runtimeHintSeconds(meta, video),
-          },
-        );
-        remuxerRef.current = remuxer;
-        void remuxer.start().catch((reason: unknown) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      setRemuxActive(true);
+      setDecoding(true);
+      const engine = new MediabunnyPlayer(
+        url,
+        canvas,
+        (next) => {
           if (disposed) return;
-          remuxer?.stop();
+          if (next.state === "error") {
+            setWaiting(false);
+            setStatus("");
+            setError(next.message);
+          } else if (next.state === "ready" || next.state === "ended") {
+            setWaiting(false);
+            setStatus("");
+            if (next.state === "ended") setPlaying(false);
+          } else {
+            setWaiting(true);
+            setStatus(next.message);
+          }
+        },
+        {
+          requestHeaders: stream.behaviorHints?.proxyHeaders?.request,
+          startPositionSeconds: startPositionMs / 1000,
+          onTime: (position, total) => {
+            if (disposed) return;
+            setCurrentTime(position);
+            if (total) setDuration(total);
+          },
+          onEnded: () => {
+            if (!disposed) setPlaying(false);
+          },
+        },
+      );
+      engineRef.current = engine;
+      engine.setVolume(volume);
+      engine.setMuted(muted);
+      void engine
+        .start()
+        .then(() => {
+          if (disposed) return;
+          // Autoplay without a gesture is refused on iOS and increasingly
+          // elsewhere; the centre button is then the gesture.
+          void engine.play().then(() => setPlaying(!engine.paused));
+        })
+        .catch((reason: unknown) => {
+          if (disposed) return;
           setWaiting(false);
           setError(
             reason instanceof Error
               ? reason.message
-              : "The local remux pipeline failed.",
+              : "This source could not be read.",
           );
         });
-      return cleanup;
+      return () => {
+        disposed = true;
+        engineRef.current = null;
+        engine.stop();
+      };
     }
     if (!verdict.playable) {
       setError(verdict.reason);
@@ -672,6 +694,13 @@ export function Player({
     onExternalPlay(mode, externalUrl, Math.max(0, (element?.currentTime ?? 0) * 1000));
   };
   const setPlayerVolume = (next: number) => {
+    if (engineRef.current) {
+      engineRef.current.setVolume(next);
+      engineRef.current.setMuted(next === 0);
+      setVolume(next);
+      setMuted(next === 0);
+      return;
+    }
     const element = videoRef.current;
     if (!element) return;
     element.volume = next;
@@ -700,7 +729,15 @@ export function Player({
         autoPlay
         preload="auto"
         poster={video?.thumbnail || meta.background}
-        style={{ objectFit: videoFit }}
+        style={{ objectFit: videoFit, display: decoding ? "none" : undefined }}
+        onDoubleClick={toggleFullscreen}
+      />
+      {/* Where the decoder draws. Object-fit matches the video element so the
+          two look the same whichever is playing. */}
+      <canvas
+        ref={canvasRef}
+        className="player-canvas"
+        style={{ objectFit: videoFit, display: decoding ? undefined : "none" }}
         onDoubleClick={toggleFullscreen}
       />
       <div className="player-shade player-shade-top" />

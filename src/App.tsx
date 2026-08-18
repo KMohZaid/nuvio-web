@@ -10,7 +10,6 @@ import {
   ChevronRight,
   Eye,
   EyeOff,
-  FlaskConical,
   Info,
   Plus,
   RefreshCw,
@@ -47,7 +46,6 @@ import { CalendarView } from "./components/Calendar";
 import { Details } from "./components/Details";
 import { Discover } from "./components/Discover";
 import { ExternalWatchPrompt } from "./components/ExternalWatchPrompt";
-import { RemuxLab } from "./components/RemuxLab";
 import {
   CollectionFolderView,
   CollectionRow,
@@ -1869,8 +1867,6 @@ export function App() {
             scope={`${profile?.profileIndex ?? 0}:${addons.map((addon) => `${addon.enabled}:${addon.url}`).join("|")}`}
             onOpen={openDetails}
           />
-        ) : deferredActive === "remuxLab" ? (
-          <RemuxLab onBack={() => setActive("settings")} />
         ) : deferredActive === "addons" ? (
           <AddonsPage
             onBack={() => setActive("settings")}
@@ -1884,7 +1880,6 @@ export function App() {
           />
         ) : (
           <SettingsPage
-            onRemuxLab={() => setActive("remuxLab")}
             addons={addons}
             addonRows={addonRows}
             onToggleAddon={toggleAddon}
@@ -2965,7 +2960,6 @@ function IntegrationCredentialField({
 }
 
 function SettingsPage({
-  onRemuxLab,
   addons,
   addonRows,
   onToggleAddon,
@@ -2997,7 +2991,6 @@ function SettingsPage({
   onShortcutReturn,
   onSignOut,
 }: {
-  onRemuxLab(): void;
   addons: InstalledAddon[];
   addonRows: AddonRow[];
   onToggleAddon(index: number): void;
@@ -4166,20 +4159,6 @@ function SettingsPage({
         </header>
         <UpdateRow />
       </div>
-      <button
-        className="setting-link settings-category-card"
-        hidden={category !== "app"}
-        onClick={onRemuxLab}
-      >
-        <FlaskConical />
-        <span>
-          <strong>Remux probe</strong>
-          <small>
-            Experiment: check whether an MKV could play here after remuxing
-          </small>
-        </span>
-        <ChevronRight />
-      </button>
       <div
         className="setting-card settings-category-card"
         hidden={category !== "app"}

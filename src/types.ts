@@ -250,7 +250,6 @@ export type NavKey =
   | "calendar"
   | "library"
   | "addons"
-  | "remuxLab"
   | "settings";
 
 /** One catalog feeding a collection folder. */

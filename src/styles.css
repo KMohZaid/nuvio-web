@@ -6315,3 +6315,13 @@ body.is-locked {
   color: #e7ebef;
 }
 .profile-lock svg { width: 12px; height: 12px; }
+
+/* The decoding player draws here. Sized and fitted exactly as the video
+   element it stands in for, so switching between them is invisible. */
+.player-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+}
