@@ -54,9 +54,64 @@ export type PlayerStatus = { state: PlayerState; message: string };
 export type MediabunnyPlayerOptions = {
   requestHeaders?: Record<string, string>;
   startPositionSeconds?: number;
+  /**
+   * Languages to prefer, best first, as two-letter codes. A file's first audio
+   * track is not its main one — a release with French first will play French
+   * to everybody unless asked otherwise.
+   */
+  preferredLanguages?: string[];
   onTime?(currentTime: number, duration: number): void;
   onEnded?(): void;
+  onAudioTracks?(tracks: AudioTrackChoice[], selected: number): void;
 };
+
+export type AudioTrackChoice = { id: number; label: string };
+
+/**
+ * Three-letter codes whose two-letter form is not their first two letters.
+ *
+ * Matroska tags tracks with ISO 639-2 while people and browsers ask in 639-1,
+ * and the two only coincide by accident: "eng" does shorten to "en", but "ger"
+ * is "de", "spa" is "es" and "jpn" is "ja". Truncating looks like it works
+ * until it silently stops matching, which is the same failure as having no
+ * preference at all.
+ */
+const LANGUAGE_ALIASES: Record<string, string> = {
+  alb: "sq", sqi: "sq", ara: "ar", arm: "hy", hye: "hy", baq: "eu", eus: "eu",
+  ben: "bn", bul: "bg", bur: "my", mya: "my", chi: "zh", zho: "zh", cze: "cs",
+  ces: "cs", dan: "da", dut: "nl", nld: "nl", eng: "en", est: "et", fin: "fi",
+  fre: "fr", fra: "fr", geo: "ka", kat: "ka", ger: "de", deu: "de", gre: "el",
+  ell: "el", heb: "he", hin: "hi", hrv: "hr", hun: "hu", ice: "is", isl: "is",
+  ind: "id", ita: "it", jpn: "ja", kor: "ko", lav: "lv", lit: "lt", mac: "mk",
+  mkd: "mk", may: "ms", msa: "ms", nor: "no", per: "fa", fas: "fa", pol: "pl",
+  por: "pt", rum: "ro", ron: "ro", rus: "ru", slo: "sk", slk: "sk", slv: "sl",
+  spa: "es", srp: "sr", swe: "sv", tam: "ta", tel: "te", tha: "th", tur: "tr",
+  ukr: "uk", urd: "ur", vie: "vi", wel: "cy", cym: "cy",
+};
+
+/** "en-GB", "eng" and "en" are the same request. */
+const normalizeLanguage = (value: string) => {
+  const base = value.trim().toLowerCase().split(/[-_]/)[0];
+  return LANGUAGE_ALIASES[base] ?? base.slice(0, 2);
+};
+
+/**
+ * Picks the track to open with.
+ *
+ * Language first, in the order asked for. Nothing matching leaves the file's
+ * own choice alone, which is the best guess available.
+ */
+export function chooseAudioTrack(
+  languages: string[],
+  preferred: string[],
+): number {
+  const available = languages.map(normalizeLanguage);
+  for (const want of preferred.map(normalizeLanguage).filter(Boolean)) {
+    const match = available.indexOf(want);
+    if (match >= 0) return match;
+  }
+  return 0;
+}
 
 /**
  * Folds any channel layout down to stereo without losing a channel.
@@ -132,6 +187,8 @@ export class MediabunnyPlayer {
   private input: Input | null = null;
   private videoTrack: InputVideoTrack | null = null;
   private audioTrack: InputAudioTrack | null = null;
+  private audioOptions: InputAudioTrack[] = [];
+  private audioIndex = 0;
   private videoSink: CanvasSink | null = null;
   private audioSink: AudioBufferSink | null = null;
   private context: AudioContext | null = null;
@@ -152,12 +209,26 @@ export class MediabunnyPlayer {
 
   duration = 0;
 
+  private url: string;
+  private canvas: HTMLCanvasElement;
+  private onStatus: (status: PlayerStatus) => void;
+  private options: MediabunnyPlayerOptions;
+
+  // Assigned rather than declared as parameter properties: the test runner
+  // strips types without compiling them, and that is the one TypeScript-only
+  // syntax it cannot strip. Keeping it out means this module can be tested
+  // like every other one here.
   constructor(
-    private url: string,
-    private canvas: HTMLCanvasElement,
-    private onStatus: (status: PlayerStatus) => void,
-    private options: MediabunnyPlayerOptions = {},
-  ) {}
+    url: string,
+    canvas: HTMLCanvasElement,
+    onStatus: (status: PlayerStatus) => void,
+    options: MediabunnyPlayerOptions = {},
+  ) {
+    this.url = url;
+    this.canvas = canvas;
+    this.onStatus = onStatus;
+    this.options = options;
+  }
 
   get currentTime() {
     if (!this.playing || !this.context) return this.pausedAt;
@@ -187,10 +258,16 @@ export class MediabunnyPlayer {
     });
     this.input = input;
 
-    const [video, audio] = await Promise.all([
+    const [video, audioTracks] = await Promise.all([
       input.getPrimaryVideoTrack(),
-      input.getPrimaryAudioTrack(),
+      input.getAudioTracks(),
     ]);
+    this.audioOptions = audioTracks;
+    this.audioIndex = chooseAudioTrack(
+      audioTracks.map((track) => track.languageCode || ""),
+      this.options.preferredLanguages ?? [],
+    );
+    const audio = audioTracks[this.audioIndex] ?? null;
 
     // Asked before anything is decoded, so an unplayable track is reported as
     // such rather than as a stall.
@@ -214,21 +291,7 @@ export class MediabunnyPlayer {
 
     this.duration = await input.computeDuration().catch(() => 0);
 
-    if (this.audioTrack) {
-      const AudioContextClass =
-        window.AudioContext ??
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
-      // Matching the file's rate keeps low-rate audio from being resampled
-      // into something that sounds wrong.
-      this.context = new AudioContextClass({
-        sampleRate: await this.audioTrack.getSampleRate(),
-      });
-      this.gain = this.context.createGain();
-      this.gain.connect(this.context.destination);
-      this.applyVolume();
-      this.audioSink = new AudioBufferSink(this.audioTrack);
-    }
+    if (this.audioTrack) await this.openAudio();
 
     if (this.videoTrack) {
       this.canvas.width = await this.videoTrack.getDisplayWidth();
@@ -239,6 +302,8 @@ export class MediabunnyPlayer {
       });
     }
 
+    this.options.onAudioTracks?.(this.describeAudioTracks(), this.audioIndex);
+
     if (trouble.length)
       this.report(
         "buffering",
@@ -246,6 +311,23 @@ export class MediabunnyPlayer {
       );
 
     await this.seek(this.options.startPositionSeconds ?? 0);
+  }
+
+  private async openAudio() {
+    if (!this.audioTrack) return;
+    const AudioContextClass =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext: typeof AudioContext })
+        .webkitAudioContext;
+    // Matching the file's rate keeps low-rate audio from being resampled into
+    // something that sounds wrong.
+    this.context = new AudioContextClass({
+      sampleRate: await this.audioTrack.getSampleRate(),
+    });
+    this.gain = this.context.createGain();
+    this.gain.connect(this.context.destination);
+    this.applyVolume();
+    this.audioSink = new AudioBufferSink(this.audioTrack);
   }
 
   /**
@@ -288,6 +370,49 @@ export class MediabunnyPlayer {
     }
     if (wasPlaying) await this.play();
     else this.options.onTime?.(this.currentTime, this.duration);
+  }
+
+  /** The audio tracks the file offers, named as helpfully as it allows. */
+  private describeAudioTracks(): AudioTrackChoice[] {
+    return this.audioOptions.map((track, id) => {
+      const language = track.languageCode?.trim();
+      const name = track.name?.trim();
+      const parts = [name, language && language !== "und" ? language.toUpperCase() : ""]
+        .filter(Boolean)
+        .join(" · ");
+      return { id, label: parts || `Track ${id + 1}` };
+    });
+  }
+
+  /**
+   * Switches audio track, keeping the picture where it is.
+   *
+   * The context is rebuilt rather than reused: a different track may be at a
+   * different sample rate, and an AudioContext's rate is fixed once created.
+   */
+  async selectAudioTrack(id: number) {
+    const track = this.audioOptions[id];
+    if (!track || id === this.audioIndex) return;
+    const resumeAt = this.currentTime;
+    const wasPlaying = this.playing;
+    this.playing = false;
+    this.generation += 1;
+    this.silence();
+
+    this.audioIndex = id;
+    this.audioTrack = (await track.canDecode().catch(() => false))
+      ? track
+      : null;
+    await this.context?.close().catch(() => undefined);
+    this.context = null;
+    this.gain = null;
+    this.audioSink = null;
+    if (this.audioTrack) await this.openAudio();
+    else this.report("buffering", "That track cannot be decoded here.");
+
+    this.pausedAt = resumeAt;
+    this.options.onAudioTracks?.(this.describeAudioTracks(), this.audioIndex);
+    if (wasPlaying) await this.play();
   }
 
   setVolume(value: number) {

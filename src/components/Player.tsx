@@ -491,6 +491,18 @@ export function Player({
         {
           requestHeaders: stream.behaviorHints?.proxyHeaders?.request,
           startPositionSeconds: startPositionMs / 1000,
+          // A file's first audio track is not its main one. Without this a
+          // release that happens to list French first plays French.
+          preferredLanguages: languageTargets(
+            settings.preferredAudioLanguage,
+            settings.secondaryPreferredAudioLanguage,
+            true,
+          ),
+          onAudioTracks: (tracks, selected) => {
+            if (disposed) return;
+            setAudioTracks(tracks);
+            setSelectedAudio(selected);
+          },
           onTime: (position, total) => {
             if (disposed) return;
             setCurrentTime(position);
@@ -669,6 +681,12 @@ export function Player({
   }, []);
 
   const selectAudio = (id: number) => {
+    if (engineRef.current) {
+      void engineRef.current.selectAudioTrack(id);
+      setSelectedAudio(id);
+      setAudioOpen(false);
+      return;
+    }
     if (hlsRef.current) hlsRef.current.audioTrack = id;
     else {
       const list = (
