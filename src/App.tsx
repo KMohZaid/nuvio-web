@@ -119,7 +119,7 @@ import {
 import {
   clearExternalHandoff,
   expectExternalReturn,
-  lastExternalReturn,
+  readExternalReturnLog,
   noteExternalReturn,
   readExternalHandoff,
   rememberExternalHandoff,
@@ -334,7 +334,7 @@ export function App() {
    */
   const handedOff = useRef<{ meta: Meta; video?: Video } | null>(null);
   /** Held in state so Settings updates on a return rather than on a revisit. */
-  const [lastReturn, setLastReturn] = useState(() => lastExternalReturn());
+  const [lastReturn, setLastReturn] = useState(() => readExternalReturnLog());
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -506,7 +506,7 @@ export function App() {
     const check = (reason: string) => {
       if (document.visibilityState !== "visible") return;
       noteExternalReturn(reason);
-      setLastReturn(lastExternalReturn());
+      setLastReturn(readExternalReturnLog());
       const report = takeExternalReport();
       if (report) applyExternalReport(report);
     };
@@ -2952,8 +2952,8 @@ function SettingsPage({
   /** Whether the Shortcut that reopens this installed web app is set up. */
   shortcutReturn: boolean;
   onShortcutReturn(value: boolean): void;
-  /** The last address a player reopened the app at, shown as a diagnostic. */
-  lastReturn: string;
+  /** How the app was last reopened, newest first, shown as a diagnostic. */
+  lastReturn: string[];
   onSignOut(): void;
 }) {
   const [category, setCategory] = useState<SettingsCategory>("appearance");
@@ -4035,10 +4035,20 @@ function SettingsPage({
             </p>
             {/* The route runs through two other apps and ends on a device with
                 no console, so what actually arrived is worth keeping. */}
-            <p className="settings-shortcut-target">
-              Last return from a player:{" "}
-              <code>{lastReturn || "nothing yet"}</code>
-            </p>
+            <div className="settings-shortcut-target">
+              How the app was last reopened:
+              {lastReturn.length ? (
+                <ol className="settings-return-log">
+                  {lastReturn.map((line, index) => (
+                    <li key={`${line}:${index}`}>
+                      <code>{line}</code>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <> <code>nothing yet</code></>
+              )}
+            </div>
             <label className="setting-select-row">
               <span>
                 <strong>Test the return</strong>

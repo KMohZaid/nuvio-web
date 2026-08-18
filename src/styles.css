@@ -4245,6 +4245,20 @@ body.is-locked {
   align-items: center;
   gap: 10px;
 }
+/* Newest first, so the entry that answers the last test is the one at the top
+   rather than the one that needs scrolling to. */
+.settings-return-log {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+.settings-return-log code {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
 .source-player {
   display: flex;
   align-items: center;

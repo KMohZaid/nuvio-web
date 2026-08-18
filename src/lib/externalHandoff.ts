@@ -82,92 +82,91 @@ export type ExternalPlayerReport =
   | { outcome: "finished" }
   | { outcome: "stopped"; positionMs: number; durationMs: number };
 
-const LAST_RETURN_KEY = "nuvio-web-last-return";
+const LOG_KEY = "nuvio-web-return-log";
 
 /**
- * What the address bar held when the app was last reopened by a player.
+ * A short log of how the app was last reopened.
  *
- * Kept because the route it travels cannot be watched from here: it runs
- * through another app, and on the device where that matters there is no
- * console to read. Settings shows it, so whether a position ever arrives is a
- * question the phone can answer.
- */
-export function lastExternalReturn(): string {
-  try {
-    return localStorage.getItem(LAST_RETURN_KEY) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-/**
- * Records what the address held, whether or not it said anything useful.
+ * A log rather than a single reading, because the question is a sequence: a
+ * test goes out, and either something comes back seconds later or the next
+ * entry is a person reopening the app minutes afterwards. One line cannot
+ * tell those apart — the flag saying an answer is owed is consumed by
+ * whichever open happens first, whether or not it was the answer.
  *
- * A report that never arrives and a report that arrives empty look identical
- * from the outside, and telling them apart is the whole question on the route
- * through Shortcuts.
+ * Kept because this route cannot be watched from here. It runs through two
+ * other apps and ends on a device with no console, so the phone has to be able
+ * to answer the question itself.
  */
-const EXPECT_KEY = "nuvio-web-expect-return";
-
-/**
- * Says an answer is being waited for, so the next arrival is recorded whatever
- * it carries.
- *
- * A blank address only means something while someone is owed a reply. Without
- * this, a return that arrived carrying nothing and a return that never
- * happened both left no trace, and those are precisely the two things worth
- * telling apart.
- */
-export function expectExternalReturn() {
-  try {
-    localStorage.setItem(EXPECT_KEY, "1");
-    // Written now, so a test that never comes back still says so rather than
-    // leaving the previous reading in place to be read as this one's result.
-    localStorage.setItem(LAST_RETURN_KEY, `${clockTime()} test sent · waiting`);
-  } catch {
-    // Only the diagnostic is lost.
-  }
-}
+const LOG_LIMIT = 6;
+const TEST_KEY = "nuvio-web-test-sent-at";
+/** Long enough to cover a slow hop, short enough not to colour a later visit. */
+const TEST_WINDOW_MS = 5 * 60 * 1000;
 
 /** Local time: this is read on the device, against its own clock. */
 function clockTime() {
   return new Date().toLocaleTimeString();
 }
 
+export function readExternalReturnLog(): string[] {
+  try {
+    const raw = localStorage.getItem(LOG_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function append(line: string) {
+  try {
+    const log = [`${clockTime()} ${line}`, ...readExternalReturnLog()];
+    localStorage.setItem(LOG_KEY, JSON.stringify(log.slice(0, LOG_LIMIT)));
+  } catch {
+    // Only the diagnostic is lost.
+  }
+}
+
+/**
+ * Notes that a test has gone out, so arrivals for the next few minutes are
+ * logged whatever they carry — and so a test that never comes back is visible
+ * as an entry with nothing after it.
+ */
+export function expectExternalReturn() {
+  try {
+    localStorage.setItem(TEST_KEY, String(Date.now()));
+  } catch {
+    // The window is lost; arrivals carrying parameters are still logged.
+  }
+  append("test sent");
+}
+
 export function noteExternalReturn(reason: string) {
   if (typeof window === "undefined") return;
-  let expecting = false;
+  let sentAt = 0;
   try {
-    expecting = localStorage.getItem(EXPECT_KEY) === "1";
+    sentAt = Number(localStorage.getItem(TEST_KEY) ?? 0);
   } catch {
-    // Treated as not expecting.
+    // Treated as no test outstanding.
   }
+  // The window is not consumed by the first arrival: an open that is not the
+  // answer must not stop the answer from being logged when it does come.
+  const testing = sentAt > 0 && Date.now() - sentAt < TEST_WINDOW_MS;
   const pending = !!readExternalHandoff();
-  // Otherwise every ordinary open would overwrite the reading being read.
-  if (!window.location.search && !expecting && !pending) return;
-  // Why this was recorded at all. A blank reading means nothing without it:
-  // the return from a test and an unrelated open while a hand-off was still
-  // unanswered look identical, and only one of them is an answer.
-  const trigger = expecting
+  // Otherwise every ordinary open would fill the log with nothing.
+  if (!window.location.search && !testing && !pending) return;
+  const why = testing
     ? "after test"
     : window.location.search
       ? "with parameters"
       : "while awaiting a player";
-  try {
-    localStorage.removeItem(EXPECT_KEY);
-    localStorage.setItem(
-      LAST_RETURN_KEY,
-      // The path as well as the query: an installed web app reopened at its
-      // start_url rather than at the address it was given is a different
-      // failure from one reopened correctly with the query stripped, and they
-      // are otherwise indistinguishable.
-      `${clockTime()} ${reason} ${trigger} · ${window.location.pathname}${
-        window.location.search || " (no parameters)"
-      }`,
-    );
-  } catch {
-    // Only the diagnostic is lost.
-  }
+  // The path as well as the query: an installed web app reopened at its
+  // start_url rather than at the address it was given is a different failure
+  // from one reopened correctly with the query stripped.
+  append(
+    `${reason} ${why} · ${window.location.pathname}${
+      window.location.search || " (no parameters)"
+    }`,
+  );
 }
 
 /** Reads the report out of the address bar and takes it back out again. */
