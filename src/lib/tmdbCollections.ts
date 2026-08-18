@@ -135,7 +135,6 @@ async function get<T>(
   // back, so two sources returning identical results is visible here.
   const shown = new URLSearchParams(params);
   shown.delete("api_key");
-  console.info("[nuvio tmdb]", endpoint, Object.fromEntries(shown));
   const response = await fetch(`${API}/${endpoint}?${params}`, {
     credentials: "omit",
     referrerPolicy: "no-referrer",

@@ -663,14 +663,6 @@ export function App() {
     // a newer one starts is the classic way a page ends up empty. Each run
     // announces itself so a broken switch can be told apart from a broken
     // fetch: no line means the effect never fired.
-    console.info("[nuvio profile] load", {
-      profile: profileIndex,
-      name: profile.name,
-      addonsFrom: addonProfileIndex,
-      mirrorsPrimaryAddons: !!profile.usesPrimaryAddons,
-      generation,
-      loadGeneration,
-    });
     const isCurrent = () =>
       generation === profileGeneration.current &&
       loadGeneration === profileLoadGeneration.current &&
@@ -732,7 +724,6 @@ export function App() {
         loadHomeLayout(profileIndex).catch(() => null),
       ]);
       if (!isCurrent()) {
-        console.warn("[nuvio profile] load abandoned after addons", profileIndex);
         return;
       }
       setAddonRows(rows);

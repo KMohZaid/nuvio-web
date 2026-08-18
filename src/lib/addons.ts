@@ -283,24 +283,9 @@ export function mapMeta(
           ) || undefined
         : undefined,
     videos: Array.isArray(value.videos)
-      ? (() => {
-          const raw = value.videos as Array<Record<string, unknown>>;
-          // One line per title, not per episode. Addons disagree about where a
-          // per-episode score lives, and the only way to know which key this
-          // one uses is to see an actual episode object.
-          if (raw.length)
-            console.info("[nuvio addons] first episode object", {
-              addon: addonName,
-              keys: Object.keys(raw[0]!),
-              ratingLike: Object.fromEntries(
-                Object.entries(raw[0]!).filter(([key]) =>
-                  /rat|vote|score|imdb/i.test(key),
-                ),
-              ),
-              sample: raw[0],
-            });
-          return raw.map((video) => mapVideo(video));
-        })()
+      ? (value.videos as Array<Record<string, unknown>>).map((video) =>
+          mapVideo(video),
+        )
       : [],
     manifestUrl,
     addonName,
@@ -345,20 +330,8 @@ export async function loadInstalledAddons(
       try {
         const url = normalizeManifestUrl(row.url);
         const manifest = await fetchJson<AddonManifest>(url);
-        console.info("[nuvio addons] manifest", {
-          requested: row.url,
-          fetched: url,
-          name: manifest?.name,
-          catalogs: manifest?.catalogs?.length ?? 0,
-          catalogIds: (manifest?.catalogs ?? []).map(
-            (catalog) => `${catalog.type}/${catalog.id}`,
-          ),
-          resources: manifest?.resources,
-          keys: Object.keys(manifest ?? {}),
-        });
         return { ...row, url, name: manifest.name || row.name, manifest };
       } catch (error) {
-        console.warn("[nuvio addons] manifest failed", row.url, error);
         return { ...row, error: explainAddonFailure(row.url, error) };
       }
     }),
@@ -441,20 +414,9 @@ export async function loadHome(
       return false;
     });
 
-  if (skipped.length) console.warn("[nuvio addons] catalogs not shown", skipped);
 
   // Ordered before batching, so the rows the user put on top are the ones
   // fetched first and therefore the ones that paint first.
-  console.info("[nuvio addons] home targets", {
-    addons: addons.length,
-    enabled: addons.filter((addon) => addon.enabled).length,
-    withManifest: addons.filter((addon) => addon.enabled && addon.manifest).length,
-    catalogsDeclared: addons
-      .filter((addon) => addon.enabled && addon.manifest)
-      .reduce((sum, addon) => sum + (addon.manifest!.catalogs?.length ?? 0), 0),
-    afterRequiredExtraFilter: targets.length,
-    hasLayout: !!layout,
-  });
 
   if (layout)
     targets.sort(
@@ -475,11 +437,6 @@ export async function loadHome(
           const payload = await fetchJson<{
             metas?: Array<Record<string, unknown>>;
           }>(catalogUrl);
-          console.info("[nuvio addons] catalog", {
-            url: catalogUrl,
-            metas: payload?.metas?.length ?? 0,
-            keys: Object.keys(payload ?? {}),
-          });
           const prefKey = `${addon.manifest!.id}:${catalog.type}:${catalog.id}`;
           const base = catalog.name || catalog.id;
           return {
@@ -505,12 +462,6 @@ export async function loadHome(
               .slice(0, 24),
           } satisfies CatalogSection;
         } catch (error) {
-          console.warn(
-            "[nuvio addons] catalog failed",
-            `${catalog.type}/${catalog.id}`,
-            addon.url,
-            error,
-          );
           errors.push(
             `${addon.name ?? addon.url}: ${error instanceof Error ? error.message : "catalog failed"}`,
           );
@@ -522,21 +473,9 @@ export async function loadHome(
       (section): section is CatalogSection =>
         section !== null && section.items.length > 0,
     );
-    for (const section of batch)
-      if (section && section.items.length === 0)
-        console.warn(
-          "[nuvio addons] catalog dropped: no items after filtering",
-          section.key,
-        );
     sections.push(...usable);
     for (const section of usable) onSection?.(section);
   }
-  console.info("[nuvio addons] home done", {
-    rowsReturned: sections.length,
-    requested: targets.length,
-    notShown: skipped.length,
-    errors,
-  });
   return { sections, errors };
 }
 
@@ -764,13 +703,6 @@ export async function loadCollectionSources(
   for (const source of sources)
     byProvider[source.provider || "addon"] =
       (byProvider[source.provider || "addon"] ?? 0) + 1;
-  console.info("[nuvio addons] collection sources", {
-    declared: sources.length,
-    byProvider,
-    requested: cursor,
-    items: items.length,
-    errors: errors.slice(0, 3),
-  });
   return {
     items,
     errors,
