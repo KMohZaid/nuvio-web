@@ -1113,8 +1113,9 @@ a {
   background: var(--app-bg);
   border: 0;
   border-radius: 0;
-  padding: max(20px, env(safe-area-inset-top)) 26px
-    max(28px, env(safe-area-inset-bottom));
+  /* No top padding of its own: that belongs to the sticky header below, which
+     has to reach the top of the scrollport to cover what passes under it. */
+  padding: 0 26px max(28px, env(safe-area-inset-bottom));
   animation: source-sheet-in 0.16s ease-out;
 }
 /* The content stays a readable column on a wide screen even though the
@@ -1144,8 +1145,29 @@ a {
   justify-content: space-between;
   align-items: center;
 }
+/* Which source you are choosing, which player it will open in, and the way
+   out stay put: a long list otherwise scrolls all three away, and on a phone
+   the way out is then several flicks back up. */
+.source-sheet > header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  gap: 12px;
+  background: var(--app-bg);
+  padding: max(14px, env(safe-area-inset-top)) 0 12px;
+  border-bottom: 1px solid var(--panel-border);
+}
+/* Both halves may shrink, and the title stays on one line rather than
+   wrapping into the height the pinned header keeps for the whole scroll. */
+.source-sheet > header > :first-child,
+.source-sheet-tools {
+  min-width: 0;
+}
 .source-sheet h2 {
   margin: 5px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .sheet-loading {
   padding: 50px 10px;
@@ -1950,10 +1972,13 @@ a {
     font-size: 10px;
   }
   .source-sheet {
-    /* Full screen on a phone means the header sits under the status bar
-       unless the inset is respected. */
-    padding: max(14px, env(safe-area-inset-top)) 14px
-      max(22px, env(safe-area-inset-bottom));
+    padding: 0 14px max(22px, env(safe-area-inset-bottom));
+  }
+  /* The header is pinned now, so its height is spent for the whole scroll.
+     At the desktop size the title wrapped beside the picker and cost two
+     lines of it. */
+  .source-sheet h2 {
+    font-size: 18px;
   }
   .source-main p {
     font-size: 13px;
@@ -4238,8 +4263,11 @@ body.is-locked {
   .source-player > span {
     display: none;
   }
+  /* Enough for the longest player name, and no more: the rest of the row is
+     the title, which would otherwise be clipped on a 375px screen. Narrower
+     than that it ellipsises, which is what it is there for. */
   .source-player select {
-    max-width: 46vw;
+    max-width: 36vw;
   }
 }
 
