@@ -118,6 +118,7 @@ import {
 } from "./lib/externalPlayer";
 import {
   clearExternalHandoff,
+  expectExternalReturn,
   lastExternalReturn,
   noteExternalReturn,
   readExternalHandoff,
@@ -332,6 +333,8 @@ export function App() {
    * refers to has to outlive the moment the app started.
    */
   const handedOff = useRef<{ meta: Meta; video?: Video } | null>(null);
+  /** Held in state so Settings updates on a return rather than on a revisit. */
+  const [lastReturn, setLastReturn] = useState(() => lastExternalReturn());
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -503,6 +506,7 @@ export function App() {
     const check = (reason: string) => {
       if (document.visibilityState !== "visible") return;
       noteExternalReturn(reason);
+      setLastReturn(lastExternalReturn());
       const report = takeExternalReport();
       if (report) applyExternalReport(report);
     };
@@ -1838,6 +1842,7 @@ export function App() {
             onProviderCredential={saveProviderCredential}
             externalPlayer={externalPlayer}
             shortcutReturn={shortcutReturn}
+            lastReturn={lastReturn}
             onShortcutReturn={(value) => {
               localStorage.setItem("nuvio-web-shortcut-return", value ? "1" : "0");
               setShortcutReturn(value);
@@ -2905,6 +2910,7 @@ function SettingsPage({
   onExternalPlayer,
   shortcutReturn,
   onShortcutReturn,
+  lastReturn,
   onSignOut,
 }: {
   onRemuxLab(): void;
@@ -2946,6 +2952,8 @@ function SettingsPage({
   /** Whether the Shortcut that reopens this installed web app is set up. */
   shortcutReturn: boolean;
   onShortcutReturn(value: boolean): void;
+  /** The last address a player reopened the app at, shown as a diagnostic. */
+  lastReturn: string;
   onSignOut(): void;
 }) {
   const [category, setCategory] = useState<SettingsCategory>("appearance");
@@ -4029,7 +4037,7 @@ function SettingsPage({
                 no console, so what actually arrived is worth keeping. */}
             <p className="settings-shortcut-target">
               Last return from a player:{" "}
-              <code>{lastExternalReturn() || "nothing yet"}</code>
+              <code>{lastReturn || "nothing yet"}</code>
             </p>
             <label className="setting-select-row">
               <span>
@@ -4046,6 +4054,10 @@ function SettingsPage({
                 type="button"
                 className="secondary"
                 onClick={() => {
+                  // Marked first: whatever comes back is then recorded, empty
+                  // or not, which is the only way "arrived with nothing" and
+                  // "never arrived" can be told apart.
+                  expectExternalReturn();
                   window.location.href = shortcutReturnUrl(
                     installedAppUrl(),
                     "?nuvio-external=stopped&position=83&duration=5400",

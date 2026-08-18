@@ -107,18 +107,46 @@ export function lastExternalReturn(): string {
  * from the outside, and telling them apart is the whole question on the route
  * through Shortcuts.
  */
+const EXPECT_KEY = "nuvio-web-expect-return";
+
+/**
+ * Says an answer is being waited for, so the next arrival is recorded whatever
+ * it carries.
+ *
+ * A blank address only means something while someone is owed a reply. Without
+ * this, a return that arrived carrying nothing and a return that never
+ * happened both left no trace, and those are precisely the two things worth
+ * telling apart.
+ */
+export function expectExternalReturn() {
+  try {
+    localStorage.setItem(EXPECT_KEY, "1");
+  } catch {
+    // Only the diagnostic is lost.
+  }
+}
+
 export function noteExternalReturn(reason: string) {
   if (typeof window === "undefined") return;
-  // Only when something arrived, or when an answer is outstanding — a blank
-  // address is the interesting case only while a player still owes us one.
-  // Otherwise every ordinary open would overwrite the reading being looked at.
-  if (!window.location.search && !readExternalHandoff()) return;
+  let expecting = false;
   try {
+    expecting = localStorage.getItem(EXPECT_KEY) === "1";
+  } catch {
+    // Treated as not expecting.
+  }
+  // Otherwise every ordinary open would overwrite the reading being read.
+  if (!window.location.search && !expecting && !readExternalHandoff()) return;
+  try {
+    localStorage.removeItem(EXPECT_KEY);
     localStorage.setItem(
       LAST_RETURN_KEY,
+      // The path as well as the query: an installed web app reopened at its
+      // start_url rather than at the address it was given is a different
+      // failure from one reopened correctly with the query stripped, and they
+      // are otherwise indistinguishable.
       `${new Date().toISOString().slice(11, 19)} ${reason} · ${
-        window.location.search || "(no parameters)"
-      }`,
+        window.location.pathname
+      }${window.location.search || " (no parameters)"}`,
     );
   } catch {
     // Only the diagnostic is lost.
