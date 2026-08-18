@@ -134,6 +134,7 @@ import {
   registerCurrentDevice,
   resetDeviceRegistration,
 } from "./lib/deviceSession";
+import { bingeGroupFor, rememberBingeGroup } from "./lib/bingeCache";
 import { pickBingeStream } from "./lib/nextEpisode";
 import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
@@ -1610,18 +1611,59 @@ export function App() {
 
   const openContinueSources = useCallback(
     (card: ContinueCard, startAtBeginning: boolean) => {
-      setDetailLaunch({
-        videoId: card.video?.id,
-        openSources: true,
-        startAtBeginning,
-      });
-      setSelected(
-        card.video
-          ? { ...card.item, selectedVideoId: card.video.id }
-          : card.item,
-      );
+      const openTitle = () => {
+        setDetailLaunch({
+          videoId: card.video?.id,
+          openSources: true,
+          startAtBeginning,
+        });
+        setSelected(
+          card.video
+            ? { ...card.item, selectedVideoId: card.video.id }
+            : card.item,
+        );
+      };
+
+      // Where the source is already known, continuing should continue rather
+      // than ask again. Anything unexpected — no remembered group, that
+      // release gone, the lookup failing — falls back to the title page with
+      // its sources open, which is what this always did.
+      const group = bingeGroupFor(card.item.id);
+      const target = card.video;
+      if (!group || !target) {
+        openTitle();
+        return;
+      }
+      const generation = ++episodeSwitch.current;
+      setMessage("Finding where you left off…");
+      // The full metadata alongside the sources: without it the player has no
+      // episode list, so next-up and the episode picker would both be empty.
+      void Promise.all([
+        loadStreams(card.item.type, target.id, addons),
+        resolveMeta(card.item, addons).catch(() => card.item),
+      ])
+        .then(([streams, meta]) => {
+          if (generation !== episodeSwitch.current) return;
+          const chosen = pickBingeStream(streams, group);
+          setMessage("");
+          if (!chosen) {
+            openTitle();
+            return;
+          }
+          setPlayback({
+            stream: chosen,
+            meta: { ...meta, selectedVideoId: target.id },
+            video: target,
+            startAtBeginning,
+          });
+        })
+        .catch(() => {
+          if (generation !== episodeSwitch.current) return;
+          setMessage("");
+          openTitle();
+        });
     },
-    [],
+    [addons],
   );
 
   const dismissContinueCard = useCallback(
@@ -2031,6 +2073,10 @@ export function App() {
                   );
                   return;
                 }
+                rememberBingeGroup(
+                  current.meta.id,
+                  chosen.behaviorHints?.bingeGroup,
+                );
                 setPlayback({
                   stream: chosen,
                   meta: current.meta,
@@ -2140,6 +2186,7 @@ export function App() {
               handOffToExternalPlayer(chosen, url, meta, video);
               return;
             }
+            rememberBingeGroup(meta.id, stream.behaviorHints?.bingeGroup);
             setPlayback({
               stream,
               meta,
