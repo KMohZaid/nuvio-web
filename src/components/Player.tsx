@@ -93,6 +93,7 @@ export function Player({
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const remuxerRef = useRef<StableRemuxStreamer | null>(null);
+  const [errorCopied, setErrorCopied] = useState(false);
   const hideTimer = useRef<number | undefined>(undefined);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
@@ -863,7 +864,32 @@ export function Player({
       {error && (
         <div className="player-error">
           <strong>Browser playback unavailable</strong>
-          <p>{error}</p>
+          {/* The message is the diagnosis, and it is long. Tapping it copies
+              it so it can be pasted somewhere useful rather than retyped from
+              a phone screen. */}
+          <p
+            className="player-error-message"
+            role="button"
+            tabIndex={0}
+            title="Tap to copy this message"
+            onClick={() => {
+              void navigator.clipboard.writeText(error);
+              setErrorCopied(true);
+              window.setTimeout(() => setErrorCopied(false), 1600);
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              void navigator.clipboard.writeText(error);
+              setErrorCopied(true);
+              window.setTimeout(() => setErrorCopied(false), 1600);
+            }}
+          >
+            {error}
+          </p>
+          <small className="player-error-hint">
+            {errorCopied ? "Copied" : "Tap the message to copy it"}
+          </small>
           <div>
             {externalUrl && (
               <>

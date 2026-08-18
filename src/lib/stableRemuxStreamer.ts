@@ -81,6 +81,26 @@ function join(
   return joined;
 }
 
+/**
+ * Rewrites a hev1./hvc1. codec-parameter prefix to match whichever of the
+ * two sample entry fourCCs the moov actually contains.
+ *
+ * Mediabunny's HEVC sample entry box is always named hvc1 (its box writer
+ * hardcodes that fourCC), but its codec-string builder always starts the
+ * parameter with hev1. — the two disagree unconditionally, not depending on
+ * the stream. A SourceBuffer opened with a codec string whose prefix doesn't
+ * match the box it's about to receive is rejected outright, so the string is
+ * corrected here rather than trusted as given.
+ */
+function normalizeHevcMimePrefix(mime: string, boxEntries?: string[]): string {
+  if (!mime) return mime;
+  // Without the moov to read, hvc1 is the safe assumption: it is the only
+  // HEVC box name this writer produces.
+  const hev1 = boxEntries?.includes("hev1") && !boxEntries.includes("hvc1");
+  if (hev1) return mime.replaceAll("hvc1.", "hev1.");
+  return mime.replaceAll("hev1.", "hvc1.");
+}
+
 function errorMessage(error: unknown) {
   if (error instanceof Error && error.message) return error.message;
   return String(error || "Unknown media error");
@@ -154,6 +174,10 @@ export class StableRemuxStreamer {
   private processedTime = 0;
   private fragmentCount = 0;
   private lastAppend = "nothing yet";
+  /** What the init segment declared, so a rejection can say what was rejected. */
+  private initSummary = "";
+  /** The output's real MIME, learnt after the moov and applied before appending. */
+  private pendingMime = "";
   private evicting = false;
   private appendedMediaSegments = 0;
   private segmentsAtLastProgress = 0;
@@ -470,9 +494,44 @@ export class StableRemuxStreamer {
       let initQueued = false;
       let lastMoof: { bytes: Uint8Array; timestamp: number } | null = null;
       const pendingMoofs: Array<{ bytes: Uint8Array; timestamp: number }> = [];
-      const maybeQueueInit = () => {
+      const maybeQueueInit = async () => {
         if (initQueued || !ftyp || !moov) return;
         initQueued = true;
+        // getMimeType() before the conversion runs reports the source's codecs,
+        // not the output's. When the video is transcoded — HEVC in, H.264 out —
+        // that opens the SourceBuffer expecting hev1 and then hands it avc1,
+        // which the browser rejects outright. Asking again now that the moov
+        // exists gets what was actually written.
+        const realMime = await output.getMimeType().catch(() => this.mime);
+        // A rejected init segment nearly always means the sample entries in
+        // the moov disagree with the MIME the SourceBuffer was opened with.
+        // Both are printed so the mismatch is visible rather than inferred.
+        const text = new TextDecoder("latin1").decode(moov);
+        const entries = [
+          "avc1", "avc3", "hvc1", "hev1", "av01", "vp09",
+          "mp4a", "ac-3", "ec-3", "Opus", "fLaC",
+        ].filter((code) => text.includes(code));
+        // mediabunny's HEVC sample entry is always written as hvc1 (see
+        // videoCodecToBoxName in its isobmff-boxes module), but its codec
+        // string builder always emits a hev1. prefix regardless — the two
+        // disagree by construction, not because of anything on our end. The
+        // box bytes are ground truth, so the codec string is rewritten to
+        // match whichever of hvc1/hev1 the moov actually contains.
+        const normalizedMime = normalizeHevcMimePrefix(realMime, entries);
+        if (normalizedMime && normalizedMime !== this.mime)
+          this.pendingMime = normalizedMime;
+        // Kept on the instance so a failure can say what it was carrying,
+        // rather than leaving the reason in a console nobody is watching.
+        this.initSummary = `${entries.join("+") || "no sample entries"} as ${
+          this.mime || plannedMime || "unknown mime"
+        }${transcodeAudio ? ", audio converted to AAC" : ""}`;
+        console.info("[nuvio remux] init segment", {
+          bytes: ftyp.byteLength + moov.byteLength,
+          sampleEntries: entries,
+          declaredMime: this.mime,
+          plannedMime,
+          transcodeAudio,
+        });
         this.enqueue(join(ftyp, moov), "initialization segment", generation);
         ftyp = null;
         moov = null;
@@ -484,12 +543,12 @@ export class StableRemuxStreamer {
         onFtyp: (bytes) => {
           if (this.stopped || generation !== this.conversionGeneration) return;
           ftyp = bytes.slice();
-          maybeQueueInit();
+          void maybeQueueInit();
         },
         onMoov: (bytes) => {
           if (this.stopped || generation !== this.conversionGeneration) return;
           moov = bytes.slice();
-          maybeQueueInit();
+          void maybeQueueInit();
         },
         onMoof: (bytes, _position, timestamp) => {
           if (this.stopped || generation !== this.conversionGeneration) return;
@@ -577,7 +636,7 @@ export class StableRemuxStreamer {
 
     try {
       if (this.stopped) return;
-      this.mime = await output.getMimeType();
+      this.mime = normalizeHevcMimePrefix(await output.getMimeType());
       await opened;
       if (this.stopped) return;
       if (mediaSource.readyState !== "open") {
@@ -661,7 +720,7 @@ export class StableRemuxStreamer {
             await built.conversion.cancel().catch(() => undefined);
           return;
         }
-        const nextMime = await built.output.getMimeType();
+        const nextMime = normalizeHevcMimePrefix(await built.output.getMimeType());
         if (nextMime !== this.mime)
           throw new Error(`The stream changed codec while seeking (${nextMime}).`);
         this.conversion = built.conversion;
@@ -716,6 +775,21 @@ export class StableRemuxStreamer {
       return;
     }
     this.queuedBytes -= next.bytes.byteLength;
+    // The output's real codecs are only known once it has written a moov, so
+    // the buffer is retyped to match rather than left expecting the source's.
+    if (this.pendingMime && this.pendingMime !== this.mime) {
+      const target = this.pendingMime;
+      this.pendingMime = "";
+      try {
+        this.buffer.changeType(target);
+        this.mime = target;
+      } catch (error) {
+        this.fail(
+          `The stream is ${target} but this browser will not switch to it: ${errorMessage(error)}`,
+        );
+        return;
+      }
+    }
     this.lastAppend = `${next.label} (${(next.bytes.byteLength / 1024).toFixed(0)} KB)`;
     if (next.label.startsWith("fragment ")) this.appendedMediaSegments += 1;
     try {
@@ -730,7 +804,9 @@ export class StableRemuxStreamer {
         return;
       }
       this.fail(
-        `The browser rejected ${this.lastAppend}: ${errorMessage(error)} · ${this.rangeDescription()}`,
+        `The browser rejected ${this.lastAppend}: ${errorMessage(error)}` +
+          `${this.initSummary ? ` · stream was ${this.initSummary}` : ""}` +
+          ` · ${this.rangeDescription()}`,
       );
     }
   }
@@ -767,7 +843,9 @@ export class StableRemuxStreamer {
     };
     const onError = () => {
       this.fail(
-        `The browser rejected ${this.lastAppend} · ${mediaErrorMessage(this.element)} · ${this.rangeDescription()}`,
+        `The browser rejected ${this.lastAppend} · ${mediaErrorMessage(this.element)}` +
+          `${this.initSummary ? ` · stream was ${this.initSummary}` : ""}` +
+          ` · ${this.rangeDescription()}`,
       );
     };
     buffer.addEventListener("updateend", onUpdateEnd);
@@ -779,7 +857,12 @@ export class StableRemuxStreamer {
   }
 
   private watchMediaElement() {
-    const onError = () => this.fail(mediaErrorMessage(this.element));
+    const onError = () =>
+      this.fail(
+        `${mediaErrorMessage(this.element)}${
+          this.initSummary ? ` · stream was ${this.initSummary}` : ""
+        }`,
+      );
     const onPlaying = () =>
       this.report("ready", `Playing · ${this.bufferedAhead().toFixed(1)}s buffered`);
     this.element.addEventListener("error", onError);
