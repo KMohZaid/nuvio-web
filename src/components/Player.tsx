@@ -1,5 +1,9 @@
 import type Hls from "hls.js";
-import { copyStreamUrl } from "../lib/externalPlayer";
+import {
+  copyStreamUrl,
+  externalPlayerOptions,
+  launchExternalPlayer,
+} from "../lib/externalPlayer";
 import { safeHttpUrl } from "../lib/security";
 import {
   assessPlayback,
@@ -34,7 +38,7 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import type { Meta, Stream, Video } from "../types";
+import type { ExternalPlayerMode, Meta, Stream, Video } from "../types";
 
 type AudioChoice = { id: number; label: string };
 type NativeAudioTrackList = {
@@ -121,6 +125,7 @@ export function Player({
   );
   const [controlsVisible, setControlsVisible] = useState(true);
   const [audioOpen, setAudioOpen] = useState(false);
+  const [externalPlayerOpen, setExternalPlayerOpen] = useState(false);
   const [audioTracks, setAudioTracks] = useState<AudioChoice[]>([]);
   const [selectedAudio, setSelectedAudio] = useState(-1);
   const url = stream.url;
@@ -160,6 +165,7 @@ export function Player({
     if (videoRef.current && !videoRef.current.paused)
       hideTimer.current = window.setTimeout(() => {
         setAudioOpen(false);
+        setExternalPlayerOpen(false);
         setControlsVisible(false);
       }, 3000);
   }, []);
@@ -646,6 +652,11 @@ export function Player({
     setSelectedAudio(id);
     setAudioOpen(false);
   };
+  const openExternalPlayer = (mode: ExternalPlayerMode) => {
+    if (!externalUrl) return;
+    setExternalPlayerOpen(false);
+    launchExternalPlayer(mode, externalUrl, video?.title || meta.name);
+  };
   const setPlayerVolume = (next: number) => {
     const element = videoRef.current;
     if (!element) return;
@@ -818,7 +829,10 @@ export function Player({
               <button
                 className={audioOpen ? "active" : ""}
                 aria-expanded={audioOpen}
-                onClick={() => setAudioOpen((value) => !value)}
+                onClick={() => {
+                  setExternalPlayerOpen(false);
+                  setAudioOpen((value) => !value);
+                }}
               >
                 <Music2 />
                 <span>Audio</span>
@@ -854,6 +868,35 @@ export function Player({
                 </div>
               )}
             </div>
+            {externalUrl && (
+              <div className="external-player-picker">
+                <button
+                  className={externalPlayerOpen ? "active" : ""}
+                  aria-label="Open in external player"
+                  aria-expanded={externalPlayerOpen}
+                  onClick={() => {
+                    setAudioOpen(false);
+                    setExternalPlayerOpen((value) => !value);
+                  }}
+                >
+                  <ExternalLink />
+                  <span>External</span>
+                </button>
+                {externalPlayerOpen && (
+                  <div className="external-player-menu">
+                    <strong>Open with</strong>
+                    {externalPlayerOptions("player").map((option) => (
+                      <button
+                        key={option.mode}
+                        onClick={() => openExternalPlayer(option.mode)}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <button aria-label="Fullscreen" onClick={toggleFullscreen}>
               <Maximize />
             </button>

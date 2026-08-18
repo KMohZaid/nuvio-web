@@ -103,8 +103,11 @@ import {
   updateReady,
 } from "./lib/appUpdate";
 import {
+  externalPlayerOptions,
+  isAndroid,
   isAppleMobile,
-  isDesktop,
+  isExternalPlayerAvailable,
+  isMacOS,
   launchExternalPlayer,
 } from "./lib/externalPlayer";
 import { syncProgress, syncWatched } from "./lib/watchSync";
@@ -318,14 +321,7 @@ export function App() {
     const stored = localStorage.getItem(
       "nuvio-web-external-player",
     ) as ExternalPlayerMode | null;
-    // The iOS-only schemes cannot work here, so an old choice would silently
-    // do nothing. Copying is the desktop equivalent.
-    if (
-      isDesktop() &&
-      (stored === "vlc" || stored === "outplayer" || stored === "infuse")
-    )
-      return "copy";
-    return stored ?? "internal";
+    return stored && isExternalPlayerAvailable(stored) ? stored : "internal";
   });
   const [active, setActive] = useState<NavKey>("home");
   // The nav highlight follows `active` immediately; the page body renders from
@@ -1821,11 +1817,16 @@ export function App() {
                   : externalPlayer === "m3u"
                     ? "Playlist downloaded. Open it with your preferred player."
                     : `Opening ${
-                        externalPlayer === "vlc"
-                          ? "VLC"
-                          : externalPlayer === "infuse"
-                            ? "Infuse"
-                            : "Outplayer"
+                        {
+                          vlc: "VLC",
+                          nextplayer: "Next Player",
+                          mxplayer: "MX Player",
+                          mpv: "mpv",
+                          "android-chooser": "Android video player chooser",
+                          outplayer: "Outplayer",
+                          infuse: "Infuse",
+                          iina: "IINA",
+                        }[externalPlayer]
                       }…`,
               );
               // Details stays open: the stream opened elsewhere, so this page
@@ -3783,11 +3784,13 @@ function SettingsPage({
           <span>
             <strong>Default player</strong>
             <small>
-              {isDesktop()
-                ? "Desktop browsers copy the URL for VLC. The desktop Nuvio app has native playback."
+              {isAndroid()
+                ? "Next Player, VLC, MX Player, mpv, and the Android video player chooser open through Android intents."
                 : isAppleMobile()
-                  ? "VLC, Outplayer, and Infuse open through their iOS URL schemes."
-                  : "External players open through their registered mobile URL schemes."}
+                  ? "VLC, Outplayer, and Infuse open through Apple URL schemes."
+                  : isMacOS()
+                    ? "VLC, Outplayer, Infuse, and IINA open through macOS URL schemes."
+                    : "mpv requires the mpv-handler browser extension; you can also copy the link for another desktop player."}
             </small>
           </span>
           <select
@@ -3797,16 +3800,11 @@ function SettingsPage({
             }
           >
             <option value="internal">Nuvio web player</option>
-            {isDesktop() ? (
-              <option value="copy">Copy link for an external player</option>
-            ) : (
-              <>
-                <option value="vlc">VLC</option>
-                <option value="outplayer">Outplayer (iOS/iPadOS)</option>
-                {isAppleMobile() && <option value="infuse">Infuse</option>}
-              </>
-            )}
-            <option value="m3u">Download M3U playlist</option>
+            {externalPlayerOptions("settings").map((option) => (
+              <option key={option.mode} value={option.mode}>
+                {option.label}
+              </option>
+            ))}
           </select>
         </label>
         <p>

@@ -236,8 +236,13 @@ export type ExternalPlayerMode =
   | "internal"
   | "copy"
   | "vlc"
+  | "nextplayer"
+  | "mxplayer"
+  | "mpv"
+  | "android-chooser"
   | "outplayer"
   | "infuse"
+  | "iina"
   | "m3u";
 export type NavKey =
   | "home"
