@@ -69,3 +69,49 @@ export function clearExternalHandoff() {
     // Nothing to do — a stale entry ages out by itself.
   }
 }
+
+/**
+ * What the other player reported on its way back.
+ *
+ * Only Outplayer says anything: its x-success and x-cancel callbacks reopen us
+ * with the outcome, and x-cancel appends where it stopped and how long the
+ * video was. That is exactly what the prompt would otherwise have to ask, so
+ * when this is present the prompt is skipped and the position simply saved.
+ */
+export type ExternalPlayerReport =
+  | { outcome: "finished" }
+  | { outcome: "stopped"; positionMs: number; durationMs: number };
+
+/** Reads the report out of the address bar and takes it back out again. */
+export function takeExternalReport(): ExternalPlayerReport | null {
+  if (typeof window === "undefined") return null;
+  const params = new URLSearchParams(window.location.search);
+  const outcome = params.get("nuvio-external");
+  if (outcome !== "finished" && outcome !== "stopped") return null;
+
+  // The parameters are the player's, and they should not survive a refresh or
+  // end up in a shared link.
+  const clean = new URL(window.location.href);
+  for (const key of [
+    "nuvio-external",
+    "url",
+    "position",
+    "duration",
+    "errorCode",
+    "errorMessage",
+  ])
+    clean.searchParams.delete(key);
+  window.history.replaceState(null, "", clean.toString());
+
+  if (outcome === "finished") return { outcome: "finished" };
+  // Both are reported in seconds, and a fractional position is normal.
+  const seconds = (value: string | null) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed * 1000) : 0;
+  };
+  return {
+    outcome: "stopped",
+    positionMs: seconds(params.get("position")),
+    durationMs: seconds(params.get("duration")),
+  };
+}

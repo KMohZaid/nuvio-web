@@ -115,6 +115,7 @@ import {
   clearExternalHandoff,
   readExternalHandoff,
   rememberExternalHandoff,
+  takeExternalReport,
 } from "./lib/externalHandoff";
 import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
@@ -303,10 +304,14 @@ export function App() {
   /** Boot may open a profile by itself once; a later hydrate must not. */
   const autoOpenAttempted = useRef(false);
   /**
-   * Read at mount, before this session can write one, so a hand-off that did
-   * not cost us the page is not also "resumed" on top of itself.
+   * Both read once, at mount: before this session can write a hand-off of its
+   * own, so one that did not cost us the page is not "resumed" on top of
+   * itself — and because reading the report rewrites the address bar, which
+   * must not happen again on every render.
    */
-  const resumeHandoff = useRef(readExternalHandoff());
+  const [bootHandoff] = useState(() => readExternalHandoff());
+  const [bootReport] = useState(() => takeExternalReport());
+  const resumeConsumed = useRef(false);
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -443,18 +448,38 @@ export function App() {
    * Puts back what the hand-off cost us, once its profile is open.
    *
    * Runs after `activateProfile`, which clears both of these — the title page
-   * you were on, and the prompt that is the only way a position from the other
-   * player gets recorded.
+   * you were on, and the way a position from the other player gets recorded.
+   * When that player said what it did, its word is taken and nothing is asked;
+   * only a player that came back silent gets the prompt.
    */
   useEffect(() => {
-    const resume = resumeHandoff.current;
-    if (!resume || !profile || profile.profileIndex !== resume.profileIndex)
-      return;
-    resumeHandoff.current = null;
+    if (resumeConsumed.current || !bootHandoff || !profile) return;
+    if (profile.profileIndex !== bootHandoff.profileIndex) return;
+    resumeConsumed.current = true;
     clearExternalHandoff();
-    setSelected(resume.meta);
-    setExternalWatch({ meta: resume.meta, video: resume.video });
-  }, [profile]);
+    setSelected(bootHandoff.meta);
+    const watched = { meta: bootHandoff.meta, video: bootHandoff.video };
+    if (!bootReport) {
+      setExternalWatch(watched);
+      return;
+    }
+    if (bootReport.outcome === "finished") {
+      void toggleWatched(watched.meta, watched.video, true);
+      setMessage("Marked as watched.");
+      return;
+    }
+    // A close within the first moments is someone backing out, not progress.
+    if (bootReport.positionMs > 0) {
+      savePlaybackProgress(
+        watched,
+        bootReport.positionMs,
+        bootReport.durationMs,
+        false,
+      );
+      setMessage("Saved your position.");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile, bootHandoff, bootReport]);
   const openProfile = useCallback(
     (next: Profile) => {
       localStorage.setItem("nuvio-active-profile", String(next.profileIndex));
@@ -497,10 +522,9 @@ export function App() {
       // — that is a return to something already in progress, not an app open,
       // so being asked who is watching loses the thread. A locked profile is
       // still locked either way, and shows the PIN alone rather than the list.
-      const resume = resumeHandoff.current;
-      const resumeProfile = resume
+      const resumeProfile = bootHandoff
         ? nextProfiles.find(
-            (item) => item.profileIndex === resume.profileIndex,
+            (item) => item.profileIndex === bootHandoff.profileIndex,
           )
         : undefined;
       const target = resumeProfile ?? (rememberProfileRef.current ? last : undefined);
@@ -517,7 +541,7 @@ export function App() {
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [session, activateProfile, openProfile]);
+  }, [session, activateProfile, openProfile, bootHandoff]);
   useEffect(() => {
     hydrate();
   }, [hydrate]);
@@ -1242,26 +1266,41 @@ export function App() {
       .catch(() => undefined);
   }
 
+  /** Where a title resumes from, shared by the web player and the hand-off. */
+  function resumePositionMs(meta: Meta, video?: Video) {
+    const row = watchIndex.progress.get(
+      watchKey(meta.id, video?.season, video?.episode),
+    );
+    // A finished title starts over rather than resuming at the credits.
+    if (!row || isComplete(row.positionMs, row.durationMs, false)) return 0;
+    return row.positionMs;
+  }
+
   /**
    * Hands a stream to a player outside the browser.
    *
    * Every route to an external player goes through here — the default chosen
    * in Settings, and the "External" menu inside the web player. Launching is
-   * only half of it: nothing that happens in the other app reaches us, so the
-   * prompt that records where you stopped is the one chance to keep progress,
-   * and it has to be raised no matter which route was taken.
+   * only half of it: most players report nothing back, so the prompt that
+   * records where you stopped is the one chance to keep progress. Outplayer is
+   * the exception; it is handed callbacks and answers for itself.
    */
   function handOffToExternalPlayer(
     mode: ExternalPlayerMode,
     url: string,
     meta: Meta,
     video?: Video,
+    positionMs?: number,
   ) {
     // Written before the launch, not after: handing off navigates away, and on
     // Android the process may not survive to run another line.
     if (profile && mode !== "copy" && mode !== "m3u")
       rememberExternalHandoff(profile.profileIndex, meta, video);
-    launchExternalPlayer(mode, url, video?.title || meta.name);
+    const resumeMs = positionMs ?? resumePositionMs(meta, video);
+    launchExternalPlayer(mode, url, video?.title || meta.name, {
+      positionSeconds: resumeMs / 1000,
+      returnUrl: `${window.location.origin}${import.meta.env.BASE_URL}`,
+    });
     setMessage(
       mode === "copy"
         ? "Stream URL copied. Paste it into VLC or your media player to watch."
@@ -1790,29 +1829,26 @@ export function App() {
         <Player
           {...playback}
           settings={webSettings.player}
-          startPositionMs={(() => {
-            if (playback.startAtBeginning) return 0;
-            const row = watchIndex.progress.get(
-              watchKey(
-                playback.meta.id,
-                playback.video?.season,
-                playback.video?.episode,
-              ),
-            );
-            // A finished title starts over rather than resuming at the credits.
-            if (!row || isComplete(row.positionMs, row.durationMs, false))
-              return 0;
-            return row.positionMs;
-          })()}
+          startPositionMs={
+            playback.startAtBeginning
+              ? 0
+              : resumePositionMs(playback.meta, playback.video)
+          }
           onClose={() => setPlayback(null)}
-          onExternalPlay={(mode, url) => {
+          onExternalPlay={(mode, url, positionMs) => {
             // The web player is torn down first. Leaving it mounted keeps it
             // decoding and downloading behind the app that is now playing the
             // same stream, and closing it is what raises the prompt that can
             // record where you stopped.
             const current = playback;
             setPlayback(null);
-            handOffToExternalPlayer(mode, url, current.meta, current.video);
+            handOffToExternalPlayer(
+              mode,
+              url,
+              current.meta,
+              current.video,
+              positionMs,
+            );
           }}
           onProgress={(positionMs, durationMs, ended) =>
             savePlaybackProgress(playback, positionMs, durationMs, ended)

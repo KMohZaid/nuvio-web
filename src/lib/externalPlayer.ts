@@ -199,11 +199,60 @@ export function mpvHandlerUrl(url: string) {
   return `mpv-handler://play/${data}`;
 }
 
+/**
+ * Where Outplayer should send the viewer back to, and what it should say.
+ *
+ * x-cancel fires when the video is closed and appends `position` and
+ * `duration`; x-success fires when it played to the end. Between them the app
+ * learns everything the "how far did you get?" prompt has to ask for, so on
+ * this one player the prompt never has to appear.
+ */
+function outplayerCallbacks(returnUrl: string) {
+  const separator = returnUrl.includes("?") ? "&" : "?";
+  return {
+    "x-success": `${returnUrl}${separator}nuvio-external=finished`,
+    "x-cancel": `${returnUrl}${separator}nuvio-external=stopped`,
+  };
+}
+
+/**
+ * Outplayer's documented x-callback-url form.
+ *
+ * The bare `outplayer://<url>` form plays, but carries nothing either way: it
+ * cannot start where you left off, and it reports nothing back. Parameters are
+ * as listed in Outplayer under Settings -> URL Schemes.
+ */
+export function outplayerPlaybackUrl(
+  url: string,
+  options: ExternalPlayerLaunchOptions = {},
+) {
+  const query = new URLSearchParams({ url });
+  const position = Math.floor(options.positionSeconds ?? 0);
+  if (position > 0) query.set("position", String(position));
+  if (options.subtitleUrl) query.set("subtitle", options.subtitleUrl);
+  if (options.returnUrl)
+    for (const [key, value] of Object.entries(
+      outplayerCallbacks(options.returnUrl),
+    ))
+      query.set(key, value);
+  return `outplayer://x-callback-url/play?${query.toString()}`;
+}
+
+export type ExternalPlayerLaunchOptions = {
+  /** Resume point. Only Outplayer can currently be told about it. */
+  positionSeconds?: number;
+  /** An external subtitle file, if the stream came with one. */
+  subtitleUrl?: string;
+  /** Where the player should return the viewer, for the players that can. */
+  returnUrl?: string;
+};
+
 /** Hands a stream to a registered player outside the browser. */
 export function launchExternalPlayer(
   mode: ExternalPlayerMode,
   url: string,
   title: string,
+  options: ExternalPlayerLaunchOptions = {},
 ) {
   const safeUrl = safeHttpUrl(url);
   if (!safeUrl) {
@@ -250,7 +299,7 @@ export function launchExternalPlayer(
     return;
   }
   if (mode === "outplayer") {
-    window.location.href = `outplayer://${safeUrl}`;
+    window.location.href = outplayerPlaybackUrl(safeUrl, options);
     return;
   }
   if (mode === "infuse") {

@@ -89,7 +89,11 @@ export function Player({
    * launched here: closing this player and recording where it got to are the
    * app's to do, and both have to happen for the handoff to be worth anything.
    */
-  onExternalPlay(mode: ExternalPlayerMode, url: string): void;
+  onExternalPlay(
+    mode: ExternalPlayerMode,
+    url: string,
+    positionMs: number,
+  ): void;
   /** Where to resume from. 0 starts at the beginning. */
   startPositionMs?: number;
   /** Reports a resume point. Fired periodically, on pause, and on exit. */
@@ -661,8 +665,11 @@ export function Player({
     setExternalPlayerOpen(false);
     // Paused first: the handoff unmounts this player, and a video element torn
     // down mid-play can leave the remuxer fetching for a moment after.
-    videoRef.current?.pause();
-    onExternalPlay(mode, externalUrl);
+    const element = videoRef.current;
+    element?.pause();
+    // Where it got to here, so the other player picks up mid-scene rather than
+    // at the last saved checkpoint.
+    onExternalPlay(mode, externalUrl, Math.max(0, (element?.currentTime ?? 0) * 1000));
   };
   const setPlayerVolume = (next: number) => {
     const element = videoRef.current;
