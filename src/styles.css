@@ -793,7 +793,8 @@ a {
   margin: 5px 0 18px;
   font-size: 30px;
 }
-.episodes select {
+.episodes select,
+.player-episodes select {
   background: #1b2025;
   color: white;
   border: 1px solid #30373f;
@@ -6431,7 +6432,11 @@ body.is-locked {
   display: block;
   font-size: 17px;
 }
-.player-episodes > .season-select-wrap,
+/* display:contents on the wrapper means the select is the child that lays
+   out, so the spacing belongs to it. */
+.player-episodes select {
+  margin: 0 16px 12px;
+}
 .player-episodes > .episode-list-heading {
   margin: 0 16px 10px;
 }

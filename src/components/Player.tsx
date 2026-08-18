@@ -173,6 +173,8 @@ export function Player({
   /** Dismissed by hand, so it does not come back for the rest of the episode. */
   const [nextDismissed, setNextDismissed] = useState(false);
   const [skipSegments, setSkipSegments] = useState<SkipSegment[]>([]);
+  /** True from choosing an episode until its stream arrives. */
+  const [switching, setSwitching] = useState(false);
   const seasons = useMemo(
     () =>
       [...new Set((episodes ?? []).map((item) => item.season ?? 0))].sort(
@@ -331,6 +333,8 @@ export function Player({
       return;
     }
     let disposed = false;
+    setSwitching(false);
+    setNextDismissed(false);
     let audioWatch: number | undefined;
     let preferredAudioApplied = false;
     let preferredSubtitleApplied = false;
@@ -1112,7 +1116,17 @@ export function Player({
           <button onClick={() => setNextDismissed(true)}>Not now</button>
           <button
             className="primary"
-            onClick={() => onPlayEpisode?.(nextEpisode)}
+            disabled={switching}
+            onClick={() => {
+              if (switching) return;
+              engineRef.current?.pause();
+              videoRef.current?.pause();
+              setPlaying(false);
+              setWaiting(true);
+              setStatus("Loading episode…");
+              setSwitching(true);
+              onPlayEpisode?.(nextEpisode);
+            }}
           >
             <FastForward /> Play
           </button>
@@ -1178,7 +1192,16 @@ export function Player({
                     percent={watchIndex ? episodePercent(watchIndex, key) : 0}
                     blurred={false}
                     onPlay={() => {
-                      if (item.id === video?.id) return;
+                      if (item.id === video?.id || switching) return;
+                      // Stopped, and said to be stopping, before the resolve
+                      // starts: it takes seconds, and in silence the old
+                      // episode simply carried on playing.
+                      engineRef.current?.pause();
+                      videoRef.current?.pause();
+                      setPlaying(false);
+                      setWaiting(true);
+                      setStatus("Loading episode…");
+                      setSwitching(true);
                       setEpisodesOpen(false);
                       onPlayEpisode?.(item);
                     }}

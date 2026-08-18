@@ -337,6 +337,8 @@ export function App() {
    * refers to has to outlive the moment the app started.
    */
   const handedOff = useRef<{ meta: Meta; video?: Video } | null>(null);
+  /** Orders the episode switches, so a slow one cannot overtake a later one. */
+  const episodeSwitch = useRef(0);
   /**
    * A report waiting for somewhere to put it. Held rather than applied because
    * it can arrive before a profile has been chosen, and saving needs one.
@@ -2014,9 +2016,14 @@ export function App() {
             // the quality, the audio and the host already chosen.
             const bingeGroup = playback.stream.behaviorHints?.bingeGroup;
             const current = playback;
+            // Resolving takes seconds. A second request started meanwhile must
+            // not be able to land after this one and pull playback back to an
+            // episode already left behind.
+            const generation = ++episodeSwitch.current;
             setMessage("");
             void loadStreams(current.meta.type, next.id, addons)
               .then((streams) => {
+                if (generation !== episodeSwitch.current) return;
                 const chosen = pickBingeStream(streams, bingeGroup);
                 if (!chosen) {
                   setMessage(
@@ -2032,6 +2039,7 @@ export function App() {
                 });
               })
               .catch(() => {
+                if (generation !== episodeSwitch.current) return;
                 setMessage("That episode's sources could not be loaded.");
               });
           }}
