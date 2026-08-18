@@ -1,4 +1,5 @@
-import { Check, Play } from "lucide-react";
+import {
+  Eye, Check, Play } from "lucide-react";
 import {
   memo,
   useEffect,
@@ -59,7 +60,7 @@ export const PosterCard = memo(function PosterCard({
         )}
         {watched && (
           <span className="watched-dot">
-            <Check size={15} />
+            <Eye size={15} />
           </span>
         )}
         {percentage > 0 && percentage < 98 && (

@@ -1,4 +1,4 @@
-import { Check, LogOut } from "lucide-react";
+import { Check, Lock, LogOut, Users } from "lucide-react";
 import { useState } from "react";
 import type { Profile } from "../types";
 
@@ -21,11 +21,14 @@ export function ProfileSwitcher({
   profiles,
   active,
   onSelect,
+  onSwitchProfiles,
   onSignOut,
 }: {
   profiles: Profile[];
   active: Profile | null;
   onSelect(profile: Profile): void;
+  /** Returns to the full picker, which is the only way back once inside. */
+  onSwitchProfiles?(): void;
   onSignOut(): void;
 }) {
   const [open, setOpen] = useState(false);
@@ -66,7 +69,16 @@ export function ProfileSwitcher({
                     setOpen(false);
                   }}
                 >
-                  <Avatar profile={profile} />
+                  <span className="profile-avatar-wrap">
+                    <Avatar profile={profile} />
+                    {/* Same badge the picker uses, so a locked profile looks
+                        locked wherever it is listed. */}
+                    {profile.pinEnabled && (
+                      <i className="profile-lock" aria-label="Locked">
+                        <Lock />
+                      </i>
+                    )}
+                  </span>
                   <span>{profile.name}</span>
                   {profile.profileIndex === active?.profileIndex && (
                     <Check className="profile-selected" />
@@ -74,6 +86,12 @@ export function ProfileSwitcher({
                 </button>
               ))}
             </div>
+            {onSwitchProfiles && (
+              <button className="profile-signout" onClick={onSwitchProfiles}>
+                <Users />
+                <span>Switch profiles</span>
+              </button>
+            )}
             <button className="profile-signout" onClick={onSignOut}>
               <LogOut />
               <span>Sign out</span>

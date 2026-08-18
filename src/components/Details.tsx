@@ -1,3 +1,4 @@
+import { loadEpisodeRatings, type EpisodeRatings } from "../lib/episodeRatings";
 import {
   ArrowLeft,
   Check,
@@ -46,6 +47,17 @@ import { ContextMenu } from "./ContextMenu";
 const DEFAULT_DETAIL_COLOR = "18 22 26";
 
 const publicAsset = (fileName: string) => `${import.meta.env.BASE_URL}${fileName}`;
+
+/**
+ * Episode scores.
+ *
+ * Addons do supply these — Cinemeta sends a `rating` on each video, and while
+ * its coverage is uneven (all 67 Breaking Bad episodes, none of Game of
+ * Thrones'), an addon that populates it gives a real IMDb number needing no
+ * key, proxy or third-party service. TMDB enrichment fills the gaps with its
+ * own vote average, which is a different measure and says so.
+ */
+const EPISODE_RATINGS_ENABLED = true;
 
 const RATING_VISUALS = [
   { source: "imdb", name: "IMDb", icon: publicAsset("rating_imdb.png"), color: "#f5c518", format: oneDecimal, wide: true },
@@ -399,6 +411,11 @@ export function Details({
     ),
   );
   const [busy, setBusy] = useState(true);
+  // Fetched per series rather than per episode, cached for half an hour, and
+  // empty when no ratings service is configured — in which case no badge shows.
+  const [episodeRatings, setEpisodeRatings] = useState<EpisodeRatings>(
+    () => new Map(),
+  );
   const [sourceOpen, setSourceOpen] = useState(false);
   const [streams, setStreams] = useState<Stream[]>([]);
   const [sourceBusy, setSourceBusy] = useState(false);
@@ -433,6 +450,17 @@ export function Details({
     };
   }, [meta.id, swipeRef]);
   useEffect(() => setDescriptionExpanded(false), [meta.id]);
+
+  useEffect(() => {
+    if (!EPISODE_RATINGS_ENABLED || meta.type !== "series") return;
+    let live = true;
+    void loadEpisodeRatings(meta.id).then((ratings) => {
+      if (live) setEpisodeRatings(ratings);
+    });
+    return () => {
+      live = false;
+    };
+  }, [meta.id, meta.type]);
   useEffect(() => {
     initialSourceConsumed.current = false;
   }, [seed.id, initialVideoId, openSourcesOnLoad]);
@@ -870,6 +898,10 @@ export function Details({
                 <EpisodeRow
                   key={video.id}
                   video={video}
+                  rating={
+                    episodeRatings.get(`${video.season}:${video.episode}`) ??
+                    (video.imdbRating ? Number(video.imdbRating) : undefined)
+                  }
                   watched={watchIndex.watched.has(
                     watchKey(meta.id, video.season, video.episode),
                   )}
@@ -1174,6 +1206,7 @@ export function Details({
  */
 function EpisodeRow({
   video,
+  rating,
   watched,
   percent,
   blurred,
@@ -1181,6 +1214,8 @@ function EpisodeRow({
   onMenu,
 }: {
   video: Video;
+  /** From the addon when it supplies one, otherwise from TMDB enrichment. */
+  rating?: number;
   watched: boolean;
   percent: number;
   blurred: boolean;
@@ -1213,15 +1248,32 @@ function EpisodeRow({
         </i>
         {watched && (
           <i className="episode-watched" aria-label="Watched">
-            <Check size={13} strokeWidth={3.4} />
+            <Eye size={13} strokeWidth={2.6} />
           </i>
         )}
         {percent > 0 && percent < 90 && (
           <i className="episode-progress" style={{ width: `${percent}%` }} />
         )}
-        {video.imdbRating && (
-          <i className="episode-imdb">IMDb {video.imdbRating}</i>
-        )}
+        {EPISODE_RATINGS_ENABLED &&
+          rating != null &&
+          (() => {
+            // Same mark and colour the details page uses, chosen by source —
+            // an IMDb badge over a TMDB vote average would be a small lie.
+            const visual =
+              RATING_VISUALS.find(
+                (item) => item.source === (video.ratingSource ?? "tmdb"),
+              ) ?? RATING_VISUALS[0];
+            return (
+              <i
+                className="episode-rating"
+                style={{ color: visual.color }}
+                title={`${visual.name} ${rating.toFixed(1)}`}
+              >
+                <img src={visual.icon} alt={visual.name} />
+                {rating.toFixed(1)}
+              </i>
+            );
+          })()}
       </span>
       <span>
         <small>

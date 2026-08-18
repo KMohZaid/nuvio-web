@@ -85,6 +85,7 @@ export function CollectionFolderView({
   folder,
   addons,
   index,
+  tmdbApiKey = "",
   onBack,
   onOpen,
   onMenu,
@@ -92,6 +93,8 @@ export function CollectionFolderView({
   folder: CollectionFolder;
   addons: InstalledAddon[];
   index: WatchIndex;
+  /** Needed for TMDB-backed sources; addon sources ignore it. */
+  tmdbApiKey?: string;
   onBack(): void;
   onOpen(item: Meta): void;
   onMenu?: MediaMenuHandler;
@@ -107,6 +110,9 @@ export function CollectionFolderView({
   const [exhausted, setExhausted] = useState(false);
   const [error, setError] = useState("");
   const sentinel = useRef<HTMLDivElement | null>(null);
+  /** How far through the source list "All" has read, and TMDB's page offset. */
+  const sourceCursor = useRef(0);
+  const skipCursor = useRef(0);
 
   const active = useMemo(
     () =>
@@ -124,9 +130,13 @@ export function CollectionFolderView({
     setError("");
     setExhausted(false);
     setItems([]);
-    loadCollectionSources(active, addons, 0)
+    sourceCursor.current = 0;
+    skipCursor.current = 0;
+    loadCollectionSources(active, addons, 0, tmdbApiKey, 0)
       .then((result) => {
         if (!live) return;
+        sourceCursor.current = result.nextSourceOffset ?? active.length;
+        skipCursor.current = result.nextSkip ?? 0;
         setItems(result.items);
         if (result.items.length === 0) {
           setExhausted(true);
@@ -137,30 +147,46 @@ export function CollectionFolderView({
     return () => {
       live = false;
     };
-  }, [active, addons]);
+    // The key is a dependency: provider credentials are pulled after the first
+    // render, so a folder opened before they land would otherwise sit on "add a
+    // TMDB API key" forever, with a key that had since arrived.
+  }, [active, addons, tmdbApiKey]);
 
   const more = useCallback(async () => {
     if (loading || loadingMore || exhausted || items.length === 0) return;
     setLoadingMore(true);
     try {
-      // `skip` is per source. Merging several sources means `items.length`
-      // overshoots any single one, so divide it back down or the next page
-      // jumps past results.
-      const skip =
-        selected === ALL_SOURCES
-          ? Math.ceil(
-              items.length / Math.max(active.length, 1) / PAGE_SIZE_GUESS,
-            ) * PAGE_SIZE_GUESS
-          : items.length;
-      const next = await loadCollectionSources(active, addons, skip);
+      // Two ways to advance, and which applies depends on where there is more
+      // to read. Sources still unread come first — that is "All" working
+      // through a long list — and only once they run out does it ask the
+      // sources it already has for their next page.
+      const moreSources = sourceCursor.current < active.length;
+      const skip = moreSources
+        ? 0
+        : skipCursor.current ||
+          (selected === ALL_SOURCES
+            ? Math.ceil(
+                items.length / Math.max(active.length, 1) / PAGE_SIZE_GUESS,
+              ) * PAGE_SIZE_GUESS
+            : items.length);
+      const next = await loadCollectionSources(
+        active,
+        addons,
+        skip,
+        tmdbApiKey,
+        moreSources ? sourceCursor.current : 0,
+      );
+      sourceCursor.current = next.nextSourceOffset ?? active.length;
+      if (next.nextSkip) skipCursor.current = next.nextSkip;
       const known = new Set(items.map((item) => `${item.type}:${item.id}`));
       const additions = next.items.filter(
         (item) => !known.has(`${item.type}:${item.id}`),
       );
-      // Addons that ignore `skip` return the same page forever, so a page that
-      // adds nothing new ends the run rather than looping.
-      if (additions.length === 0) setExhausted(true);
-      else setItems((current) => [...current, ...additions]);
+      // Nothing new and nowhere left to read means the end. A page that merely
+      // repeats itself while sources remain must not stop the run.
+      if (additions.length === 0 && sourceCursor.current >= active.length)
+        setExhausted(true);
+      else if (additions.length) setItems((current) => [...current, ...additions]);
     } catch (reason) {
       setError(
         reason instanceof Error ? reason.message : "Could not load more",

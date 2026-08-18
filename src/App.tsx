@@ -1,3 +1,6 @@
+import { ProfileGate } from "./components/ProfileGate";
+import { effectiveAddonProfileIndex } from "./lib/account";
+import { PinPrompt } from "./components/PinPrompt";
 import {
   ArrowDown,
   ArrowLeft,
@@ -274,6 +277,22 @@ export function App() {
   settingsBlobRef.current = settingsBlob;
   const settingsWriteQueue = useRef<Promise<void>>(Promise.resolve());
   const settingsRevision = useRef(0);
+  const [pinTarget, setPinTarget] = useState<Profile | null>(null);
+  const [rememberProfile, setRememberProfile] = useState(
+    () => localStorage.getItem("nuvio-remember-profile") === "1",
+  );
+  /** Set when the picker is asked for explicitly, so it beats "use last". */
+  const [switchingProfile, setSwitchingProfile] = useState(false);
+  /**
+   * Read rather than depended on. Toggling the preference must not re-run
+   * hydrate — doing so opened the remembered profile the instant the switch
+   * was flipped, before anyone had picked anything.
+   */
+  const rememberProfileRef = useRef(
+    localStorage.getItem("nuvio-remember-profile") === "1",
+  );
+  /** Boot may open a profile by itself once; a later hydrate must not. */
+  const autoOpenAttempted = useRef(false);
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -413,6 +432,15 @@ export function App() {
       })
       .finally(() => setBooting(false));
   }, []);
+  const openProfile = useCallback(
+    (next: Profile) => {
+      localStorage.setItem("nuvio-active-profile", String(next.profileIndex));
+      setSwitchingProfile(false);
+      activateProfile(next);
+    },
+    [activateProfile],
+  );
+
   const hydrate = useCallback(async () => {
     const hydrationGeneration = ++accountHydrationGeneration.current;
     if (!session) {
@@ -438,12 +466,17 @@ export function App() {
           (item.avatarId ? avatarUrls.get(item.avatarId) : undefined),
       }));
       const stored = Number(localStorage.getItem("nuvio-active-profile") ?? 1);
-      const nextProfile =
-        nextProfiles.find((item) => item.profileIndex === stored) ??
-        nextProfiles[0];
+      const last = nextProfiles.find((item) => item.profileIndex === stored);
       if (!isCurrent()) return;
       setProfiles(nextProfiles);
-      activateProfile(nextProfile ?? null);
+      // Nothing loads until someone is chosen. Only a remembered profile skips
+      // the picker, and a locked one still has to be unlocked first — so the
+      // remembered case shows the PIN alone rather than the whole list.
+      if (!autoOpenAttempted.current && rememberProfileRef.current && last) {
+        autoOpenAttempted.current = true;
+        if (last.pinEnabled) setPinTarget(last);
+        else openProfile(last);
+      }
     } catch (error) {
       if (!isCurrent()) return;
       setMessage(
@@ -452,15 +485,28 @@ export function App() {
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [session, activateProfile]);
+  }, [session, activateProfile, openProfile]);
   useEffect(() => {
     hydrate();
   }, [hydrate]);
   const loadProfileData = useCallback(async () => {
     if (!profile) return;
     const profileIndex = profile.profileIndex;
+    const addonProfileIndex = effectiveAddonProfileIndex(profile);
     const generation = profileGeneration.current;
     const loadGeneration = ++profileLoadGeneration.current;
+    // Switching profiles restarts every load, and a stale one finishing after
+    // a newer one starts is the classic way a page ends up empty. Each run
+    // announces itself so a broken switch can be told apart from a broken
+    // fetch: no line means the effect never fired.
+    console.info("[nuvio profile] load", {
+      profile: profileIndex,
+      name: profile.name,
+      addonsFrom: addonProfileIndex,
+      mirrorsPrimaryAddons: !!profile.usesPrimaryAddons,
+      generation,
+      loadGeneration,
+    });
     const isCurrent = () =>
       generation === profileGeneration.current &&
       loadGeneration === profileLoadGeneration.current &&
@@ -517,10 +563,14 @@ export function App() {
       // is one small request and decides which catalogs are fetched at all, so
       // it is worth waiting for rather than reordering afterwards.
       const [rows, nextLayout] = await Promise.all([
-        loadAddons(profileIndex),
+        // A mirroring profile's addons live on profile 1, not under its own id.
+        loadAddons(addonProfileIndex),
         loadHomeLayout(profileIndex).catch(() => null),
       ]);
-      if (!isCurrent()) return;
+      if (!isCurrent()) {
+        console.warn("[nuvio profile] load abandoned after addons", profileIndex);
+        return;
+      }
       setAddonRows(rows);
       setHomeLayout(nextLayout);
       const installed = await loadInstalledAddons(rows);
@@ -681,7 +731,9 @@ export function App() {
 
     const write = addonWriteQueue.current
       .catch(() => undefined)
-      .then(() => saveAddons(profileIndex, normalized));
+      // Written back to the same list it was read from. Saving under this
+      // profile's own id would create a shadow list nothing reads.
+      .then(() => saveAddons(effectiveAddonProfileIndex(profile), normalized));
     addonWriteQueue.current = write.catch(() => undefined);
     const installedTask = refreshContent
       ? loadInstalledAddons(normalized)
@@ -1073,6 +1125,15 @@ export function App() {
         : (homeLayout.orderOf.get(row.key) ?? Number.MAX_SAFE_INTEGER);
     return [...rows].sort((a, b) => rank(a) - rank(b));
   }, [collections, homeLayout, sections]);
+  const pinnedCollectionKeys = useMemo(
+    () =>
+      new Set(
+        collections
+          .filter((collection) => collection.pinToTop)
+          .map((collection) => `${COLLECTION_KEY_PREFIX}${collection.id}`),
+      ),
+    [collections],
+  );
   const homeLayoutLabels = useMemo(
     () =>
       new Map<string, string>([
@@ -1356,6 +1417,45 @@ export function App() {
         {updatePrompt}
       </>
     );
+  // Signed in but nobody chosen yet: the picker, and nothing else. A PIN
+  // prompt on its own counts as chosen-but-locked, so it takes precedence.
+  if (!profile && !pinTarget)
+    return (
+      <>
+        {profiles.length > 0 ? (
+          <ProfileGate
+            profiles={profiles}
+            remember={rememberProfile}
+            onRememberChange={(value) => {
+              setRememberProfile(value);
+              rememberProfileRef.current = value;
+              localStorage.setItem(
+                "nuvio-remember-profile",
+                value ? "1" : "0",
+              );
+            }}
+            onSelect={(next) => {
+              if (next.pinEnabled) {
+                setPinTarget(next);
+                return;
+              }
+              openProfile(next);
+            }}
+            onSignOut={async () => {
+              await signOut();
+              activateProfile(null);
+              setSession(null);
+            }}
+          />
+        ) : (
+          <div className="splash">
+            <i className="mini-spinner" /> Loading profiles…
+          </div>
+        )}
+        {updatePrompt}
+      </>
+    );
+
   return (
     <div className={`app-shell${playback ? " player-active" : ""}`}>
       <aside className="rail">
@@ -1393,12 +1493,19 @@ export function App() {
         <ProfileSwitcher
           profiles={profiles}
           active={profile}
+          onSwitchProfiles={() => {
+            setSwitchingProfile(true);
+            activateProfile(null);
+          }}
           onSelect={(next) => {
-            localStorage.setItem(
-              "nuvio-active-profile",
-              String(next.profileIndex),
-            );
-            activateProfile(next);
+            // A locked profile is verified before it is opened. Unlocking is
+            // remembered for the session only, so closing the tab re-locks it —
+            // the PIN itself is never kept.
+            if (next.pinEnabled) {
+              setPinTarget(next);
+              return;
+            }
+            openProfile(next);
           }}
           onSignOut={async () => {
             await signOut();
@@ -1407,6 +1514,22 @@ export function App() {
           }}
         />
       </header>
+      {pinTarget && (
+        <PinPrompt
+          profile={pinTarget}
+          // "Switch profiles" rather than "Cancel" when this is the only thing
+          // on screen: cancelling into an empty app would be a dead end.
+          cancelLabel={profile ? "Cancel" : "Switch profiles"}
+          onUnlocked={() => {
+            openProfile(pinTarget);
+            setPinTarget(null);
+          }}
+          onCancel={() => {
+            setPinTarget(null);
+            if (!profile) setSwitchingProfile(true);
+          }}
+        />
+      )}
       <main className="content">
         {message && (
           <div className="notice">
@@ -1439,6 +1562,7 @@ export function App() {
             folder={deferredFolder}
             addons={addons}
             index={watchIndex}
+            tmdbApiKey={providerCredential(providerCredentials, "tmdb", "api_key")}
             onBack={() => setFolder(null)}
             onOpen={openDetails}
             onMenu={(item, x, y) => setTitleMenu({ item, x, y })}
@@ -1519,6 +1643,7 @@ export function App() {
             settingsReady={settingsBlob != null}
             homeLayout={homeLayout}
             homeLayoutLabels={homeLayoutLabels}
+            pinnedCollectionKeys={pinnedCollectionKeys}
             onHomeLayout={saveHomeLayout}
             onTypedSetting={updateTypedSetting}
             onPosterSetting={updatePosterSetting}
@@ -2286,22 +2411,55 @@ function SettingToggle({
 function HomeLayoutSettings({
   layout,
   labels,
+  pinnedKeys,
   disabled,
   onChange,
 }: {
   layout: HomeLayout | null;
   labels: Map<string, string>;
+  /** Collections pinned to the top; Nuvio forbids reordering across these. */
+  pinnedKeys?: Set<string>;
   disabled?: boolean;
   onChange(next: HomeLayout): Promise<void>;
 }) {
   const [error, setError] = useState<string | null>(null);
+  // Matches Nuvio: a move is refused when either end of it is pinned, so a
+  // pinned row cannot move and nothing can be moved above one.
+  const isPinned = (key?: string) => !!key && !!pinnedKeys?.has(key);
+
+  // A profile that has never saved a layout gets none from the server, and
+  // that is not the same as one still loading. Nuvio shows the editor
+  // immediately in that case, built from the catalogs it already has — so this
+  // does too, rather than spinning on a pull that already finished. Nothing is
+  // written until the first edit.
+  const effective =
+    layout ??
+    (labels.size
+      ? ({
+          items: [...labels.keys()].map((key, order) => ({
+            key,
+            enabled: true,
+            order,
+            isCollection: key.startsWith(COLLECTION_KEY_PREFIX),
+            customTitle: "",
+            // No synced row behind a synthesised item; the shape still has to
+            // match so an edit writes the same payload Nuvio expects.
+            raw: {} as Record<string, unknown>,
+          })),
+          orderOf: new Map([...labels.keys()].map((key, index) => [key, index])),
+          enabledOf: new Map([...labels.keys()].map((key) => [key, true])),
+          customTitleOf: new Map<string, string>(),
+          showCatalogType: true,
+          hideUnreleasedContent: false,
+        } satisfies HomeLayout)
+      : null);
 
   const rebuild = useCallback(
     (
       items: HomeLayout["items"],
       patch: Partial<Pick<HomeLayout, "showCatalogType" | "hideUnreleasedContent">> = {},
     ): HomeLayout => ({
-      ...(layout as HomeLayout),
+      ...(effective as HomeLayout),
       ...patch,
       items,
       orderOf: new Map(items.map((item, index) => [item.key, index])),
@@ -2312,7 +2470,7 @@ function HomeLayoutSettings({
           .map((item) => [item.key, item.customTitle.trim()]),
       ),
     }),
-    [layout],
+    [effective],
   );
 
   async function apply(next: HomeLayout) {
@@ -2326,7 +2484,7 @@ function HomeLayoutSettings({
     }
   }
 
-  if (!layout)
+  if (!effective)
     return <div className="home-layout-loading"><i className="mini-spinner" /> Loading Home layout…</div>;
 
   return (
@@ -2334,19 +2492,19 @@ function HomeLayoutSettings({
       <SettingToggle
         title="Show catalog type"
         description="Append Movies, Series, or another media type to catalog names."
-        checked={layout.showCatalogType}
+        checked={effective.showCatalogType}
         disabled={disabled}
         onChange={(showCatalogType) =>
-          void apply(rebuild(layout.items, { showCatalogType }))
+          void apply(rebuild(effective.items, { showCatalogType }))
         }
       />
       <SettingToggle
         title="Hide unreleased content"
         description="Hide catalog titles whose known release date is still in the future."
-        checked={layout.hideUnreleasedContent}
+        checked={effective.hideUnreleasedContent}
         disabled={disabled}
         onChange={(hideUnreleasedContent) =>
-          void apply(rebuild(layout.items, { hideUnreleasedContent }))
+          void apply(rebuild(effective.items, { hideUnreleasedContent }))
         }
       />
       {error && <p className="addon-card-error">{error}</p>}
@@ -2354,18 +2512,21 @@ function HomeLayoutSettings({
         <summary>
           <span>
             <strong>Catalogs &amp; collections</strong>
-            <small>{layout.items.length} Home sections</small>
+            <small>{effective.items.length} Home sections</small>
           </span>
           <ChevronRight aria-hidden="true" />
         </summary>
         <div className="home-layout-list-web">
-          {layout.items.map((item, index) => (
+          {effective.items.map((item, index) => (
             <div className={item.enabled ? "" : "is-hidden"} key={item.key}>
               <span className="home-layout-copy">
                 <strong>
                   {item.customTitle.trim() || labels.get(item.key) || String(item.raw.catalog_id ?? item.raw.collection_id ?? item.key)}
                 </strong>
-                <small>{item.isCollection ? "Collection" : "Catalog"}</small>
+                <small>
+                  {item.isCollection ? "Collection" : "Catalog"}
+                  {isPinned(item.key) ? " · Pinned to top" : ""}
+                </small>
               </span>
               <label className="home-layout-title-input">
                 <span>Custom title</span>
@@ -2377,7 +2538,7 @@ function HomeLayoutSettings({
                   onBlur={(event) => {
                     const customTitle = event.currentTarget.value.trim();
                     if (customTitle === item.customTitle) return;
-                    const items = layout.items.map((entry, row) =>
+                    const items = effective.items.map((entry, row) =>
                       row === index ? { ...entry, customTitle } : entry,
                     );
                     void apply(rebuild(items));
@@ -2388,10 +2549,19 @@ function HomeLayoutSettings({
                 <button
                   type="button"
                   className="icon-button reorder-action"
-                  title="Move up"
-                  disabled={disabled || index === 0}
+                  title={
+                    isPinned(item.key) || isPinned(effective.items[index - 1]?.key)
+                      ? "Pinned rows stay at the top"
+                      : "Move up"
+                  }
+                  disabled={
+                    disabled ||
+                    index === 0 ||
+                    isPinned(item.key) ||
+                    isPinned(effective.items[index - 1]?.key)
+                  }
                   onClick={() => {
-                    const items = [...layout.items];
+                    const items = [...effective.items];
                     [items[index - 1], items[index]] = [items[index], items[index - 1]];
                     void apply(rebuild(items));
                   }}
@@ -2399,10 +2569,19 @@ function HomeLayoutSettings({
                 <button
                   type="button"
                   className="icon-button reorder-action"
-                  title="Move down"
-                  disabled={disabled || index === layout.items.length - 1}
+                  title={
+                    isPinned(item.key) || isPinned(effective.items[index + 1]?.key)
+                      ? "Pinned rows stay at the top"
+                      : "Move down"
+                  }
+                  disabled={
+                    disabled ||
+                    index === effective.items.length - 1 ||
+                    isPinned(item.key) ||
+                    isPinned(effective.items[index + 1]?.key)
+                  }
                   onClick={() => {
-                    const items = [...layout.items];
+                    const items = [...effective.items];
                     [items[index], items[index + 1]] = [items[index + 1], items[index]];
                     void apply(rebuild(items));
                   }}
@@ -2413,7 +2592,7 @@ function HomeLayoutSettings({
                     checked={item.enabled}
                     disabled={disabled}
                     onChange={(event) => {
-                      const items = layout.items.map((entry, row) =>
+                      const items = effective.items.map((entry, row) =>
                         row === index ? { ...entry, enabled: event.target.checked } : entry,
                       );
                       void apply(rebuild(items));
@@ -2528,6 +2707,7 @@ function SettingsPage({
   settingsReady,
   homeLayout,
   homeLayoutLabels,
+  pinnedCollectionKeys,
   onHomeLayout,
   onTypedSetting,
   onPosterSetting,
@@ -2557,6 +2737,7 @@ function SettingsPage({
   settingsReady: boolean;
   homeLayout: HomeLayout | null;
   homeLayoutLabels: Map<string, string>;
+  pinnedCollectionKeys: Set<string>;
   onHomeLayout(next: HomeLayout): Promise<void>;
   onTypedSetting(
     feature: string,
@@ -3049,6 +3230,7 @@ function SettingsPage({
         <HomeLayoutSettings
           layout={homeLayout}
           labels={homeLayoutLabels}
+          pinnedKeys={pinnedCollectionKeys}
           disabled={!profile}
           onChange={onHomeLayout}
         />

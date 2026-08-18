@@ -1,3 +1,4 @@
+import { resolveTmdbSource } from "./tmdbCollections";
 import { mediaTypeLabel, type HomeLayout } from "./account";
 import type {
   AddonManifest,
@@ -99,6 +100,22 @@ function resourceUrl(
   return url.toString();
 }
 
+/**
+ * An episode's score, or nothing.
+ *
+ * Cinemeta sends the string "0" for every episode it has no rating for — all
+ * 32 of Reacher's, for instance — so a badge built straight from the field
+ * reads "IMDb 0" across a whole show. Zero is absence here, not a score, and
+ * an addon that sends no rating at all should look the same as one that sends
+ * zero rather than different.
+ */
+function episodeRating(value: Record<string, unknown>): string | undefined {
+  const raw = value.imdbRating ?? value.imdb_rating ?? value.rating;
+  if (raw == null || String(raw).trim() === "") return undefined;
+  const score = Number(raw);
+  return Number.isFinite(score) && score > 0 ? String(raw) : undefined;
+}
+
 function mapVideo(value: Record<string, unknown>): Video {
   return {
     id: String(value.id ?? ""),
@@ -109,14 +126,9 @@ function mapVideo(value: Record<string, unknown>): Video {
     thumbnail: value.thumbnail ? String(value.thumbnail) : undefined,
     overview: value.overview ? String(value.overview) : undefined,
     runtime: value.runtime == null ? undefined : Number(value.runtime),
-    imdbRating:
-      value.imdbRating != null
-        ? String(value.imdbRating)
-        : value.imdb_rating != null
-          ? String(value.imdb_rating)
-          : value.rating != null
-            ? String(value.rating)
-            : undefined,
+    imdbRating: episodeRating(value),
+    // Only an addon-supplied score is an IMDb one; enrichment marks its own.
+    ratingSource: episodeRating(value) ? "imdb" : undefined,
     available: value.available !== false,
   };
 }
@@ -271,7 +283,24 @@ export function mapMeta(
           ) || undefined
         : undefined,
     videos: Array.isArray(value.videos)
-      ? value.videos.map((video) => mapVideo(video as Record<string, unknown>))
+      ? (() => {
+          const raw = value.videos as Array<Record<string, unknown>>;
+          // One line per title, not per episode. Addons disagree about where a
+          // per-episode score lives, and the only way to know which key this
+          // one uses is to see an actual episode object.
+          if (raw.length)
+            console.info("[nuvio addons] first episode object", {
+              addon: addonName,
+              keys: Object.keys(raw[0]!),
+              ratingLike: Object.fromEntries(
+                Object.entries(raw[0]!).filter(([key]) =>
+                  /rat|vote|score|imdb/i.test(key),
+                ),
+              ),
+              sample: raw[0],
+            });
+          return raw.map((video) => mapVideo(video));
+        })()
       : [],
     manifestUrl,
     addonName,
@@ -292,6 +321,22 @@ function supports(
   });
 }
 
+/**
+ * Turns a browser fetch failure into something a user can act on.
+ *
+ * The native clients reach addons a browser cannot, so "works on desktop,
+ * empty on web" is the normal shape of this bug — and `TypeError: Failed to
+ * fetch` is all the platform says about the two most common reasons.
+ */
+function explainAddonFailure(url: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : "Manifest failed";
+  if (/^http:/i.test(url.trim()) && !/^(localhost|127\.0\.0\.1|\[::1\])/i.test(new URL(url).hostname))
+    return "Served over HTTP. A page on HTTPS cannot load it — the addon needs HTTPS.";
+  if (message === "Failed to fetch" || /NetworkError|Load failed/i.test(message))
+    return "Unreachable from a browser. Usually the addon sends no CORS header (Access-Control-Allow-Origin), or it is offline.";
+  return message;
+}
+
 export async function loadInstalledAddons(
   rows: AddonRow[],
 ): Promise<InstalledAddon[]> {
@@ -300,12 +345,21 @@ export async function loadInstalledAddons(
       try {
         const url = normalizeManifestUrl(row.url);
         const manifest = await fetchJson<AddonManifest>(url);
+        console.info("[nuvio addons] manifest", {
+          requested: row.url,
+          fetched: url,
+          name: manifest?.name,
+          catalogs: manifest?.catalogs?.length ?? 0,
+          catalogIds: (manifest?.catalogs ?? []).map(
+            (catalog) => `${catalog.type}/${catalog.id}`,
+          ),
+          resources: manifest?.resources,
+          keys: Object.keys(manifest ?? {}),
+        });
         return { ...row, url, name: manifest.name || row.name, manifest };
       } catch (error) {
-        return {
-          ...row,
-          error: error instanceof Error ? error.message : "Manifest failed",
-        };
+        console.warn("[nuvio addons] manifest failed", row.url, error);
+        return { ...row, error: explainAddonFailure(row.url, error) };
       }
     }),
   );
@@ -338,13 +392,37 @@ export async function loadHome(
     }
     return false;
   };
+  const sections: CatalogSection[] = [];
+  const errors: string[] = [];
+  // Reported, not just skipped. An enabled addon with no manifest contributes
+  // no catalogs, and this used to drop it in silence — so a user whose addons
+  // all failed saw an empty home page and no message at all, which is the
+  // hardest possible version of this to diagnose from a bug report.
+  for (const addon of addons)
+    if (addon.enabled && !addon.manifest)
+      errors.push(`${addon.name ?? addon.url}: ${addon.error ?? "manifest did not load"}`);
+
+  // Every catalog that will not appear, and the reason. A catalog held back by
+  // a required extra and one switched off in the layout are indistinguishable
+  // on screen — both are simply absent — so they are separated here.
+  const skipped: Array<{ catalog: string; reason: string; detail?: string }> = [];
+
   const targets = addons
     .filter((addon) => addon.enabled && addon.manifest)
     .flatMap((addon) =>
       (addon.manifest!.catalogs ?? [])
-        .filter(
-          (catalog) => !(catalog.extra ?? []).some((extra) => extra.isRequired),
-        )
+        .filter((catalog) => {
+          const required = (catalog.extra ?? []).filter((extra) => extra.isRequired);
+          if (!required.length) return true;
+          // Matches Nuvio's own home filter, which drops any catalog needing an
+          // input the home screen has no way to supply.
+          skipped.push({
+            catalog: `${addon.manifest!.name}: ${catalog.type}/${catalog.id}`,
+            reason: "needs a required extra",
+            detail: required.map((extra) => extra.name).join(", "),
+          });
+          return false;
+        })
         .map((catalog) => ({
           addon,
           catalog,
@@ -353,25 +431,55 @@ export async function loadHome(
     )
     // A catalog the layout does not mention is new to this device, so it stays
     // visible — matching how the other clients treat an unknown key.
-    .filter(({ prefKey }) => layout?.enabledOf.get(prefKey) !== false);
+    .filter(({ addon, catalog, prefKey }) => {
+      if (layout?.enabledOf.get(prefKey) !== false) return true;
+      skipped.push({
+        catalog: `${addon.manifest!.name}: ${catalog.type}/${catalog.id}`,
+        reason: "switched off in the home layout",
+        detail: prefKey,
+      });
+      return false;
+    });
+
+  if (skipped.length) console.warn("[nuvio addons] catalogs not shown", skipped);
 
   // Ordered before batching, so the rows the user put on top are the ones
   // fetched first and therefore the ones that paint first.
+  console.info("[nuvio addons] home targets", {
+    addons: addons.length,
+    enabled: addons.filter((addon) => addon.enabled).length,
+    withManifest: addons.filter((addon) => addon.enabled && addon.manifest).length,
+    catalogsDeclared: addons
+      .filter((addon) => addon.enabled && addon.manifest)
+      .reduce((sum, addon) => sum + (addon.manifest!.catalogs?.length ?? 0), 0),
+    afterRequiredExtraFilter: targets.length,
+    hasLayout: !!layout,
+  });
+
   if (layout)
     targets.sort(
       (a, b) =>
         (layout.orderOf.get(a.prefKey) ?? Number.MAX_SAFE_INTEGER) -
         (layout.orderOf.get(b.prefKey) ?? Number.MAX_SAFE_INTEGER),
     );
-  const sections: CatalogSection[] = [];
-  const errors: string[] = [];
   for (let cursor = 0; cursor < targets.length; cursor += 4) {
     const batch = await Promise.all(
       targets.slice(cursor, cursor + 4).map(async ({ addon, catalog }) => {
         try {
+          const catalogUrl = resourceUrl(
+            addon.url,
+            "catalog",
+            catalog.type,
+            catalog.id,
+          );
           const payload = await fetchJson<{
             metas?: Array<Record<string, unknown>>;
-          }>(resourceUrl(addon.url, "catalog", catalog.type, catalog.id));
+          }>(catalogUrl);
+          console.info("[nuvio addons] catalog", {
+            url: catalogUrl,
+            metas: payload?.metas?.length ?? 0,
+            keys: Object.keys(payload ?? {}),
+          });
           const prefKey = `${addon.manifest!.id}:${catalog.type}:${catalog.id}`;
           const base = catalog.name || catalog.id;
           return {
@@ -397,6 +505,12 @@ export async function loadHome(
               .slice(0, 24),
           } satisfies CatalogSection;
         } catch (error) {
+          console.warn(
+            "[nuvio addons] catalog failed",
+            `${catalog.type}/${catalog.id}`,
+            addon.url,
+            error,
+          );
           errors.push(
             `${addon.name ?? addon.url}: ${error instanceof Error ? error.message : "catalog failed"}`,
           );
@@ -408,11 +522,26 @@ export async function loadHome(
       (section): section is CatalogSection =>
         section !== null && section.items.length > 0,
     );
+    for (const section of batch)
+      if (section && section.items.length === 0)
+        console.warn(
+          "[nuvio addons] catalog dropped: no items after filtering",
+          section.key,
+        );
     sections.push(...usable);
     for (const section of usable) onSection?.(section);
   }
+  console.info("[nuvio addons] home done", {
+    rowsReturned: sections.length,
+    requested: targets.length,
+    notShown: skipped.length,
+    errors,
+  });
   return { sections, errors };
 }
+
+/** TMDB's fixed page size, which its offset arithmetic depends on. */
+const TMDB_PAGE = 20;
 
 /** One collection source resolved against the installed addons. */
 export type CollectionSourceView = {
@@ -447,11 +576,54 @@ export function catalogTypeSuffix(name: string, contentType: string): string {
  * Labels each source the way Nuvio's folder tabs do: the catalog's own name,
  * plus its kind and the genre when the source pins one.
  */
+/**
+ * A stable string for a filter set, used to tell two otherwise identical
+ * sources apart. Sorted by key so the same filters always produce the same
+ * string regardless of the order they were serialised in.
+ */
+function stableFilterKey(filters?: Record<string, string | number>): string {
+  if (!filters) return "";
+  return Object.keys(filters)
+    .sort()
+    .map((key) => `${key}=${filters[key]}`)
+    .join("&");
+}
+
 export function describeCollectionSources(
   folder: CollectionFolder,
   addons: InstalledAddon[],
 ): CollectionSourceView[] {
   return folder.catalogSources.flatMap((source) => {
+    // TMDB and Trakt sources belong to no installed addon, so requiring one
+    // dropped them here — before a tab existed, before a request was made, and
+    // with nothing to report. The folder simply came back empty.
+    const provider = (source.provider || "addon").toLowerCase();
+    if (provider !== "addon") {
+      const kind = (source.tmdbSourceType ?? "list").toLowerCase();
+      // Mirrors Nuvio's catalogRouteKey, filters included. Nuvio ends its TMDB
+      // key with filters.hashCode() for a reason: a channel's sources differ
+      // only by their filters, so leaving them out collapsed every one of them
+      // onto the same key — and picking a single catalog then matched all of
+      // them, which is exactly what "All catalogs" already does.
+      const key =
+        provider === "tmdb"
+          ? `tmdb_${kind}_${source.tmdbId ?? ""}_${source.mediaType ?? ""}_${source.sortBy ?? ""}_${stableFilterKey(source.filters)}`
+          : `trakt_${source.traktListId ?? ""}_${source.mediaType ?? ""}_${source.sortBy ?? ""}_${source.sortHow ?? ""}`;
+      return [
+        {
+          source,
+          key,
+          label:
+            source.title?.trim() ||
+            `${provider === "tmdb" ? "TMDB" : "Trakt"} ${kind}`,
+          addonName: provider === "tmdb" ? "TMDB" : "Trakt",
+          // Only the paged TMDB endpoints; a collection or a person's credits
+          // come back whole.
+          supportsPagination:
+            provider === "tmdb" && ["list", "discover", "company", "network"].includes(kind),
+        },
+      ];
+    }
     const addon = addons.find(
       (item) => item.enabled && item.manifest?.id === source.addonId,
     );
@@ -487,53 +659,129 @@ export async function loadCollectionSources(
   sources: CollectionCatalogSource[],
   addons: InstalledAddon[],
   skip = 0,
-): Promise<{ items: Meta[]; errors: string[] }> {
+  /** TMDB API key from the profile's provider credentials, when one is saved. */
+  tmdbApiKey = "",
+  /** Where in `sources` to resume. "All" pages through the list with this. */
+  sourceOffset = 0,
+): Promise<{
+  items: Meta[];
+  errors: string[];
+  nextSkip?: number;
+  nextSourceOffset?: number;
+}> {
   const errors: string[] = [];
-  const results = await Promise.all(
-    sources.map(async (source) => {
-      const addon = addons.find(
-        (item) => item.enabled && item.manifest?.id === source.addonId,
-      );
-      if (!addon?.manifest) {
-        errors.push(`Collection addon ${source.addonId} is not installed`);
-        return [] as Meta[];
-      }
-      const extras: Record<string, string | number> = {};
-      if (source.genre?.trim()) extras.genre = source.genre.trim();
-      if (skip) extras.skip = skip;
-      try {
-        const payload = await fetchJson<{
-          metas?: Array<Record<string, unknown>>;
-        }>(
-          resourceUrl(
-            addon.url,
-            "catalog",
-            source.type,
-            source.catalogId,
-            extras,
-          ),
-        );
-        return (payload.metas ?? []).map((meta) =>
-          mapMeta(meta, addon.url, addon.manifest!.name),
-        );
-      } catch (error) {
-        errors.push(
-          `${addon.manifest.name}: ${error instanceof Error ? error.message : "catalog failed"}`,
-        );
-        return [] as Meta[];
-      }
-    }),
-  );
   const seen = new Set<string>();
   const items: Meta[] = [];
-  for (const batch of results)
-    for (const item of batch) {
-      const key = `${item.type}:${item.id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      items.push(item);
+  let tmdbHasMore = false;
+
+  const fetchSource = async (source: CollectionCatalogSource) => {
+    // TMDB and Trakt sources are lists on those services, not catalogs on an
+    // installed addon, and this client cannot read them yet. Saying so is the
+    // point: they used to be resolved as addon sources with a blank addonId
+    // and reported as "Collection addon  is not installed", which is both
+    // wrong and unactionable.
+    if (source.provider === "tmdb") {
+      if (!tmdbApiKey.trim()) {
+        errors.push(
+          `${source.title ?? "TMDB source"}: add a TMDB API key in Settings to load this.`,
+        );
+        return [] as Meta[];
+      }
+      try {
+        // TMDB pages; the addon path uses an item offset. Converting by item
+        // count stalled as soon as a page came back short — 19 items meant
+        // floor(19/20)+1 = page 1 again, the same titles, and the view decided
+        // it had reached the end. The offset therefore counts pages, not items.
+        const page = Math.floor(skip / TMDB_PAGE) + 1;
+        const result = await resolveTmdbSource(source, tmdbApiKey.trim(), page);
+        if (result.nextPage) tmdbHasMore = true;
+        return result.items;
+      } catch (error) {
+        errors.push(
+          `${source.title ?? "TMDB source"}: ${error instanceof Error ? error.message : "TMDB request failed"}`,
+        );
+        return [] as Meta[];
+      }
     }
-  return { items, errors };
+    if (source.provider && source.provider !== "addon") {
+      errors.push(
+        `${source.title ?? source.provider.toUpperCase()}: ${source.provider.toUpperCase()} collection sources are not supported in the web client yet.`,
+      );
+      return [] as Meta[];
+    }
+    const addon = addons.find(
+      (item) => item.enabled && item.manifest?.id === source.addonId,
+    );
+    if (!addon?.manifest) {
+      errors.push(`Collection addon ${source.addonId || "(unnamed)"} is not installed`);
+      return [] as Meta[];
+    }
+    const extras: Record<string, string | number> = {};
+    if (source.genre?.trim()) extras.genre = source.genre.trim();
+    if (skip) extras.skip = skip;
+    try {
+      const payload = await fetchJson<{
+        metas?: Array<Record<string, unknown>>;
+      }>(
+        resourceUrl(addon.url, "catalog", source.type, source.catalogId, extras),
+      );
+      return (payload.metas ?? []).map((meta) =>
+        mapMeta(meta, addon.url, addon.manifest!.name),
+      );
+    } catch (error) {
+      errors.push(
+        `${addon.manifest.name}: ${error instanceof Error ? error.message : "catalog failed"}`,
+      );
+      return [] as Meta[];
+    }
+  };
+
+  // A few at a time, stopping once the page is full.
+  //
+  // This used to be Promise.all over every source. A collection with three
+  // thousand of them opened three thousand fetches at once, and since a browser
+  // runs about six per host the rest sat in a queue — each already counting
+  // down the 14s timeout that starts when the request is created, not when it
+  // is sent. Nearly all of them therefore aborted before they were ever sent,
+  // so a large collection reliably came back empty and took the tab down with
+  // it.
+  const CONCURRENCY = 6;
+  const TARGET_ITEMS = 120;
+  let cursor = Math.max(0, sourceOffset);
+  while (cursor < sources.length && items.length < TARGET_ITEMS) {
+    const slice = sources.slice(cursor, cursor + CONCURRENCY);
+    cursor += slice.length;
+    const batch = await Promise.all(slice.map(fetchSource));
+    for (const metas of batch)
+      for (const item of metas) {
+        const key = `${item.type}:${item.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push(item);
+      }
+  }
+  const byProvider: Record<string, number> = {};
+  for (const source of sources)
+    byProvider[source.provider || "addon"] =
+      (byProvider[source.provider || "addon"] ?? 0) + 1;
+  console.info("[nuvio addons] collection sources", {
+    declared: sources.length,
+    byProvider,
+    requested: cursor,
+    items: items.length,
+    errors: errors.slice(0, 3),
+  });
+  return {
+    items,
+    errors,
+    // Only meaningful when TMDB reported another page; addon sources keep using
+    // the item-offset paging they already had.
+    nextSkip: tmdbHasMore ? skip + TMDB_PAGE : undefined,
+    // Where the next call should resume. Without this the page budget meant
+    // "All" only ever saw the first few sources: it filled up, stopped, and
+    // every later request started from the beginning again.
+    nextSourceOffset: cursor < sources.length ? cursor : undefined,
+  };
 }
 
 export async function loadCatalog(

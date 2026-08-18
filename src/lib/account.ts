@@ -216,6 +216,9 @@ function camelProfile(row: Record<string, unknown>): Profile {
     avatarId: row.avatar_id ? String(row.avatar_id) : undefined,
     usesPrimaryPlugins:
       row.uses_primary_plugins === true || row.usesPrimaryPlugins === true,
+    pinEnabled: row.pin_enabled === true || row.pinEnabled === true,
+    usesPrimaryAddons:
+      row.uses_primary_addons === true || row.usesPrimaryAddons === true,
     avatarUrl: row.avatar_url ? String(row.avatar_url) : undefined,
   };
 }
@@ -258,6 +261,20 @@ export async function loadAvatarCatalog(): Promise<AvatarCatalogItem[]> {
         left.category.localeCompare(right.category) ||
         left.sortOrder - right.sortOrder,
     );
+}
+
+/**
+ * Which profile's addon rows to read.
+ *
+ * A profile set to mirror the primary keeps no rows of its own, so querying by
+ * its own index returns nothing and the home page comes up empty. Matches the
+ * desktop client's `effective_addon_profile_id`.
+ */
+export function effectiveAddonProfileIndex(profile: Profile | null): number {
+  if (!profile) return 1;
+  return profile.usesPrimaryAddons && profile.profileIndex !== 1
+    ? 1
+    : profile.profileIndex;
 }
 
 export async function loadAddons(profileIndex: number): Promise<AddonRow[]> {
@@ -427,6 +444,38 @@ export async function pushSettingsBlob(
     p_origin_client_id: CLIENT_ID,
   });
   return next;
+}
+
+export type PinVerifyResult = {
+  unlocked: boolean;
+  retryAfterSeconds: number;
+  message?: string;
+};
+
+/**
+ * Checks a profile's PIN against the backend.
+ *
+ * The same RPC the official clients call, so a PIN set on one works on all of
+ * them. Verification is deliberately server-side: the PIN is never sent to the
+ * client to compare against, and the backend is what enforces the lockout after
+ * repeated failures.
+ */
+export async function verifyProfilePin(
+  profileIndex: number,
+  pin: string,
+): Promise<PinVerifyResult> {
+  const raw = await rpc<unknown>("verify_profile_pin", {
+    p_profile_id: profileIndex,
+    p_pin: pin,
+  });
+  const row = (Array.isArray(raw) ? raw[0] : raw) as
+    | Record<string, unknown>
+    | undefined;
+  return {
+    unlocked: row?.unlocked === true,
+    retryAfterSeconds: Number(row?.retry_after_seconds ?? 0) || 0,
+    message: row?.message ? String(row.message) : undefined,
+  };
 }
 
 export async function loadProviderCredentials(
@@ -767,9 +816,17 @@ export async function loadCollections(
         pinToTop: !!value.pinToTop,
         folders: folders.map((item) => {
           const folder = item as Record<string, unknown>;
-          const sources = Array.isArray(folder.catalogSources)
+          // Two lists exist and only one is authoritative. Nuvio writes modern
+          // sources — the ones that can be TMDB or Trakt — to `sources`, and
+          // keeps `catalogSources` as a legacy addon-only fallback for folders
+          // saved by older builds. Its `resolvedSources` is
+          // `sources.ifEmpty { catalogSources }`, and reading only the fallback
+          // is why every TMDB/Trakt collection arrived with nothing in it.
+          const modern = Array.isArray(folder.sources) ? folder.sources : [];
+          const legacy = Array.isArray(folder.catalogSources)
             ? folder.catalogSources
             : [];
+          const sources = modern.length ? modern : legacy;
           return {
             id: String(folder.id ?? ""),
             title: String(folder.title ?? "Folder"),
@@ -784,10 +841,34 @@ export async function loadCollections(
             catalogSources: sources.map((source) => {
               const entry = source as Record<string, unknown>;
               return {
+                // Nuvio omits this for addon sources and sets it to "tmdb" or
+                // "trakt" otherwise. Dropping it made every TMDB and Trakt
+                // source look like an addon source with a blank addonId, which
+                // then failed as "Collection addon  is not installed".
+                provider: String(entry.provider ?? "addon").toLowerCase(),
                 addonId: String(entry.addonId ?? ""),
                 type: String(entry.type ?? ""),
                 catalogId: String(entry.catalogId ?? ""),
                 genre: entry.genre ? String(entry.genre) : undefined,
+                title: entry.title ? String(entry.title) : undefined,
+                mediaType: entry.mediaType ? String(entry.mediaType) : undefined,
+                tmdbSourceType: entry.tmdbSourceType
+                  ? String(entry.tmdbSourceType)
+                  : undefined,
+                tmdbId: Number.isFinite(Number(entry.tmdbId))
+                  ? Number(entry.tmdbId)
+                  : undefined,
+                traktListId: Number.isFinite(Number(entry.traktListId))
+                  ? Number(entry.traktListId)
+                  : undefined,
+                sortBy: entry.sortBy ? String(entry.sortBy) : undefined,
+                sortHow: entry.sortHow ? String(entry.sortHow) : undefined,
+                // Kept as-is: these are TMDB discover parameters and the
+                // service, not this client, decides what they mean.
+                filters:
+                  entry.filters && typeof entry.filters === "object"
+                    ? (entry.filters as Record<string, string | number>)
+                    : undefined,
               };
             }),
           } satisfies CollectionFolder;

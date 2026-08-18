@@ -226,6 +226,12 @@ function tmdbPeople(payload: Json, series: boolean): {
   };
 }
 
+/** TMDB scores an unrated episode 0, which is absence rather than a score. */
+function episodeScore(item: Json): string | undefined {
+  const score = number(item.vote_average);
+  return score != null && score > 0 ? score.toFixed(1) : undefined;
+}
+
 function tmdbTrailers(payload: Json): MetaTrailer[] {
   return list(json(payload.videos)?.results)
     .filter((item) => text(item.site)?.toLowerCase() === "youtube" && text(item.key))
@@ -355,6 +361,18 @@ async function enrichEpisodes(
         runtime: config.useEpisodes
           ? number(item.runtime) || video.runtime
           : video.runtime,
+        // The season payload already carries a score per episode, and this is
+        // the only per-episode rating available to a browser: addons supply a
+        // rating for the show but not for its episodes, and the service the
+        // native clients use for that sends no CORS headers.
+        // The addon's own score wins: it is an actual IMDb rating, where
+        // TMDB's vote average is a different measure that merely looks alike.
+        imdbRating: config.useEpisodes
+          ? video.imdbRating ?? episodeScore(item)
+          : video.imdbRating,
+        ratingSource: config.useEpisodes
+          ? video.ratingSource ?? (episodeScore(item) ? "tmdb" : undefined)
+          : video.ratingSource,
       };
     }),
   };

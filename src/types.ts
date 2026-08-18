@@ -14,6 +14,13 @@ export type Profile = {
   avatarUrl?: string;
   /** Secondary profiles can deliberately share profile 1's plugin list. */
   usesPrimaryPlugins?: boolean;
+  /**
+   * The same for addons. A mirroring profile stores no addon rows of its own,
+   * so its addons must be read from profile 1 or it has none at all.
+   */
+  usesPrimaryAddons?: boolean;
+  /** Locked profiles ask for a four-digit PIN before they can be opened. */
+  pinEnabled?: boolean;
 };
 export type AvatarCatalogItem = {
   id: string;
@@ -67,6 +74,8 @@ export type Video = {
   overview?: string;
   runtime?: number;
   imdbRating?: string;
+  /** Which service the score came from, so the badge can be honest about it. */
+  ratingSource?: "imdb" | "tmdb";
   available?: boolean;
 };
 export type PluginRow = {
@@ -241,10 +250,27 @@ export type NavKey =
 
 /** One catalog feeding a collection folder. */
 export type CollectionCatalogSource = {
+  /**
+   * "addon", "tmdb" or "trakt". Nuvio defaults it to "addon" when absent, and
+   * only addon sources carry a resolvable addonId — a TMDB or Trakt source is
+   * a list on that service, not a catalog on an installed addon.
+   */
+  provider: string;
   addonId: string;
   type: string;
   catalogId: string;
   genre?: string;
+  /** Set on TMDB and Trakt sources; used for labelling them. */
+  title?: string;
+  mediaType?: string;
+  /** LIST | COLLECTION | COMPANY | NETWORK | DISCOVER | PERSON | DIRECTOR. */
+  tmdbSourceType?: string;
+  tmdbId?: number;
+  traktListId?: number;
+  sortBy?: string;
+  sortHow?: string;
+  /** Passed through to TMDB's discover endpoint verbatim. */
+  filters?: Record<string, string | number>;
 };
 export type CollectionFolder = {
   id: string;
