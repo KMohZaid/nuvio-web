@@ -25,6 +25,38 @@ A token and two integers, for as long as it takes the app to ask — deleted on
 collection, or after five minutes if nobody collects. It never receives what
 is being watched, the stream URL, the addon, or anything about the account.
 
+## What is exposed
+
+**The stream URL reaches the relay, and there is no way to stop it.** Outplayer
+appends `url`, `position` and `duration` to whatever address it was handed, so
+the stream URL arrives in the query string of the callback. This relay never
+reads it, never stores it and never echoes it back — the slot holds only an
+outcome and two integers — but it has still left the device and travelled to
+Cloudflare, which sees request URLs as a matter of course.
+
+That is worth weighing if a stream URL carries an access token. Most debrid
+links are short-lived and tied to the requesting IP, which limits what a copy
+of one is worth later, but it is not nothing. The page returned sets
+`Referrer-Policy: no-referrer` and `Cache-Control: no-store` so the address
+goes no further, and it also sits in that device's Safari history.
+
+**The token is the only thing protecting a report.** It is 128 bits from the
+platform's own generator, and there is nothing to enumerate. The CORS check on
+collection restricts browsers to the configured hosts, but an `Origin` header
+can be set by anything that is not a browser — treat it as tidiness, not as
+access control. Knowing a token is the whole of the permission, which is why
+the slot is emptied on the first read.
+
+**Writes are unauthenticated.** Anyone who learns the relay's address can
+create slots. Nothing readable comes of it — they would be writing to tokens
+nobody will collect — but it consumes the daily write allowance, so the honest
+protection is that a `workers.dev` address nobody has been given is not worth
+guessing at. The free plan fails closed rather than billing. Slots delete
+themselves five minutes after they are written, so nothing accumulates.
+
+**What never reaches it:** what is being watched, which addon served it, the
+library, the account, or any credential.
+
 ## Deploying
 
 ```bash
