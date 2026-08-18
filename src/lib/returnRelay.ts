@@ -80,7 +80,14 @@ export function relayReturnUrl(
   outcome: "finished" | "stopped",
 ) {
   const query = new URLSearchParams({ outcome, app: appHost });
-  return `${relayUrl()}/r/${token}?${query.toString()}`;
+  // The trailing fragment is the point of interest. A player appends its own
+  // parameters to the end of whatever address it was handed, and a fragment is
+  // never sent to a server — so if it appends plainly rather than parsing the
+  // address first, the stream URL it appends alongside the position stays on
+  // the device, and the relay page reads the position and posts that alone.
+  // Where it does parse, the parameters land in the query as before and
+  // nothing is worse than it was.
+  return `${relayUrl()}/r/${token}?${query.toString()}#nuvio`;
 }
 
 /**

@@ -114,7 +114,7 @@ function corsHeaders(request: Request, env: Env) {
  * behind it, because a scheme handoff without a tap is not something every
  * iOS version allows.
  */
-function handoffPage(appHost: string, shortcutName: string) {
+function handoffPage(appHost: string, shortcutName: string, token: string) {
   const target = `webapp://${appHost}/`;
   const shortcut =
     `shortcuts://run-shortcut?` +
@@ -134,12 +134,40 @@ function handoffPage(appHost: string, shortcutName: string) {
  a{display:inline-block;padding:14px 22px;border-radius:12px;background:#e9eef2;
    color:#090b0d;text-decoration:none;font-weight:600}
  p{color:#8d97a2;margin:0}
+ small{color:#5d666f;font-size:11px}
 </style></head>
 <body><div>
  <p>Saved where you stopped.</p>
  <p><a id="go" href="${escaped}">Return to Nuvio</a></p>
+ <p><small id="via"></small></p>
 </div>
-<script>location.href=document.getElementById("go").href</script>
+<script>
+// A fragment never leaves the browser. If the player appended its parameters
+// after the "#" we put on the end of this address, then the stream URL it
+// appends alongside them was never sent here — and the position is read out of
+// the fragment and posted back on its own, without it.
+(async function () {
+  var hash = location.hash.replace(/^#nuvio&?/, "");
+  var read = new URLSearchParams(hash);
+  var pos = read.get("position");
+  var via = document.getElementById("via");
+  if (pos !== null) {
+    try {
+      await fetch(${JSON.stringify(`/p/${token}`)}, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ position: pos, duration: read.get("duration") })
+      });
+      via.textContent = "Position read on this device; the stream URL was never sent.";
+    } catch (e) {
+      via.textContent = "Could not save the position.";
+    }
+  } else {
+    via.textContent = "Position arrived in the address.";
+  }
+  location.href = document.getElementById("go").href;
+})();
+</script>
 </body></html>`;
 }
 
@@ -166,11 +194,13 @@ export default {
         durationMs: seconds(url.searchParams.get("duration")),
         at: Date.now(),
       };
+      // Stored even when empty: the outcome is known either way, and the page
+      // fills in the numbers afterwards when they came back in the fragment.
       await slot.fetch("https://slot/put", {
         method: "POST",
         body: JSON.stringify(report),
       });
-      return new Response(handoffPage(host, env.SHORTCUT_NAME), {
+      return new Response(handoffPage(host, env.SHORTCUT_NAME, token), {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           // The player's parameters are in this address; keep it out of
@@ -179,6 +209,29 @@ export default {
           "Cache-Control": "no-store",
         },
       });
+    }
+
+    // The handoff page, posting numbers it read out of the fragment — which
+    // means they, and the stream URL beside them, never reached this server in
+    // the request line. Same origin, so no CORS to negotiate.
+    if (route === "p" && request.method === "POST") {
+      const body = (await request.json().catch(() => null)) as {
+        position?: string;
+        duration?: string;
+      } | null;
+      if (!body) return new Response("Bad request", { status: 400 });
+      const answer = await slot.fetch("https://slot/take");
+      const existing = (await answer.json()) as { report?: Report };
+      await slot.fetch("https://slot/put", {
+        method: "POST",
+        body: JSON.stringify({
+          outcome: existing.report?.outcome ?? "stopped",
+          positionMs: seconds(body.position ?? null),
+          durationMs: seconds(body.duration ?? null),
+          at: Date.now(),
+        } satisfies Report),
+      });
+      return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
     }
 
     // The app collecting its answer.

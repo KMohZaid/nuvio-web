@@ -27,18 +27,28 @@ is being watched, the stream URL, the addon, or anything about the account.
 
 ## What is exposed
 
-**The stream URL reaches the relay, and there is no way to stop it.** Outplayer
-appends `url`, `position` and `duration` to whatever address it was handed, so
-the stream URL arrives in the query string of the callback. This relay never
-reads it, never stores it and never echoes it back — the slot holds only an
-outcome and two integers — but it has still left the device and travelled to
-Cloudflare, which sees request URLs as a matter of course.
+**The stream URL may or may not reach the relay, and the callback is shaped so
+that it does not have to.** Outplayer appends `url`, `position` and `duration`
+to whatever address it was handed. The address handed to it ends in a
+fragment — `#nuvio` — and a fragment is never sent to a server. So:
 
-That is worth weighing if a stream URL carries an access token. Most debrid
-links are short-lived and tied to the requesting IP, which limits what a copy
-of one is worth later, but it is not nothing. The page returned sets
-`Referrer-Policy: no-referrer` and `Cache-Control: no-store` so the address
-goes no further, and it also sits in that device's Safari history.
+- If the player appends plainly, its parameters land after the `#`. The server
+  receives only the token, the outcome and the app host; the stream URL never
+  goes on the wire at all. The page reads the position out of the fragment on
+  the device and posts back that alone.
+- If the player parses the address first, its parameters land in the query and
+  the server sees them, the stream URL included. Nothing is worse than it would
+  otherwise have been, and the position still arrives.
+
+Which of the two happens is a property of the player, and the handoff page says
+which it was while it is on screen.
+
+In the second case it is worth weighing whether a stream URL carries an access
+token. Most debrid links are short-lived and tied to the requesting IP, which
+limits what a copy is worth later, but it is not nothing. The relay never reads,
+stores or echoes the URL in either case, the page sets `Referrer-Policy:
+no-referrer` and `Cache-Control: no-store` so the address travels no further,
+and it sits in that device's Safari history regardless.
 
 **The token is the only thing protecting a report.** It is 128 bits from the
 platform's own generator, and there is nothing to enumerate. The CORS check on
@@ -77,8 +87,11 @@ handoff → Return relay**.
 
 ## The routes
 
-- `GET /r/<token>?outcome=…&app=…&position=…&duration=…` — where the player's
-  callback lands. Stores the report and returns a page that hands off to
-  Shortcuts, which opens the app.
+- `GET /r/<token>?outcome=…&app=…` — where the player's callback lands, with
+  `position` and `duration` alongside if the player put them in the query
+  rather than after the fragment. Stores what it has and returns a page that
+  hands off to Shortcuts, which opens the app.
+- `POST /p/<token>` — that page, sending the position it read out of the
+  fragment. Same origin, so no CORS; the token is the permission, as elsewhere.
 - `GET /c/<token>` — the app collecting its answer. CORS-restricted to the
   allowed hosts, and the slot is emptied on read.
