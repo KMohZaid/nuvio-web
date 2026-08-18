@@ -121,9 +121,17 @@ const EXPECT_KEY = "nuvio-web-expect-return";
 export function expectExternalReturn() {
   try {
     localStorage.setItem(EXPECT_KEY, "1");
+    // Written now, so a test that never comes back still says so rather than
+    // leaving the previous reading in place to be read as this one's result.
+    localStorage.setItem(LAST_RETURN_KEY, `${clockTime()} test sent · waiting`);
   } catch {
     // Only the diagnostic is lost.
   }
+}
+
+/** Local time: this is read on the device, against its own clock. */
+function clockTime() {
+  return new Date().toLocaleTimeString();
 }
 
 export function noteExternalReturn(reason: string) {
@@ -134,8 +142,17 @@ export function noteExternalReturn(reason: string) {
   } catch {
     // Treated as not expecting.
   }
+  const pending = !!readExternalHandoff();
   // Otherwise every ordinary open would overwrite the reading being read.
-  if (!window.location.search && !expecting && !readExternalHandoff()) return;
+  if (!window.location.search && !expecting && !pending) return;
+  // Why this was recorded at all. A blank reading means nothing without it:
+  // the return from a test and an unrelated open while a hand-off was still
+  // unanswered look identical, and only one of them is an answer.
+  const trigger = expecting
+    ? "after test"
+    : window.location.search
+      ? "with parameters"
+      : "while awaiting a player";
   try {
     localStorage.removeItem(EXPECT_KEY);
     localStorage.setItem(
@@ -144,9 +161,9 @@ export function noteExternalReturn(reason: string) {
       // start_url rather than at the address it was given is a different
       // failure from one reopened correctly with the query stripped, and they
       // are otherwise indistinguishable.
-      `${new Date().toISOString().slice(11, 19)} ${reason} · ${
-        window.location.pathname
-      }${window.location.search || " (no parameters)"}`,
+      `${clockTime()} ${reason} ${trigger} · ${window.location.pathname}${
+        window.location.search || " (no parameters)"
+      }`,
     );
   } catch {
     // Only the diagnostic is lost.
