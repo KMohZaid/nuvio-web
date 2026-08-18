@@ -106,11 +106,15 @@ import {
   canReturnToApp,
   externalPlayerLabel,
   externalPlayerOptions,
+  installedAppUrl,
   isAndroid,
   isAppleMobile,
   isExternalPlayerAvailable,
+  isInstalledAppleWebApp,
   isMacOS,
   launchExternalPlayer,
+  RETURN_SHORTCUT_NAME,
+  shortcutReturnUrl,
 } from "./lib/externalPlayer";
 import {
   clearExternalHandoff,
@@ -340,6 +344,13 @@ export function App() {
     ) as ExternalPlayerMode | null;
     return stored && isExternalPlayerAvailable(stored) ? stored : "internal";
   });
+  /**
+   * Off until the Shortcut it depends on is installed. Nothing about the
+   * device says whether it is, so this is the answer to being asked.
+   */
+  const [shortcutReturn, setShortcutReturn] = useState(
+    () => localStorage.getItem("nuvio-web-shortcut-return") === "1",
+  );
   const [active, setActive] = useState<NavKey>("home");
   // The nav highlight follows `active` immediately; the page body renders from
   // the deferred copy, so a tap paints the new tab first and the heavy list
@@ -1298,13 +1309,17 @@ export function App() {
     if (profile && mode !== "copy" && mode !== "m3u")
       rememberExternalHandoff(profile.profileIndex, meta, video);
     const resumeMs = positionMs ?? resumePositionMs(meta, video);
+    const appUrl = installedAppUrl();
     launchExternalPlayer(mode, url, video?.title || meta.name, {
       positionSeconds: resumeMs / 1000,
-      // Omitted where a link back cannot reach us: an installed iOS web app
-      // would only send the viewer to a signed-out Safari tab.
-      returnUrl: canReturnToApp()
-        ? `${window.location.origin}${import.meta.env.BASE_URL}`
-        : undefined,
+      // An https link reaches an installed iOS web app only as a signed-out
+      // Safari tab, so there the way back is the Shortcut, and only once it
+      // has been installed. Everywhere else the plain address is the app.
+      returnUrlFor: canReturnToApp()
+        ? (query) => `${appUrl}${query}`
+        : shortcutReturn
+          ? (query) => shortcutReturnUrl(appUrl, query)
+          : undefined,
     });
     setMessage(
       mode === "copy"
@@ -1762,6 +1777,11 @@ export function App() {
             credentialsReady={credentialsReady}
             onProviderCredential={saveProviderCredential}
             externalPlayer={externalPlayer}
+            shortcutReturn={shortcutReturn}
+            onShortcutReturn={(value) => {
+              localStorage.setItem("nuvio-web-shortcut-return", value ? "1" : "0");
+              setShortcutReturn(value);
+            }}
             onExternalPlayer={(mode) => {
               setExternalPlayer(mode);
               localStorage.setItem("nuvio-web-external-player", mode);
@@ -2823,6 +2843,8 @@ function SettingsPage({
   onProviderCredential,
   externalPlayer,
   onExternalPlayer,
+  shortcutReturn,
+  onShortcutReturn,
   onSignOut,
 }: {
   onRemuxLab(): void;
@@ -2861,6 +2883,9 @@ function SettingsPage({
   ): Promise<void>;
   externalPlayer: ExternalPlayerMode;
   onExternalPlayer(mode: ExternalPlayerMode): void;
+  /** Whether the Shortcut that reopens this installed web app is set up. */
+  shortcutReturn: boolean;
+  onShortcutReturn(value: boolean): void;
   onSignOut(): void;
 }) {
   const [category, setCategory] = useState<SettingsCategory>("appearance");
@@ -3903,11 +3928,45 @@ function SettingsPage({
             <option value="internal">Nuvio web player</option>
             {externalPlayerOptions("settings").map((option) => (
               <option key={option.mode} value={option.mode}>
+                {/* Which players can say what happened is the difference
+                    between progress being recorded and being asked for. */}
                 {option.label}
+                {option.reportsBack ? " ✓ reports back" : ""}
               </option>
             ))}
           </select>
         </label>
+        {/* Only where it is the one way back: everywhere else a plain link
+            already reaches the app. */}
+        {isInstalledAppleWebApp() && (
+          <>
+            <label className="setting-select-row">
+              <span>
+                <strong>Return through the Shortcut</strong>
+                <small>
+                  iOS hands an ordinary link to Safari, which is signed out and
+                  cannot save anything. A Shortcut can open this app instead.
+                  Add one named “{RETURN_SHORTCUT_NAME}” that takes text input
+                  and runs <b>Open URLs</b> on it, then turn this on. Only
+                  players marked “reports back” use it.
+                </small>
+              </span>
+              <span className="switch">
+                <input
+                  type="checkbox"
+                  checked={shortcutReturn}
+                  onChange={(event) => onShortcutReturn(event.target.checked)}
+                />
+                <i />
+              </span>
+            </label>
+            <p className="settings-shortcut-target">
+              The Shortcut opens whichever copy of the app you installed, so it
+              has to be this address, trailing slash included:{" "}
+              <code>{`webapp://${installedAppUrl().replace(/^https?:\/\//i, "")}`}</code>
+            </p>
+          </>
+        )}
         <p>
           The web remux fallback only re-boxes compatible tracks. DTS and
           TrueHD still require an external player; Nuvio Web does not transcode.

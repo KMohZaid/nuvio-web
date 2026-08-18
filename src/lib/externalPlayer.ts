@@ -31,6 +31,61 @@ const isStandalone = () =>
  */
 export const canReturnToApp = () => !(isAppleMobile() && isStandalone());
 
+/** True only where the Shortcut route below is the one way back. */
+export const isInstalledAppleWebApp = () => isAppleMobile() && isStandalone();
+
+/**
+ * This app's own address, as webapp:// needs it.
+ *
+ * Derived rather than written down: the installed app is whichever origin it
+ * was added to the home screen from — a tunnel while testing, Pages once
+ * deployed — and webapp:// only resolves the one that matches. The trailing
+ * slash is required; without it iOS does not find the app at all.
+ */
+export function installedAppUrl() {
+  const url = `${window.location.origin}${import.meta.env.BASE_URL}`;
+  return url.endsWith("/") ? url : `${url}/`;
+}
+
+/** The Shortcut's name, which has to match the one installed on the device. */
+export const RETURN_SHORTCUT_NAME = "Open Nuvio";
+
+/**
+ * A way back into an installed iOS web app, by way of Shortcuts.
+ *
+ * iOS gives an https link to Safari, which is a separate storage container
+ * from the installed app and so is signed out and knows nothing. webapp://
+ * opens the installed app itself, but Safari will not follow it. The Shortcuts
+ * app will: handed the webapp:// address as text, a one-step shortcut opens
+ * it, and the app comes to the front where the session and the note about what
+ * was playing already are.
+ *
+ * What this cannot carry is the position. A player appends `position` and
+ * `duration` to the address it is given — here that is the shortcuts:// one,
+ * so they arrive as parameters of the shortcut rather than inside the text it
+ * passes on, and Shortcuts drops what it does not recognise. Finishing needs
+ * no parameters and so survives; stopping part-way comes back to the prompt.
+ */
+export function shortcutReturnUrl(
+  appUrl: string,
+  query: string,
+  shortcutName = RETURN_SHORTCUT_NAME,
+) {
+  // The slash is load-bearing, so it is enforced here rather than assumed of
+  // whoever passed the address in.
+  const host = appUrl.replace(/^https?:\/\//i, "").replace(/\/*$/, "/");
+  const target = `webapp://${host}${query}`;
+  const params = new URLSearchParams({
+    name: shortcutName,
+    input: "text",
+    text: target,
+  });
+  // Form encoding writes a space as "+", which only means a space to a reader
+  // that knows it is reading a form. The name has to match a Shortcut exactly,
+  // and "Open+Nuvio" is not "Open Nuvio" to anything that does not.
+  return `shortcuts://run-shortcut?${params.toString().replaceAll("+", "%20")}`;
+}
+
 export type ExternalPlayerSurface = "settings" | "player";
 type PlayerPlatform = "android" | "apple-mobile" | "macos" | "desktop";
 
@@ -38,6 +93,11 @@ type ExternalPlayerDefinition = {
   mode: ExternalPlayerMode;
   label: string | Partial<Record<PlayerPlatform, string>>;
   platforms: Record<ExternalPlayerSurface, readonly PlayerPlatform[]>;
+  /**
+   * Whether the player tells us what happened when it is done. Only Outplayer
+   * does; everything else is a one-way trip and has to be asked afterwards.
+   */
+  reportsBack?: boolean;
 };
 
 const EVERYWHERE = [
@@ -89,6 +149,7 @@ const externalPlayerDefinitions: readonly ExternalPlayerDefinition[] = [
     mode: "outplayer",
     label: "Outplayer",
     platforms: { settings: ["apple-mobile"], player: ["apple-mobile"] },
+    reportsBack: true,
   },
   {
     mode: "infuse",
@@ -120,6 +181,7 @@ export function externalPlayerOptions(surface: ExternalPlayerSurface) {
     .filter((option) => option.platforms[surface].includes(platform))
     .map((option) => ({
       mode: option.mode,
+      reportsBack: option.reportsBack === true,
       label:
         typeof option.label === "string"
           ? option.label
@@ -227,11 +289,10 @@ export function mpvHandlerUrl(url: string) {
  * learns everything the "how far did you get?" prompt has to ask for, so on
  * this one player the prompt never has to appear.
  */
-function outplayerCallbacks(returnUrl: string) {
-  const separator = returnUrl.includes("?") ? "&" : "?";
+function outplayerCallbacks(returnUrlFor: (query: string) => string) {
   return {
-    "x-success": `${returnUrl}${separator}nuvio-external=finished`,
-    "x-cancel": `${returnUrl}${separator}nuvio-external=stopped`,
+    "x-success": returnUrlFor("?nuvio-external=finished"),
+    "x-cancel": returnUrlFor("?nuvio-external=stopped"),
   };
 }
 
@@ -250,9 +311,9 @@ export function outplayerPlaybackUrl(
   const position = Math.floor(options.positionSeconds ?? 0);
   if (position > 0) query.set("position", String(position));
   if (options.subtitleUrl) query.set("subtitle", options.subtitleUrl);
-  if (options.returnUrl)
+  if (options.returnUrlFor)
     for (const [key, value] of Object.entries(
-      outplayerCallbacks(options.returnUrl),
+      outplayerCallbacks(options.returnUrlFor),
     ))
       query.set(key, value);
   return `outplayer://x-callback-url/play?${query.toString()}`;
@@ -263,8 +324,13 @@ export type ExternalPlayerLaunchOptions = {
   positionSeconds?: number;
   /** An external subtitle file, if the stream came with one. */
   subtitleUrl?: string;
-  /** Where the player should return the viewer, for the players that can. */
-  returnUrl?: string;
+  /**
+   * Builds the address a player should return to, given the query it should
+   * carry. A function rather than a string because the Shortcut route has to
+   * fold that query inside the text it passes on, not onto its own end.
+   * Absent where no address can reach us.
+   */
+  returnUrlFor?: (query: string) => string;
 };
 
 /** Hands a stream to a registered player outside the browser. */

@@ -4139,8 +4139,13 @@ body.is-locked {
   gap: 10px;
 }
 /* Centred rather than bottom-anchored: this is a question, not a sheet of
-   options to scroll. */
+   options to scroll.
+
+   Above the detail view, which is z-index 100 and renders after this — so at
+   the sheet backdrop's own z-index of 10 the question was drawn underneath
+   the page that raised it. */
 .sheet-backdrop:has(.watch-prompt) {
+  z-index: 150;
   align-items: center;
   padding: 20px;
 }

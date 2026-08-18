@@ -1095,6 +1095,7 @@ export function Details({
                     {externalPlayerOptions("player").map((option) => (
                       <option key={option.mode} value={option.mode}>
                         {option.label}
+                        {option.reportsBack ? " ✓" : ""}
                       </option>
                     ))}
                   </select>
