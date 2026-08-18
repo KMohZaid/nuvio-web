@@ -120,6 +120,7 @@ import {
   clearRelayToken,
   collectRelayReport,
   describeReturnRoute,
+  lastRelayRoute,
   newRelayToken,
   pendingRelayToken,
   relayReturnUrl,
@@ -550,7 +551,7 @@ export function App() {
       void collectRelayReport(token).then((relayed) => {
         noteExternalEvent(
           relayed
-            ? `relay answered ${relayed.outcome} at ${Math.round(relayed.outcome === "stopped" ? relayed.positionMs / 1000 : 0)}s`
+            ? `relay answered ${relayed.outcome} at ${Math.round(relayed.outcome === "stopped" ? relayed.positionMs / 1000 : 0)}s · ${lastRelayRoute()}`
             : `relay had nothing (${reason})`,
         );
         setLastReturn(readExternalReturnLog());

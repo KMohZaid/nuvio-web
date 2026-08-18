@@ -110,6 +110,21 @@ export function describeReturnRoute(options: {
   return "Nowhere. The prompt will ask what happened. Add a relay above to have it reported instead.";
 }
 
+let lastVia: "query" | "fragment" | null = null;
+
+/**
+ * How the last report reached the relay, in plain words.
+ *
+ * "fragment" means the player appended after the "#" we ended the address
+ * with, so its parameters — the stream URL among them — never went on the
+ * wire. "query" means it parsed the address first and they did.
+ */
+export function lastRelayRoute(): string {
+  if (lastVia === "fragment") return "stream URL stayed on the device";
+  if (lastVia === "query") return "stream URL was sent too";
+  return "";
+}
+
 /**
  * Asks the relay whether an answer is waiting. Reading empties the slot, so
  * this is asked once per return and the token dropped either way.
@@ -133,11 +148,17 @@ export async function collectRelayReport(
         outcome?: string;
         positionMs?: number;
         durationMs?: number;
+        via?: "query" | "fragment";
       };
     };
     const report = body.found ? body.report : undefined;
-    if (report?.outcome === "finished") return { outcome: "finished" };
-    if (report?.outcome === "stopped")
+    if (!report) return null;
+    // Whether the stream URL went on the wire alongside the position. Carried
+    // out with the report so it can be said plainly rather than inferred from
+    // a page that is gone in under a second.
+    lastVia = report.via ?? null;
+    if (report.outcome === "finished") return { outcome: "finished" };
+    if (report.outcome === "stopped")
       return {
         outcome: "stopped",
         positionMs: Math.max(0, Math.round(report.positionMs ?? 0)),

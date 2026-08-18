@@ -33,6 +33,12 @@ type Report = {
   positionMs: number;
   durationMs: number;
   at: number;
+  /**
+   * Where the player put its parameters, which decides whether the stream URL
+   * beside them was ever sent here. Recorded so the app can say so long after
+   * the page that observed it has gone.
+   */
+  via: "query" | "fragment";
 };
 
 /**
@@ -193,6 +199,10 @@ export default {
         positionMs: seconds(url.searchParams.get("position")),
         durationMs: seconds(url.searchParams.get("duration")),
         at: Date.now(),
+        // A position in the query means the player parsed the address and put
+        // everything there, the stream URL included. Absent, it went after the
+        // fragment and the page will post it back on its own.
+        via: url.searchParams.has("position") ? "query" : "fragment",
       };
       // Stored even when empty: the outcome is known either way, and the page
       // fills in the numbers afterwards when they came back in the fragment.
@@ -229,6 +239,7 @@ export default {
           positionMs: seconds(body.position ?? null),
           durationMs: seconds(body.duration ?? null),
           at: Date.now(),
+          via: "fragment",
         } satisfies Report),
       });
       return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
