@@ -1897,9 +1897,15 @@ export function App() {
             shortcutReturn && !canReturnToApp()
               ? (text) => {
                   const report = parseExternalReport(text);
-                  if (!report) return false;
+                  if (!report)
+                    return "The clipboard does not hold anything from the Shortcut.";
+                  // The address arrived but the player's own numbers were
+                  // never in it. Saying so beats a tap that looks like it did
+                  // nothing, which is exactly what this used to be.
+                  if (report.outcome === "stopped" && report.positionMs <= 0)
+                    return "The Shortcut copied the address, but the player did not put a position in it.";
                   applyExternalReport(report);
-                  return true;
+                  return null;
                 }
               : undefined
           }

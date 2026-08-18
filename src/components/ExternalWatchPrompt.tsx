@@ -68,10 +68,10 @@ export function ExternalWatchPrompt({
   onDismiss(): void;
   /**
    * Hands over whatever the clipboard holds, for the one route where a player
-   * can say where it stopped but cannot deliver it. Returns false when that is
-   * not what was on the clipboard. Absent where the route is not in use.
+   * can say where it stopped but cannot deliver it. Returns null when it was
+   * used, or why it could not be. Absent where the route is not in use.
    */
-  onPasted?(text: string): boolean;
+  onPasted?(text: string): string | null;
 }) {
   const known = runtimeMinutes(meta, video);
   const [partial, setPartial] = useState(false);
@@ -123,10 +123,10 @@ export function ExternalWatchPrompt({
                 setPasteError("");
                 try {
                   const text = await navigator.clipboard.readText();
-                  if (!onPasted(text))
-                    setPasteError(
-                      "The clipboard does not hold a position from the Shortcut.",
-                    );
+                  // A reason, or nothing at all — the one outcome to avoid is
+                  // a tap that appears to do nothing, which is what happens
+                  // when a report is read but has no position in it.
+                  setPasteError(onPasted(text) ?? "");
                 } catch {
                   setPasteError("iOS did not allow the clipboard to be read.");
                 }
