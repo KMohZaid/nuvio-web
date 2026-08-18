@@ -11,8 +11,6 @@ export const isAndroid = () => /Android/i.test(navigator.userAgent);
 export const isMacOS = () =>
   !isAppleMobile() && /Macintosh|Mac OS X/i.test(navigator.userAgent);
 
-export const isDesktop = () => !isAppleMobile() && !isAndroid();
-
 export type ExternalPlayerSurface = "settings" | "player";
 type PlayerPlatform = "android" | "apple-mobile" | "macos" | "desktop";
 
@@ -22,16 +20,28 @@ type ExternalPlayerDefinition = {
   platforms: Record<ExternalPlayerSurface, readonly PlayerPlatform[]>;
 };
 
+const EVERYWHERE = [
+  "android",
+  "apple-mobile",
+  "macos",
+  "desktop",
+] as const satisfies readonly PlayerPlatform[];
+
 const externalPlayerDefinitions: readonly ExternalPlayerDefinition[] = [
   {
     mode: "copy",
+    // Pasting a URL into a player works on every platform, so this is offered
+    // as a default on every platform too.
     label: "Copy stream URL",
-    platforms: { settings: ["macos", "desktop"], player: ["android", "apple-mobile", "macos", "desktop"] },
+    platforms: { settings: EVERYWHERE, player: EVERYWHERE },
   },
   {
+    // vlc-x-callback is an iOS scheme. VLC for macOS registers no URL scheme
+    // of its own, so there is nothing to hand a stream to there; copy is the
+    // honest route on a Mac.
     mode: "vlc",
     label: "VLC",
-    platforms: { settings: ["android", "apple-mobile", "macos"], player: ["android", "apple-mobile", "macos"] },
+    platforms: { settings: ["android", "apple-mobile"], player: ["android", "apple-mobile"] },
   },
   {
     mode: "nextplayer",
@@ -54,9 +64,11 @@ const externalPlayerDefinitions: readonly ExternalPlayerDefinition[] = [
     platforms: { settings: ["android"], player: ["android"] },
   },
   {
+    // iOS and iPadOS only — there is no Outplayer for macOS to answer the
+    // scheme.
     mode: "outplayer",
     label: "Outplayer",
-    platforms: { settings: ["apple-mobile", "macos"], player: ["apple-mobile", "macos"] },
+    platforms: { settings: ["apple-mobile"], player: ["apple-mobile"] },
   },
   {
     mode: "infuse",
@@ -71,7 +83,7 @@ const externalPlayerDefinitions: readonly ExternalPlayerDefinition[] = [
   {
     mode: "m3u",
     label: "Download M3U playlist",
-    platforms: { settings: ["android", "apple-mobile", "macos", "desktop"], player: ["android", "apple-mobile", "macos", "desktop"] },
+    platforms: { settings: EVERYWHERE, player: EVERYWHERE },
   },
 ];
 
@@ -91,7 +103,11 @@ export function externalPlayerOptions(surface: ExternalPlayerSurface) {
       label:
         typeof option.label === "string"
           ? option.label
-          : option.label[platform] ?? "mpv",
+          : // Any wording beats none, and the mode beats a label belonging to
+            // a different player.
+            option.label[platform] ??
+            Object.values(option.label)[0] ??
+            option.mode,
     }));
 }
 
@@ -153,11 +169,34 @@ export function androidIntentUrl(
 ) {
   const parsed = new URL(url);
   const packagePart = packageName ? `package=${packageName};` : "";
-  return `intent://${parsed.host}${parsed.pathname}${parsed.search}#Intent;scheme=${parsed.protocol.slice(0, -1)};${packagePart}action=android.intent.action.VIEW;type=video/*;S.title=${encodeURIComponent(title)};end`;
+  // Without a fallback, an intent no installed app can answer drops the user
+  // on a Chrome error page — out of the PWA entirely. Naming the page we are
+  // already on sends them back here instead.
+  const fallback =
+    typeof window === "undefined"
+      ? ""
+      : `S.browser_fallback_url=${encodeURIComponent(window.location.href)};`;
+  return `intent://${parsed.host}${parsed.pathname}${parsed.search}#Intent;scheme=${parsed.protocol.slice(0, -1)};${packagePart}action=android.intent.action.VIEW;type=video/*;S.title=${encodeURIComponent(title)};${fallback}end`;
 }
 
+/**
+ * mpv-handler takes the stream URL as URL-safe base64 with the padding
+ * stripped, and it reads that data as one path segment — splitting on the
+ * first "/" it finds.
+ *
+ * Standard base64 therefore fails twice over: a "/" in the output truncates
+ * the URL silently, and "+" and "=" do not decode. btoa also throws on
+ * anything outside Latin-1, so the URL becomes UTF-8 bytes first.
+ */
 export function mpvHandlerUrl(url: string) {
-  return `mpv-handler://play/${btoa(url)}`;
+  let binary = "";
+  for (const byte of new TextEncoder().encode(url))
+    binary += String.fromCharCode(byte);
+  const data = btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+  return `mpv-handler://play/${data}`;
 }
 
 /** Hands a stream to a registered player outside the browser. */

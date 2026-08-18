@@ -103,6 +103,7 @@ import {
   updateReady,
 } from "./lib/appUpdate";
 import {
+  externalPlayerLabel,
   externalPlayerOptions,
   isAndroid,
   isAppleMobile,
@@ -1207,6 +1208,32 @@ export function App() {
   }
 
   /**
+   * Hands a stream to a player outside the browser.
+   *
+   * Every route to an external player goes through here — the default chosen
+   * in Settings, and the "External" menu inside the web player. Launching is
+   * only half of it: nothing that happens in the other app reaches us, so the
+   * prompt that records where you stopped is the one chance to keep progress,
+   * and it has to be raised no matter which route was taken.
+   */
+  function handOffToExternalPlayer(
+    mode: ExternalPlayerMode,
+    url: string,
+    meta: Meta,
+    video?: Video,
+  ) {
+    launchExternalPlayer(mode, url, video?.title || meta.name);
+    setMessage(
+      mode === "copy"
+        ? "Stream URL copied. Paste it into VLC or your media player to watch."
+        : mode === "m3u"
+          ? "Playlist downloaded. Open it with your preferred player."
+          : `Opening ${externalPlayerLabel(mode)}…`,
+    );
+    setExternalWatch({ meta, video });
+  }
+
+  /**
    * Adds or removes a title, flipping the button before the server answers and
    * restoring it if the write fails.
    */
@@ -1733,6 +1760,15 @@ export function App() {
             return row.positionMs;
           })()}
           onClose={() => setPlayback(null)}
+          onExternalPlay={(mode, url) => {
+            // The web player is torn down first. Leaving it mounted keeps it
+            // decoding and downloading behind the app that is now playing the
+            // same stream, and closing it is what raises the prompt that can
+            // record where you stopped.
+            const current = playback;
+            setPlayback(null);
+            handOffToExternalPlayer(mode, url, current.meta, current.video);
+          }}
           onProgress={(positionMs, durationMs, ended) =>
             savePlaybackProgress(playback, positionMs, durationMs, ended)
           }
@@ -1806,33 +1842,9 @@ export function App() {
           onPlay={(stream, meta, video) => {
             const url = stream.url || stream.externalUrl;
             if (externalPlayer !== "internal" && url) {
-              launchExternalPlayer(
-                externalPlayer,
-                url,
-                video?.title || meta.name,
-              );
-              setMessage(
-                externalPlayer === "copy"
-                  ? "Stream URL copied. Paste it into VLC or your media player to watch."
-                  : externalPlayer === "m3u"
-                    ? "Playlist downloaded. Open it with your preferred player."
-                    : `Opening ${
-                        {
-                          vlc: "VLC",
-                          nextplayer: "Next Player",
-                          mxplayer: "MX Player",
-                          mpv: "mpv",
-                          "android-chooser": "Android video player chooser",
-                          outplayer: "Outplayer",
-                          infuse: "Infuse",
-                          iina: "IINA",
-                        }[externalPlayer]
-                      }…`,
-              );
               // Details stays open: the stream opened elsewhere, so this page
-              // is exactly where you want to be when you come back. The prompt
-              // is the only way progress from that player can be recorded.
-              setExternalWatch({ meta, video });
+              // is exactly where you want to be when you come back.
+              handOffToExternalPlayer(externalPlayer, url, meta, video);
               return;
             }
             setPlayback({
@@ -3789,8 +3801,8 @@ function SettingsPage({
                 : isAppleMobile()
                   ? "VLC, Outplayer, and Infuse open through Apple URL schemes."
                   : isMacOS()
-                    ? "VLC, Outplayer, Infuse, and IINA open through macOS URL schemes."
-                    : "mpv requires the mpv-handler browser extension; you can also copy the link for another desktop player."}
+                    ? "Infuse and IINA open through macOS URL schemes. VLC registers none on a Mac, so copy the link for it."
+                    : "mpv opens through the mpv-handler helper, which has to be installed separately. Otherwise copy the link for your player."}
             </small>
           </span>
           <select

@@ -2360,6 +2360,9 @@ body,
   background: #eef2f4;
   color: #080a0c;
 }
+/* Both menus, so the two do not behave differently side by side. Hover only:
+   a touch device has none, and the selected row keeps its own fill. */
+.audio-menu > button:not(.selected):hover,
 .external-player-menu > button:hover {
   background: #343b43;
 }

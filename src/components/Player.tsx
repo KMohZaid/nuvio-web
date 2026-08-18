@@ -1,9 +1,5 @@
 import type Hls from "hls.js";
-import {
-  copyStreamUrl,
-  externalPlayerOptions,
-  launchExternalPlayer,
-} from "../lib/externalPlayer";
+import { copyStreamUrl, externalPlayerOptions } from "../lib/externalPlayer";
 import { safeHttpUrl } from "../lib/security";
 import {
   assessPlayback,
@@ -79,6 +75,7 @@ export function Player({
   meta,
   video,
   onClose,
+  onExternalPlay,
   onProgress,
   settings,
   startPositionMs = 0,
@@ -87,6 +84,12 @@ export function Player({
   meta: Meta;
   video?: Video;
   onClose(): void;
+  /**
+   * Hands the stream off to a player outside the browser. Raised rather than
+   * launched here: closing this player and recording where it got to are the
+   * app's to do, and both have to happen for the handoff to be worth anything.
+   */
+  onExternalPlay(mode: ExternalPlayerMode, url: string): void;
   /** Where to resume from. 0 starts at the beginning. */
   startPositionMs?: number;
   /** Reports a resume point. Fired periodically, on pause, and on exit. */
@@ -656,7 +659,10 @@ export function Player({
   const openExternalPlayer = (mode: ExternalPlayerMode) => {
     if (!externalUrl) return;
     setExternalPlayerOpen(false);
-    launchExternalPlayer(mode, externalUrl, video?.title || meta.name);
+    // Paused first: the handoff unmounts this player, and a video element torn
+    // down mid-play can leave the remuxer fetching for a moment after.
+    videoRef.current?.pause();
+    onExternalPlay(mode, externalUrl);
   };
   const setPlayerVolume = (next: number) => {
     const element = videoRef.current;
