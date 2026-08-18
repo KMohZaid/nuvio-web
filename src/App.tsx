@@ -117,9 +117,19 @@ import {
   shortcutReturnUrl,
 } from "./lib/externalPlayer";
 import {
+  clearRelayToken,
+  collectRelayReport,
+  newRelayToken,
+  pendingRelayToken,
+  relayReturnUrl,
+  relayUrl,
+  setRelayUrl,
+} from "./lib/returnRelay";
+import {
   clearExternalHandoff,
   expectExternalReturn,
   readExternalReturnLog,
+  noteExternalEvent,
   noteExternalReturn,
   parseExternalReport,
   readExternalHandoff,
@@ -509,7 +519,22 @@ export function App() {
       noteExternalReturn(reason);
       setLastReturn(readExternalReturnLog());
       const report = takeExternalReport();
-      if (report) applyExternalReport(report);
+      if (report) {
+        applyExternalReport(report);
+        return;
+      }
+      // Nothing in the address, which on an installed iOS web app is every
+      // time. If a hand-off went out through the relay, the answer is waiting
+      // there instead.
+      const token = pendingRelayToken();
+      if (!token) return;
+      void collectRelayReport(token).then((relayed) => {
+        if (!relayed) return;
+        clearRelayToken();
+        noteExternalEvent(`relay answered · ${relayed.outcome}`);
+        setLastReturn(readExternalReturnLog());
+        applyExternalReport(relayed);
+      });
     };
     const onVisible = () => check("resumed");
     const onShow = () => check("shown");
@@ -1317,6 +1342,7 @@ export function App() {
     const watched = handedOff.current;
     if (!watched) return;
     clearExternalHandoff();
+    clearRelayToken();
     if (report.outcome === "finished") {
       handedOff.current = null;
       setExternalWatch(null);
@@ -1375,16 +1401,25 @@ export function App() {
     }
     const resumeMs = positionMs ?? resumePositionMs(meta, video);
     const appUrl = installedAppUrl();
+    // The relay is the only route that carries a position into an installed
+    // iOS web app, so it wins where it is configured. Without one, an https
+    // address reaches the app anywhere it is not installed as a web app, and
+    // the Shortcut at least reopens it where it is.
+    const relay = !canReturnToApp() && relayUrl() ? newRelayToken() : "";
     launchExternalPlayer(mode, url, video?.title || meta.name, {
       positionSeconds: resumeMs / 1000,
-      // An https link reaches an installed iOS web app only as a signed-out
-      // Safari tab, so there the way back is the Shortcut, and only once it
-      // has been installed. Everywhere else the plain address is the app.
-      returnUrlFor: canReturnToApp()
-        ? (query) => `${appUrl}${query}`
-        : shortcutReturn
-          ? (query) => shortcutReturnUrl(appUrl, query)
-          : undefined,
+      returnUrlFor: relay
+        ? (query) =>
+            relayReturnUrl(
+              relay,
+              window.location.host,
+              query.includes("finished") ? "finished" : "stopped",
+            )
+        : canReturnToApp()
+          ? (query) => `${appUrl}${query}`
+          : shortcutReturn
+            ? (query) => shortcutReturnUrl(appUrl, query)
+            : undefined,
     });
     setMessage(
       mode === "copy"
@@ -4050,6 +4085,29 @@ function SettingsPage({
               has to be this address, trailing slash included:{" "}
               <code>{`webapp://${installedAppUrl().replace(/^https?:\/\//i, "")}`}</code>
             </p>
+            <label className="setting-select-row">
+              <span>
+                <strong>Return relay</strong>
+                <small>
+                  Where a position comes back through. iOS reopens this app at
+                  its own address and drops everything else, so a player's
+                  callback goes here instead — the one point in the chain that
+                  sees the number. It holds a random token and a count of
+                  seconds, deleted the moment this app collects them. Leave it
+                  empty and the prompt asks instead. See worker/README.md.
+                </small>
+              </span>
+              <input
+                type="url"
+                inputMode="url"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                placeholder="https://…workers.dev"
+                defaultValue={relayUrl()}
+                onBlur={(event) => setRelayUrl(event.target.value)}
+              />
+            </label>
             {/* The route runs through two other apps and ends on a device with
                 no console, so what actually arrived is worth keeping. */}
             <div className="settings-shortcut-target">

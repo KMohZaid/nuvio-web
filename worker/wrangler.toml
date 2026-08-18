@@ -1,0 +1,21 @@
+name = "nuvio-return-relay"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# Every host the app is reached from. A callback naming anything else is
+# refused, and only these origins may read an answer back.
+[vars]
+# localhost is the preview server. An origin can only claim to be localhost by
+# being it, so this widens nothing for anyone else.
+ALLOWED_APP_HOSTS = "nuvioweb.lucaboox.win,lucaboox.github.io,localhost:4180"
+SHORTCUT_NAME = "Open Nuvio"
+
+[[durable_objects.bindings]]
+name = "RETURN_SLOT"
+class_name = "ReturnSlot"
+
+# SQLite-backed, which is the only kind the free plan runs — and the free plan
+# is not billed for its storage.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ReturnSlot"]

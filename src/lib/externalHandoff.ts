@@ -126,6 +126,11 @@ function append(line: string) {
   }
 }
 
+/** Adds a line the address bar could not have told us, such as a relay's answer. */
+export function noteExternalEvent(line: string) {
+  append(line);
+}
+
 /**
  * Notes that a test has gone out, so arrivals for the next few minutes are
  * logged whatever they carry — and so a test that never comes back is visible
