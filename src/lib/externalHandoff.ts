@@ -169,12 +169,42 @@ export function noteExternalReturn(reason: string) {
   );
 }
 
+/**
+ * Reads a report out of any address, wherever it was found.
+ *
+ * The address bar is one source. On an installed iOS web app it is never the
+ * source: webapp:// opens the app at its start_url and discards the path and
+ * query it was given — the Shortcut receives the full address intact and the
+ * app still wakes at "/" with nothing. So the same address also arrives by
+ * clipboard, and is read the same way.
+ */
+export function parseExternalReport(
+  address: string,
+): ExternalPlayerReport | null {
+  const query = address.includes("?")
+    ? address.slice(address.indexOf("?"))
+    : address;
+  const params = new URLSearchParams(query);
+  const outcome = params.get("nuvio-external");
+  if (outcome !== "finished" && outcome !== "stopped") return null;
+  if (outcome === "finished") return { outcome: "finished" };
+  // Both are reported in seconds, and a fractional position is normal.
+  const seconds = (value: string | null) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed * 1000) : 0;
+  };
+  return {
+    outcome: "stopped",
+    positionMs: seconds(params.get("position")),
+    durationMs: seconds(params.get("duration")),
+  };
+}
+
 /** Reads the report out of the address bar and takes it back out again. */
 export function takeExternalReport(): ExternalPlayerReport | null {
   if (typeof window === "undefined") return null;
-  const params = new URLSearchParams(window.location.search);
-  const outcome = params.get("nuvio-external");
-  if (outcome !== "finished" && outcome !== "stopped") return null;
+  const report = parseExternalReport(window.location.search);
+  if (!report) return null;
 
   // The parameters are the player's, and they should not survive a refresh or
   // end up in a shared link.
@@ -189,16 +219,5 @@ export function takeExternalReport(): ExternalPlayerReport | null {
   ])
     clean.searchParams.delete(key);
   window.history.replaceState(null, "", clean.toString());
-
-  if (outcome === "finished") return { outcome: "finished" };
-  // Both are reported in seconds, and a fractional position is normal.
-  const seconds = (value: string | null) => {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed * 1000) : 0;
-  };
-  return {
-    outcome: "stopped",
-    positionMs: seconds(params.get("position")),
-    durationMs: seconds(params.get("duration")),
-  };
+  return report;
 }

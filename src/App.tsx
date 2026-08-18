@@ -121,6 +121,7 @@ import {
   expectExternalReturn,
   readExternalReturnLog,
   noteExternalReturn,
+  parseExternalReport,
   readExternalHandoff,
   rememberExternalHandoff,
   takeExternalReport,
@@ -1892,6 +1893,16 @@ export function App() {
         <ExternalWatchPrompt
           meta={externalWatch.meta}
           video={externalWatch.video}
+          onPasted={
+            shortcutReturn && !canReturnToApp()
+              ? (text) => {
+                  const report = parseExternalReport(text);
+                  if (!report) return false;
+                  applyExternalReport(report);
+                  return true;
+                }
+              : undefined
+          }
           /* Answered here, so there is nothing left to resume on a later open. */
           onDismiss={() => {
             clearExternalHandoff();
@@ -4013,10 +4024,10 @@ function SettingsPage({
                 <strong>Return through the Shortcut</strong>
                 <small>
                   iOS hands an ordinary link to Safari, which is signed out and
-                  cannot save anything. A Shortcut can open this app instead.
-                  Add one named “{RETURN_SHORTCUT_NAME}” that takes text input
-                  and runs <b>Open URLs</b> on it, then turn this on. Only
-                  players marked “reports back” use it.
+                  cannot save anything. A Shortcut can reopen this app instead.
+                  Add one named “{RETURN_SHORTCUT_NAME}” that takes text input,
+                  runs <b>Copy to Clipboard</b> on it, then <b>Open URLs</b> on
+                  it. Only players marked “reports back” use it.
                 </small>
               </span>
               <span className="switch">
@@ -4054,10 +4065,11 @@ function SettingsPage({
                 <strong>Test the return</strong>
                 <small>
                   Goes out through the Shortcut exactly as a player would,
-                  carrying a position of 1:23. Come back here and read the line
-                  above: if it shows <code>position=83</code> the whole route
-                  works, and if it shows only <code>nuvio-external</code> then
-                  the address arrives but what a player appends to it does not.
+                  carrying a position of 1:23. The log above records what came
+                  back — <code>(no parameters)</code> is expected, because iOS
+                  reopens an installed web app at its own start address. The
+                  Shortcut’s copy is what carries the position, and the prompt
+                  reads it from there.
                 </small>
               </span>
               <button
