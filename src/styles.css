@@ -2247,6 +2247,16 @@ body,
 .player-center:hover {
   transform: translate(-50%, -50%) scale(1.05);
 }
+.player-center-busy {
+  pointer-events: none;
+}
+.player-center-busy:hover {
+  transform: translate(-50%, -50%);
+}
+.player-center-busy svg {
+  width: 52px;
+  height: 52px;
+}
 .player-center svg {
   width: 64px;
   height: 64px;
@@ -2358,11 +2368,6 @@ body,
 .player-control-group button svg {
   width: 21px;
   height: 21px;
-}
-.player-control-group button small {
-  position: absolute;
-  font-size: 8px;
-  font-weight: 700;
 }
 .player-control-group .player-play {
   width: 54px;

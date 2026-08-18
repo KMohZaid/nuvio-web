@@ -247,10 +247,14 @@ export function Player({
 
       if (engine) {
         setCurrentTime(target);
+        setWaiting(true);
         await engine.seek(target);
         return;
       }
       if (!element) return;
+      // Shown straight away rather than waiting for the browser to admit it is
+      // stalling, which it only does once the gap is already noticeable.
+      setWaiting(true);
 
       element.currentTime = target;
       setCurrentTime(target);
@@ -265,6 +269,25 @@ export function Player({
     },
     [seekTo],
   );
+  /**
+   * Mute, wherever playback actually is.
+   *
+   * This went to the video element, which the decoding player never touches —
+   * so the button did nothing on exactly the streams that need that player,
+   * while dragging the slider to zero still worked because that goes through
+   * setPlayerVolume.
+   */
+  const toggleMuted = useCallback(() => {
+    const engine = engineRef.current;
+    if (engine) {
+      const next = !muted;
+      engine.setMuted(next);
+      setMuted(next);
+      return;
+    }
+    const element = videoRef.current;
+    if (element) element.muted = !element.muted;
+  }, [muted]);
   const toggleFullscreen = useCallback(async () => {
     const container = playerRef.current;
     const element = videoRef.current as
@@ -662,13 +685,12 @@ export function Player({
         togglePlayback();
       } else if (event.key === "ArrowLeft") seekBy(-10);
       else if (event.key === "ArrowRight") seekBy(10);
-      else if (event.key.toLowerCase() === "m" && videoRef.current)
-        videoRef.current.muted = !videoRef.current.muted;
+      else if (event.key.toLowerCase() === "m") toggleMuted();
       else if (event.key.toLowerCase() === "f") toggleFullscreen();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [seekBy, toggleFullscreen, togglePlayback]);
+  }, [seekBy, toggleFullscreen, togglePlayback, toggleMuted]);
 
   useEffect(() => {
     const element = videoRef.current;
@@ -823,19 +845,14 @@ export function Player({
           <strong>{video?.title || meta.name}</strong>
         </div>
       </div>
-      {!error && (!waiting || settings.showLoadingOverlay) && (
-        <button
-          className="player-center"
-          aria-label={playing ? "Pause" : "Play"}
-          onClick={togglePlayback}
-        >
-          {waiting ? (
-            <LoaderCircle className="spin" />
-          ) : playing ? (
-            <Pause />
-          ) : (
-            <Play />
-          )}
+      {!error && waiting && settings.showLoadingOverlay && (
+        <div className="player-center player-center-busy" aria-label="Loading">
+          <LoaderCircle className="spin" />
+        </div>
+      )}
+      {!error && !waiting && !playing && (
+        <button className="player-center" aria-label="Play" onClick={togglePlayback}>
+          <Play />
         </button>
       )}
       {status && !waiting && !error && (
@@ -902,7 +919,6 @@ export function Player({
           <div className="player-control-group">
             <button aria-label="Rewind 10 seconds" onClick={() => seekBy(-10)}>
               <Rewind />
-              <small>10</small>
             </button>
             <button
               className="player-play"
@@ -913,16 +929,12 @@ export function Player({
             </button>
             <button aria-label="Forward 10 seconds" onClick={() => seekBy(10)}>
               <FastForward />
-              <small>10</small>
             </button>
           </div>
           <div className="player-control-group player-control-right">
             <button
               aria-label={muted ? "Unmute" : "Mute"}
-              onClick={() => {
-                if (videoRef.current)
-                  videoRef.current.muted = !videoRef.current.muted;
-              }}
+              onClick={() => toggleMuted()}
             >
               {muted || volume === 0 ? <VolumeX /> : <Volume2 />}
             </button>
@@ -951,7 +963,6 @@ export function Player({
                 }}
               >
                 <Music2 />
-                <span>Audio</span>
               </button>
               {audioOpen && (
                 <div className="audio-menu">
@@ -996,7 +1007,6 @@ export function Player({
                   }}
                 >
                   <ExternalLink />
-                  <span>External</span>
                 </button>
                 {externalPlayerOpen && (
                   <div className="external-player-menu">
@@ -1025,7 +1035,6 @@ export function Player({
                 }}
               >
                 <List />
-                <span>Episodes</span>
               </button>
             )}
             <button aria-label="Fullscreen" onClick={toggleFullscreen}>

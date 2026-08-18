@@ -394,6 +394,7 @@ export class MediabunnyPlayer {
     this.generation += 1;
     this.silence();
     this.pausedAt = target;
+    this.report("buffering", "");
     // A still frame at the destination, so scrubbing shows where it landed
     // rather than freezing on where it left.
     if (this.videoSink) {
@@ -401,7 +402,10 @@ export class MediabunnyPlayer {
       if (frame) this.draw(frame);
     }
     if (wasPlaying) await this.play();
-    else this.options.onTime?.(this.currentTime, this.duration);
+    else {
+      this.report("ready", "");
+      this.options.onTime?.(this.currentTime, this.duration);
+    }
   }
 
   /** The audio tracks the file offers, named as helpfully as it allows. */
