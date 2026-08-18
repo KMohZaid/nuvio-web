@@ -42,6 +42,7 @@ import {
   shouldShowNextEpisode,
 } from "../lib/nextEpisode";
 import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
+import { EpisodeRow } from "./Details";
 import {
   activeSkipSegment,
   creditsStart,
@@ -172,6 +173,22 @@ export function Player({
   /** Dismissed by hand, so it does not come back for the rest of the episode. */
   const [nextDismissed, setNextDismissed] = useState(false);
   const [skipSegments, setSkipSegments] = useState<SkipSegment[]>([]);
+  const seasons = useMemo(
+    () =>
+      [...new Set((episodes ?? []).map((item) => item.season ?? 0))].sort(
+        (a, b) => (a === 0 ? 1 : b === 0 ? -1 : a - b),
+      ),
+    [episodes],
+  );
+  const [season, setSeason] = useState<number | undefined>();
+  // Opens on the season being watched rather than at the beginning of the run.
+  useEffect(() => {
+    setSeason(video?.season ?? seasons[0]);
+  }, [video?.season, seasons]);
+  const seasonEpisodes = useMemo(
+    () => (episodes ?? []).filter((item) => (item.season ?? 0) === season),
+    [episodes, season],
+  );
   const [audioTracks, setAudioTracks] = useState<AudioChoice[]>([]);
   const [selectedAudio, setSelectedAudio] = useState(-1);
   const url = stream.url;
@@ -1106,14 +1123,19 @@ export function Player({
           className="player-episodes-scrim"
           onClick={() => setEpisodesOpen(false)}
         >
-          {/* The same list as the detail page, watched state included, so the
-              run reads the same whether you are choosing or watching. */}
+          {/* The detail page's own list, not a second one built to look like
+              it: same rows, same watched eye, same resume bar, and the same
+              season picker rather than every season run together with the
+              specials among them. */}
           <aside
             className="player-episodes"
             onClick={(event) => event.stopPropagation()}
           >
             <header>
-              <strong>Episodes</strong>
+              <div>
+                <span className="eyebrow">EPISODES</span>
+                <strong>{meta.name}</strong>
+              </div>
               <button
                 className="circle-button"
                 aria-label="Close"
@@ -1122,44 +1144,46 @@ export function Player({
                 <X />
               </button>
             </header>
-            <div className="player-episode-list">
-              {episodes.map((item) => {
+            <label className="season-select-wrap">
+              <span>SEASON</span>
+              <select
+                value={season ?? ""}
+                onChange={(event) => setSeason(Number(event.target.value))}
+              >
+                {seasons.map((value) => (
+                  <option key={value} value={value}>
+                    {value === 0 ? "Specials" : `Season ${value}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="episode-list-heading">
+              <strong>
+                {season === 0 ? "Specials" : `Season ${season ?? seasons[0] ?? 1}`}
+              </strong>
+              <span>
+                {seasonEpisodes.length}{" "}
+                {seasonEpisodes.length === 1 ? "episode" : "episodes"}
+              </span>
+            </div>
+            <div className="player-episode-list episode-list is-detailed">
+              {seasonEpisodes.map((item) => {
                 const key = watchKey(meta.id, item.season, item.episode);
-                const watched = watchIndex?.watched.has(key) ?? false;
-                const percent = watchIndex ? episodePercent(watchIndex, key) : 0;
-                const playing = item.id === video?.id;
                 return (
-                  <button
+                  <EpisodeRow
                     key={item.id}
-                    className={playing ? "is-playing" : ""}
-                    disabled={playing || !hasEpisodeAired(item.released)}
-                    onClick={() => {
+                    video={item}
+                    rating={item.imdbRating ? Number(item.imdbRating) : undefined}
+                    watched={watchIndex?.watched.has(key) ?? false}
+                    percent={watchIndex ? episodePercent(watchIndex, key) : 0}
+                    blurred={false}
+                    onPlay={() => {
+                      if (item.id === video?.id) return;
                       setEpisodesOpen(false);
                       onPlayEpisode?.(item);
                     }}
-                  >
-                    <span className="player-episode-thumb">
-                      {item.thumbnail ? (
-                        <img src={item.thumbnail} alt="" loading="lazy" />
-                      ) : null}
-                      {percent > 0 && percent < 100 && (
-                        <i style={{ width: `${percent}%` }} />
-                      )}
-                      {watched && (
-                        <b aria-label="Watched">
-                          <Eye />
-                        </b>
-                      )}
-                    </span>
-                    <span className="player-episode-copy">
-                      <small>
-                        {item.season != null && item.episode != null
-                          ? `S${item.season} · E${item.episode}`
-                          : "Special"}
-                      </small>
-                      <strong>{item.title || `Episode ${item.episode ?? ""}`}</strong>
-                    </span>
-                  </button>
+                    onMenu={() => undefined}
+                  />
                 );
               })}
             </div>

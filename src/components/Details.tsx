@@ -1212,7 +1212,7 @@ export function Details({
  * hold opens the menu instead. Watched state shows as a check badge, and a
  * partial resume point as a bar across the bottom of the thumbnail.
  */
-function EpisodeRow({
+export function EpisodeRow({
   video,
   rating,
   watched,
