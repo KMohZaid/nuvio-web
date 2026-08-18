@@ -118,6 +118,7 @@ import {
 } from "./lib/externalPlayer";
 import {
   clearExternalHandoff,
+  lastExternalReturn,
   readExternalHandoff,
   rememberExternalHandoff,
   takeExternalReport,
@@ -480,16 +481,23 @@ export function App() {
       setMessage("Marked as watched.");
       return;
     }
-    // A close within the first moments is someone backing out, not progress.
-    if (bootReport.positionMs > 0) {
-      savePlaybackProgress(
-        watched,
-        bootReport.positionMs,
-        bootReport.durationMs,
-        false,
-      );
-      setMessage("Saved your position.");
+    // "Stopped" without a position is the Shortcut route: the player appends
+    // where it got to onto the address it was handed, which there is the
+    // shortcuts:// one, so it lands beside the text passed on rather than
+    // inside it and never arrives. Knowing playback ended is not knowing
+    // where, so it still has to be asked — silently saving nothing was the
+    // one thing this must not do.
+    if (bootReport.positionMs <= 0) {
+      setExternalWatch(watched);
+      return;
     }
+    savePlaybackProgress(
+      watched,
+      bootReport.positionMs,
+      bootReport.durationMs,
+      false,
+    );
+    setMessage("Saved your position.");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile, bootHandoff, bootReport]);
   const openProfile = useCallback(
@@ -3964,6 +3972,12 @@ function SettingsPage({
               The Shortcut opens whichever copy of the app you installed, so it
               has to be this address, trailing slash included:{" "}
               <code>{`webapp://${installedAppUrl().replace(/^https?:\/\//i, "")}`}</code>
+            </p>
+            {/* The route runs through two other apps and ends on a device with
+                no console, so what actually arrived is worth keeping. */}
+            <p className="settings-shortcut-target">
+              Last return from a player:{" "}
+              <code>{lastExternalReturn() || "nothing yet"}</code>
             </p>
           </>
         )}

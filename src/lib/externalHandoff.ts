@@ -82,12 +82,40 @@ export type ExternalPlayerReport =
   | { outcome: "finished" }
   | { outcome: "stopped"; positionMs: number; durationMs: number };
 
+const LAST_RETURN_KEY = "nuvio-web-last-return";
+
+/**
+ * What the address bar held when the app was last reopened by a player.
+ *
+ * Kept because the route it travels cannot be watched from here: it runs
+ * through another app, and on the device where that matters there is no
+ * console to read. Settings shows it, so whether a position ever arrives is a
+ * question the phone can answer.
+ */
+export function lastExternalReturn(): string {
+  try {
+    return localStorage.getItem(LAST_RETURN_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 /** Reads the report out of the address bar and takes it back out again. */
 export function takeExternalReport(): ExternalPlayerReport | null {
   if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
   const outcome = params.get("nuvio-external");
   if (outcome !== "finished" && outcome !== "stopped") return null;
+  try {
+    localStorage.setItem(
+      LAST_RETURN_KEY,
+      `${new Date().toISOString().slice(0, 16).replace("T", " ")} · ${
+        window.location.search || "(no parameters)"
+      }`,
+    );
+  } catch {
+    // Only the diagnostic is lost.
+  }
 
   // The parameters are the player's, and they should not survive a refresh or
   // end up in a shared link.
