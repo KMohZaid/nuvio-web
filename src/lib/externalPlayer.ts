@@ -6,8 +6,105 @@ export const isAppleMobile = () =>
   // iPadOS reports itself as a Mac, so the touch count is the giveaway.
   (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
-export const isDesktop = () =>
-  !isAppleMobile() && !/Android/i.test(navigator.userAgent);
+export const isAndroid = () => /Android/i.test(navigator.userAgent);
+
+export const isMacOS = () =>
+  !isAppleMobile() && /Macintosh|Mac OS X/i.test(navigator.userAgent);
+
+export const isDesktop = () => !isAppleMobile() && !isAndroid();
+
+export type ExternalPlayerSurface = "settings" | "player";
+type PlayerPlatform = "android" | "apple-mobile" | "macos" | "desktop";
+
+type ExternalPlayerDefinition = {
+  mode: ExternalPlayerMode;
+  label: string | Partial<Record<PlayerPlatform, string>>;
+  platforms: Record<ExternalPlayerSurface, readonly PlayerPlatform[]>;
+};
+
+const externalPlayerDefinitions: readonly ExternalPlayerDefinition[] = [
+  {
+    mode: "copy",
+    label: "Copy stream URL",
+    platforms: { settings: ["macos", "desktop"], player: ["android", "apple-mobile", "macos", "desktop"] },
+  },
+  {
+    mode: "vlc",
+    label: "VLC",
+    platforms: { settings: ["android", "apple-mobile", "macos"], player: ["android", "apple-mobile", "macos"] },
+  },
+  {
+    mode: "nextplayer",
+    label: "Next Player",
+    platforms: { settings: ["android"], player: ["android"] },
+  },
+  {
+    mode: "mxplayer",
+    label: "MX Player",
+    platforms: { settings: ["android"], player: ["android"] },
+  },
+  {
+    mode: "mpv",
+    label: { android: "mpv", macos: "mpv (mpv-handler plugin required)", desktop: "mpv (mpv-handler plugin required)" },
+    platforms: { settings: ["android", "macos", "desktop"], player: ["android", "macos", "desktop"] },
+  },
+  {
+    mode: "android-chooser",
+    label: "Android video player chooser",
+    platforms: { settings: ["android"], player: ["android"] },
+  },
+  {
+    mode: "outplayer",
+    label: "Outplayer",
+    platforms: { settings: ["apple-mobile", "macos"], player: ["apple-mobile", "macos"] },
+  },
+  {
+    mode: "infuse",
+    label: "Infuse",
+    platforms: { settings: ["apple-mobile", "macos"], player: ["apple-mobile", "macos"] },
+  },
+  {
+    mode: "iina",
+    label: "IINA",
+    platforms: { settings: ["macos"], player: ["macos"] },
+  },
+  {
+    mode: "m3u",
+    label: "Download M3U playlist",
+    platforms: { settings: ["android", "apple-mobile", "macos", "desktop"], player: ["android", "apple-mobile", "macos", "desktop"] },
+  },
+];
+
+function playerPlatform(): PlayerPlatform {
+  if (isAndroid()) return "android";
+  if (isAppleMobile()) return "apple-mobile";
+  if (isMacOS()) return "macos";
+  return "desktop";
+}
+
+export function externalPlayerOptions(surface: ExternalPlayerSurface) {
+  const platform = playerPlatform();
+  return externalPlayerDefinitions
+    .filter((option) => option.platforms[surface].includes(platform))
+    .map((option) => ({
+      mode: option.mode,
+      label:
+        typeof option.label === "string"
+          ? option.label
+          : option.label[platform] ?? "mpv",
+    }));
+}
+
+export function externalPlayerLabel(mode: ExternalPlayerMode) {
+  return (
+    externalPlayerOptions("player").find((option) => option.mode === mode)
+      ?.label ?? "Nuvio web player"
+  );
+}
+
+export const isExternalPlayerAvailable = (mode: ExternalPlayerMode) =>
+  mode === "internal" ||
+  externalPlayerOptions("settings").some((option) => option.mode === mode);
 
 function m3uFor(url: string, title: string) {
   return new Blob(
@@ -49,14 +146,21 @@ export function infusePlaybackUrl(url: string, title: string) {
   return `infuse://x-callback-url/play?${query.toString()}`;
 }
 
-/**
- * Hands a stream to something outside the browser.
- *
- * Desktop has no reliable route: VLC registers no URL scheme on Windows, and
- * a downloaded playlist opens in whatever claims the extension — iTunes, in
- * practice. So desktop copies the URL and lets the user paste it. iOS is the
- * one platform where a real registered scheme exists.
- */
+export function androidIntentUrl(
+  url: string,
+  title: string,
+  packageName?: string,
+) {
+  const parsed = new URL(url);
+  const packagePart = packageName ? `package=${packageName};` : "";
+  return `intent://${parsed.host}${parsed.pathname}${parsed.search}#Intent;scheme=${parsed.protocol.slice(0, -1)};${packagePart}action=android.intent.action.VIEW;type=video/*;S.title=${encodeURIComponent(title)};end`;
+}
+
+export function mpvHandlerUrl(url: string) {
+  return `mpv-handler://play/${btoa(url)}`;
+}
+
+/** Hands a stream to a registered player outside the browser. */
 export function launchExternalPlayer(
   mode: ExternalPlayerMode,
   url: string,
@@ -74,6 +178,34 @@ export function launchExternalPlayer(
     void copyStreamUrl(safeUrl);
     return;
   }
+  if (mode === "vlc" && isAndroid()) {
+    window.location.href = androidIntentUrl(safeUrl, title, "org.videolan.vlc");
+    return;
+  }
+  if (mode === "nextplayer") {
+    window.location.href = androidIntentUrl(
+      safeUrl,
+      title,
+      "dev.anilbeesetti.nextplayer",
+    );
+    return;
+  }
+  if (mode === "mxplayer") {
+    window.location.href = androidIntentUrl(
+      safeUrl,
+      title,
+      "com.mxtech.videoplayer.ad",
+    );
+    return;
+  }
+  if (mode === "mpv" && isAndroid()) {
+    window.location.href = androidIntentUrl(safeUrl, title, "is.xyz.mpv");
+    return;
+  }
+  if (mode === "android-chooser") {
+    window.location.href = androidIntentUrl(safeUrl, title);
+    return;
+  }
   if (mode === "vlc") {
     window.location.href = `vlc-x-callback://x-callback-url/stream?url=${encodeURIComponent(safeUrl)}`;
     return;
@@ -84,6 +216,14 @@ export function launchExternalPlayer(
   }
   if (mode === "infuse") {
     window.location.href = infusePlaybackUrl(safeUrl, title);
+    return;
+  }
+  if (mode === "iina") {
+    window.location.href = `iina://weblink?url=${encodeURIComponent(safeUrl)}`;
+    return;
+  }
+  if (mode === "mpv") {
+    window.location.href = mpvHandlerUrl(safeUrl);
     return;
   }
   if (mode === "m3u") download(m3uFor(safeUrl, title), title, "m3u");
