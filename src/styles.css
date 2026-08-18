@@ -4245,19 +4245,36 @@ body.is-locked {
   align-items: center;
   gap: 10px;
 }
-/* Newest first, so the entry that answers the last test is the one at the top
-   rather than the one that needs scrolling to. */
-.settings-return-log {
-  margin: 6px 0 0;
-  padding: 0;
-  list-style: none;
-  display: grid;
-  gap: 4px;
+/* A link that has to read as the one thing to do here, since nothing below it
+   works until the Shortcut is installed. */
+.shortcut-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 4px 0 2px;
+  padding: 13px 15px;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background: var(--panel-soft);
+  color: inherit;
+  text-decoration: none;
 }
-.settings-return-log code {
-  display: block;
-  overflow-wrap: anywhere;
-  font-size: 11px;
+.shortcut-banner > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.shortcut-banner small {
+  color: #8d97a2;
+  line-height: 1.45;
+}
+.shortcut-banner svg {
+  width: 20px;
+  flex: none;
+  color: var(--accent);
+}
+.shortcut-banner:hover {
+  border-color: #46505b;
 }
 .source-player {
   display: flex;

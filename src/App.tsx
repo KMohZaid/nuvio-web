@@ -4,6 +4,7 @@ import { PinPrompt } from "./components/PinPrompt";
 import {
   ArrowDown,
   ArrowLeft,
+  Download,
   ArrowUp,
   CalendarDays,
   ChevronRight,
@@ -106,7 +107,6 @@ import {
   canReturnToApp,
   externalPlayerLabel,
   externalPlayerOptions,
-  installedAppUrl,
   isAndroid,
   isAppleMobile,
   isExternalPlayerAvailable,
@@ -114,25 +114,17 @@ import {
   isMacOS,
   launchExternalPlayer,
   RETURN_SHORTCUT_NAME,
-  shortcutReturnUrl,
+  RETURN_SHORTCUT_URL,
 } from "./lib/externalPlayer";
 import {
   clearRelayToken,
   collectRelayReport,
-  describeReturnRoute,
-  lastRelayRoute,
   newRelayToken,
   pendingRelayToken,
   relayReturnUrl,
-  relayUrl,
-  setRelayUrl,
 } from "./lib/returnRelay";
 import {
   clearExternalHandoff,
-  expectExternalReturn,
-  readExternalReturnLog,
-  noteExternalEvent,
-  noteExternalReturn,
   parseExternalReport,
   readExternalHandoff,
   rememberExternalHandoff,
@@ -332,12 +324,7 @@ export function App() {
    * must not happen again on every render.
    */
   const [bootHandoff] = useState(() => readExternalHandoff());
-  const [bootReport] = useState(() => {
-    // Noted before it is read: takeExternalReport strips the address on its
-    // way past, so afterwards there is nothing left to record.
-    noteExternalReturn("opened");
-    return takeExternalReport();
-  });
+  const [bootReport] = useState(() => takeExternalReport());
   const resumeConsumed = useRef(false);
   /**
    * What was last handed to another player, for as long as we are still owed
@@ -346,8 +333,6 @@ export function App() {
    * refers to has to outlive the moment the app started.
    */
   const handedOff = useRef<{ meta: Meta; video?: Video } | null>(null);
-  /** Held in state so Settings updates on a return rather than on a revisit. */
-  const [lastReturn, setLastReturn] = useState(() => readExternalReturnLog());
   /**
    * A report waiting for somewhere to put it. Held rather than applied because
    * it can arrive before a profile has been chosen, and saving needs one.
@@ -545,38 +530,30 @@ export function App() {
      * as an answer, and distinguishes a relay that was never asked from one
      * that was asked and was empty.
      */
-    const pollRelay = (reason: string) => {
+    const pollRelay = () => {
       const token = pendingRelayToken();
       if (!token) return;
       void collectRelayReport(token).then((relayed) => {
-        noteExternalEvent(
-          relayed
-            ? `relay answered ${relayed.outcome} at ${Math.round(relayed.outcome === "stopped" ? relayed.positionMs / 1000 : 0)}s · ${lastRelayRoute()}`
-            : `relay had nothing (${reason})`,
-        );
-        setLastReturn(readExternalReturnLog());
         if (!relayed) return;
         clearRelayToken();
         setPendingReport(relayed);
       });
     };
-    const check = (reason: string) => {
+    const check = () => {
       if (document.visibilityState !== "visible") return;
-      noteExternalReturn(reason);
-      setLastReturn(readExternalReturnLog());
       const report = takeExternalReport();
       if (report) {
         setPendingReport(report);
         return;
       }
-      pollRelay(reason);
+      pollRelay();
     };
     // A cold start is a return too, and the quietest kind: nothing becomes
     // visible because it was never hidden, so no event fires and the relay
     // would go unasked.
-    pollRelay("opened");
-    const onVisible = () => check("resumed");
-    const onShow = () => check("shown");
+    pollRelay();
+    const onVisible = () => check();
+    const onShow = () => check();
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("pageshow", onShow);
     return () => {
@@ -1439,26 +1416,21 @@ export function App() {
       handedOff.current = { meta, video };
     }
     const resumeMs = positionMs ?? resumePositionMs(meta, video);
-    const appUrl = installedAppUrl();
     // The relay is the only route that carries a position into an installed
-    // iOS web app, so it wins where it is configured. Without one, an https
-    // address reaches the app anywhere it is not installed as a web app, and
-    // the Shortcut at least reopens it where it is.
-    const relay = !canReturnToApp() && relayUrl() ? newRelayToken() : "";
+    // iOS web app. Anywhere else the app's own address already reaches it.
+    const relay = canReturnToApp() ? "" : newRelayToken();
     launchExternalPlayer(mode, url, video?.title || meta.name, {
       positionSeconds: resumeMs / 1000,
       returnUrlFor: relay
         ? (query) =>
             relayReturnUrl(
               relay,
-              window.location.host,
+              // Host and path: a project site is installed from /<repo>/, and
+              // the relay sends the viewer back to exactly that address.
+              `${window.location.host}${import.meta.env.BASE_URL}`,
               query.includes("finished") ? "finished" : "stopped",
             )
-        : canReturnToApp()
-          ? (query) => `${appUrl}${query}`
-          : shortcutReturn
-            ? (query) => shortcutReturnUrl(appUrl, query)
-            : undefined,
+        : (query) => `${window.location.origin}${import.meta.env.BASE_URL}${query}`,
     });
     setMessage(
       mode === "copy"
@@ -1917,7 +1889,6 @@ export function App() {
             onProviderCredential={saveProviderCredential}
             externalPlayer={externalPlayer}
             shortcutReturn={shortcutReturn}
-            lastReturn={lastReturn}
             onShortcutReturn={(value) => {
               localStorage.setItem("nuvio-web-shortcut-return", value ? "1" : "0");
               setShortcutReturn(value);
@@ -3001,7 +2972,6 @@ function SettingsPage({
   onExternalPlayer,
   shortcutReturn,
   onShortcutReturn,
-  lastReturn,
   onSignOut,
 }: {
   onRemuxLab(): void;
@@ -3043,8 +3013,6 @@ function SettingsPage({
   /** Whether the Shortcut that reopens this installed web app is set up. */
   shortcutReturn: boolean;
   onShortcutReturn(value: boolean): void;
-  /** How the app was last reopened, newest first, shown as a diagnostic. */
-  lastReturn: string[];
   onSignOut(): void;
 }) {
   const [category, setCategory] = useState<SettingsCategory>("appearance");
@@ -3709,6 +3677,86 @@ function SettingsPage({
         </div>
       </div>
       <div
+        className="setting-card web-only-card settings-category-card"
+        hidden={category !== "playback"}
+      >
+        <header>
+          <h2>Web-only playback handoff</h2>
+          <span>Stored on this browser only</span>
+        </header>
+        <label className="setting-select-row">
+          <span>
+            <strong>Default player</strong>
+            <small>
+              {isAndroid()
+                ? "Next Player, VLC, MX Player, mpv, and the Android video player chooser open through Android intents."
+                : isAppleMobile()
+                  ? "VLC, Outplayer, and Infuse open through Apple URL schemes."
+                  : isMacOS()
+                    ? "Infuse and IINA open through macOS URL schemes. VLC registers none on a Mac, so copy the link for it."
+                    : "mpv opens through the mpv-handler helper, which has to be installed separately. Otherwise copy the link for your player."}
+            </small>
+          </span>
+          <select
+            value={externalPlayer}
+            onChange={(event) =>
+              onExternalPlayer(event.target.value as ExternalPlayerMode)
+            }
+          >
+            <option value="internal">Nuvio web player</option>
+            {externalPlayerOptions("settings").map((option) => (
+              <option key={option.mode} value={option.mode}>
+                {/* Which players can say what happened is the difference
+                    between progress being recorded and being asked for. */}
+                {option.label}
+                {option.reportsBack ? " ✓ reports back" : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        {/* iOS only, because it is the only platform that cannot be reopened
+            by a link. The Shortcut is what carries you back, so it is offered
+            wherever it can be installed — including Safari, where someone may
+            well be setting up before installing the app itself. */}
+        {isAppleMobile() && (
+          <>
+            <a
+              className="shortcut-banner"
+              href={RETURN_SHORTCUT_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <span>
+                <strong>Get the &ldquo;{RETURN_SHORTCUT_NAME}&rdquo; Shortcut</strong>
+                <small>
+                  iOS hands an ordinary link to Safari, which cannot reach this
+                  app. Add the Shortcut once and an external player can send you
+                  back here with your position.
+                </small>
+              </span>
+              <Download />
+            </a>
+            <label className="setting-select-row">
+              <span>
+                <strong>Return through the Shortcut</strong>
+              </span>
+              <span className="switch">
+                <input
+                  type="checkbox"
+                  checked={shortcutReturn}
+                  onChange={(event) => onShortcutReturn(event.target.checked)}
+                />
+                <i />
+              </span>
+            </label>
+          </>
+        )}
+        <p>
+          The web remux fallback only re-boxes compatible tracks. DTS and
+          TrueHD still require an external player; Nuvio Web does not transcode.
+        </p>
+      </div>
+      <div
         className="setting-card settings-category-card"
         hidden={category !== "playback"}
       >
@@ -4056,163 +4104,6 @@ function SettingsPage({
             )
           }
         />
-      </div>
-      <div
-        className="setting-card web-only-card settings-category-card"
-        hidden={category !== "playback"}
-      >
-        <header>
-          <h2>Web-only playback handoff</h2>
-          <span>Stored on this browser only</span>
-        </header>
-        <label className="setting-select-row">
-          <span>
-            <strong>Default player</strong>
-            <small>
-              {isAndroid()
-                ? "Next Player, VLC, MX Player, mpv, and the Android video player chooser open through Android intents."
-                : isAppleMobile()
-                  ? "VLC, Outplayer, and Infuse open through Apple URL schemes."
-                  : isMacOS()
-                    ? "Infuse and IINA open through macOS URL schemes. VLC registers none on a Mac, so copy the link for it."
-                    : "mpv opens through the mpv-handler helper, which has to be installed separately. Otherwise copy the link for your player."}
-            </small>
-          </span>
-          <select
-            value={externalPlayer}
-            onChange={(event) =>
-              onExternalPlayer(event.target.value as ExternalPlayerMode)
-            }
-          >
-            <option value="internal">Nuvio web player</option>
-            {externalPlayerOptions("settings").map((option) => (
-              <option key={option.mode} value={option.mode}>
-                {/* Which players can say what happened is the difference
-                    between progress being recorded and being asked for. */}
-                {option.label}
-                {option.reportsBack ? " ✓ reports back" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
-        {/* Which route applies depends on where the app is running and what
-            has been set up — neither of which can be seen by looking at it. */}
-        <p className="settings-shortcut-target">
-          Running as{" "}
-          <b>
-            {isInstalledAppleWebApp()
-              ? "an installed web app"
-              : "a browser tab"}
-          </b>
-          . A player sent from here reports back:{" "}
-          {describeReturnRoute({
-            installedAppleWebApp: isInstalledAppleWebApp(),
-            shortcutReturn,
-          })}
-        </p>
-        {/* Only where it is the one way back: everywhere else a plain link
-            already reaches the app. */}
-        {isInstalledAppleWebApp() && (
-          <>
-            <label className="setting-select-row">
-              <span>
-                <strong>Return through the Shortcut</strong>
-                <small>
-                  iOS hands an ordinary link to Safari, which is signed out and
-                  cannot save anything. A Shortcut can reopen this app instead.
-                  Add one named “{RETURN_SHORTCUT_NAME}” that takes text input,
-                  runs <b>Copy to Clipboard</b> on it, then <b>Open URLs</b> on
-                  it. Only players marked “reports back” use it.
-                </small>
-              </span>
-              <span className="switch">
-                <input
-                  type="checkbox"
-                  checked={shortcutReturn}
-                  onChange={(event) => onShortcutReturn(event.target.checked)}
-                />
-                <i />
-              </span>
-            </label>
-            <p className="settings-shortcut-target">
-              The Shortcut opens whichever copy of the app you installed, so it
-              has to be this address, trailing slash included:{" "}
-              <code>{`webapp://${installedAppUrl().replace(/^https?:\/\//i, "")}`}</code>
-            </p>
-            <label className="setting-select-row">
-              <span>
-                <strong>Return relay</strong>
-                <small>
-                  Where a position comes back through. iOS reopens this app at
-                  its own address and drops everything else, so a player's
-                  callback goes here instead — the one point in the chain that
-                  sees the number. It holds a random token and a count of
-                  seconds, deleted the moment this app collects them. Leave it
-                  empty and the prompt asks instead. See worker/README.md.
-                </small>
-              </span>
-              <input
-                type="url"
-                inputMode="url"
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-                placeholder="https://…workers.dev"
-                defaultValue={relayUrl()}
-                onBlur={(event) => setRelayUrl(event.target.value)}
-              />
-            </label>
-            {/* The route runs through two other apps and ends on a device with
-                no console, so what actually arrived is worth keeping. */}
-            <div className="settings-shortcut-target">
-              How the app was last reopened:
-              {lastReturn.length ? (
-                <ol className="settings-return-log">
-                  {lastReturn.map((line, index) => (
-                    <li key={`${line}:${index}`}>
-                      <code>{line}</code>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <> <code>nothing yet</code></>
-              )}
-            </div>
-            <label className="setting-select-row">
-              <span>
-                <strong>Test the return</strong>
-                <small>
-                  Goes out through the Shortcut exactly as a player would,
-                  carrying a position of 1:23. The log above records what came
-                  back — <code>(no parameters)</code> is expected, because iOS
-                  reopens an installed web app at its own start address. The
-                  Shortcut’s copy is what carries the position, and the prompt
-                  reads it from there.
-                </small>
-              </span>
-              <button
-                type="button"
-                className="secondary"
-                onClick={() => {
-                  // Marked first: whatever comes back is then recorded, empty
-                  // or not, which is the only way "arrived with nothing" and
-                  // "never arrived" can be told apart.
-                  expectExternalReturn();
-                  window.location.href = shortcutReturnUrl(
-                    installedAppUrl(),
-                    "?nuvio-external=stopped&position=83&duration=5400",
-                  );
-                }}
-              >
-                Test
-              </button>
-            </label>
-          </>
-        )}
-        <p>
-          The web remux fallback only re-boxes compatible tracks. DTS and
-          TrueHD still require an external player; Nuvio Web does not transcode.
-        </p>
       </div>
       <div
         className="setting-card settings-category-card"

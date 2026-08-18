@@ -14,27 +14,10 @@ import type { ExternalPlayerReport } from "./externalHandoff";
  * before and the prompt asks. See worker/README.md.
  */
 
-const URL_KEY = "nuvio-web-return-relay";
 const TOKEN_KEY = "nuvio-web-return-token";
 
-/** Where the relay is deployed, or "" when there is none. */
-export function relayUrl(): string {
-  try {
-    return (localStorage.getItem(URL_KEY) ?? "").trim().replace(/\/+$/, "");
-  } catch {
-    return "";
-  }
-}
-
-export function setRelayUrl(value: string) {
-  try {
-    const trimmed = value.trim().replace(/\/+$/, "");
-    if (trimmed) localStorage.setItem(URL_KEY, trimmed);
-    else localStorage.removeItem(URL_KEY);
-  } catch {
-    // Without storage the relay simply stays unconfigured.
-  }
-}
+/** Where the relay runs. See worker/ for what it is and what it holds. */
+export const RELAY_URL = "https://nuvio-return-relay.lucaboox.workers.dev";
 
 /**
  * A fresh token per hand-off, 128 bits from the platform's own source.
@@ -76,10 +59,10 @@ export function clearRelayToken() {
  */
 export function relayReturnUrl(
   token: string,
-  appHost: string,
+  appAddress: string,
   outcome: "finished" | "stopped",
 ) {
-  const query = new URLSearchParams({ outcome, app: appHost });
+  const query = new URLSearchParams({ outcome, app: appAddress });
   // The trailing fragment is the point of interest. A player appends its own
   // parameters to the end of whatever address it was handed, and a fragment is
   // never sent to a server — so if it appends plainly rather than parsing the
@@ -87,42 +70,7 @@ export function relayReturnUrl(
   // the device, and the relay page reads the position and posts that alone.
   // Where it does parse, the parameters land in the query as before and
   // nothing is worse than it was.
-  return `${relayUrl()}/r/${token}?${query.toString()}#nuvio`;
-}
-
-/**
- * Which way home a hand-off started here would take.
- *
- * Four routes exist and which one applies depends on where the app is running
- * and what has been set up, neither of which is visible while looking at it.
- * Saying so plainly beats inferring it from whether something worked.
- */
-export function describeReturnRoute(options: {
-  installedAppleWebApp: boolean;
-  shortcutReturn: boolean;
-}): string {
-  if (!options.installedAppleWebApp)
-    return "Straight back to this page, carrying the position. Nothing else needed.";
-  if (relayUrl())
-    return "Through the relay, which is the only route that carries a position into an installed app.";
-  if (options.shortcutReturn)
-    return "Through the Shortcut, which reopens the app but cannot carry a position — the prompt will ask.";
-  return "Nowhere. The prompt will ask what happened. Add a relay above to have it reported instead.";
-}
-
-let lastVia: "query" | "fragment" | null = null;
-
-/**
- * How the last report reached the relay, in plain words.
- *
- * "fragment" means the player appended after the "#" we ended the address
- * with, so its parameters — the stream URL among them — never went on the
- * wire. "query" means it parsed the address first and they did.
- */
-export function lastRelayRoute(): string {
-  if (lastVia === "fragment") return "stream URL stayed on the device";
-  if (lastVia === "query") return "stream URL was sent too";
-  return "";
+  return `${RELAY_URL}/r/${token}?${query.toString()}#nuvio`;
 }
 
 /**
@@ -133,10 +81,9 @@ export async function collectRelayReport(
   token: string,
   signal?: AbortSignal,
 ): Promise<ExternalPlayerReport | null> {
-  const base = relayUrl();
-  if (!base || !token) return null;
+  if (!token) return null;
   try {
-    const response = await fetch(`${base}/c/${token}`, {
+    const response = await fetch(`${RELAY_URL}/c/${token}`, {
       credentials: "omit",
       referrerPolicy: "no-referrer",
       signal,
@@ -148,15 +95,10 @@ export async function collectRelayReport(
         outcome?: string;
         positionMs?: number;
         durationMs?: number;
-        via?: "query" | "fragment";
       };
     };
     const report = body.found ? body.report : undefined;
     if (!report) return null;
-    // Whether the stream URL went on the wire alongside the position. Carried
-    // out with the report so it can be said plainly rather than inferred from
-    // a page that is gone in under a second.
-    lastVia = report.via ?? null;
     if (report.outcome === "finished") return { outcome: "finished" };
     if (report.outcome === "stopped")
       return {

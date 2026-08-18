@@ -50,6 +50,10 @@ export function installedAppUrl() {
 /** The Shortcut's name, which has to match the one installed on the device. */
 export const RETURN_SHORTCUT_NAME = "Open Nuvio";
 
+/** Where to get it, so nobody has to build it by hand. */
+export const RETURN_SHORTCUT_URL =
+  "https://www.icloud.com/shortcuts/abe18a0678c8497ab7d64367c681791b";
+
 /**
  * A way back into an installed iOS web app, by way of Shortcuts.
  *

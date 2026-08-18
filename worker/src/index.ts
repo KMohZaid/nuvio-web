@@ -120,8 +120,11 @@ function corsHeaders(request: Request, env: Env) {
  * behind it, because a scheme handoff without a tap is not something every
  * iOS version allows.
  */
-function handoffPage(appHost: string, shortcutName: string, token: string) {
-  const target = `webapp://${appHost}/`;
+function handoffPage(appAddress: string, shortcutName: string, token: string) {
+  // Host and path both: a project site lives under /<repo>/, and webapp://
+  // opens the app installed from exactly one address. The trailing slash is
+  // required — without it iOS finds nothing.
+  const target = `webapp://${appAddress.replace(/\/*$/, "/")}`;
   const shortcut =
     `shortcuts://run-shortcut?` +
     new URLSearchParams({ name: shortcutName, input: "text", text: target })
@@ -191,8 +194,11 @@ export default {
       const outcome = url.searchParams.get("outcome");
       if (outcome !== "finished" && outcome !== "stopped")
         return new Response("Not found", { status: 404 });
-      const host = (url.searchParams.get("app") ?? "").toLowerCase();
-      if (!allowedHosts(env).includes(host))
+      // "host" or "host/path/" — only the host is checked against the list,
+      // and the path is carried through so a project site is reopened at the
+      // address it was installed from rather than at the domain root.
+      const app = (url.searchParams.get("app") ?? "").toLowerCase();
+      if (!allowedHosts(env).includes(app.split("/")[0] ?? ""))
         return new Response("Unknown app", { status: 400 });
       const report: Report = {
         outcome,
@@ -210,7 +216,7 @@ export default {
         method: "POST",
         body: JSON.stringify(report),
       });
-      return new Response(handoffPage(host, env.SHORTCUT_NAME, token), {
+      return new Response(handoffPage(app, env.SHORTCUT_NAME, token), {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           // The player's parameters are in this address; keep it out of

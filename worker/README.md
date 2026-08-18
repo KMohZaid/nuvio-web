@@ -93,12 +93,15 @@ in that list is refused, and only those origins may read an answer back.
 takes text input and runs **Open URLs** on it. Copy to Clipboard is no longer
 needed; the position comes back through the relay rather than the clipboard.
 
-Then paste the deployed URL into Nuvio under **Settings → Web-only playback
-handoff → Return relay**.
+The deployed address is compiled into the app (`RELAY_URL` in
+`src/lib/returnRelay.ts`); change it there if the Worker moves.
 
 ## The routes
 
-- `GET /r/<token>?outcome=…&app=…` — where the player's callback lands, with
+- `GET /r/<token>?outcome=…&app=…` — where the player's callback lands. `app`
+  is host **and path** (`lucaboox.github.io/nuvio-web/`), because a project
+  site is installed from a subpath and `webapp://` opens only the address it
+  was installed from; the host alone is what is checked against the list. With
   `position` and `duration` alongside if the player put them in the query
   rather than after the fragment. Stores what it has and returns a page that
   hands off to Shortcuts, which opens the app.
