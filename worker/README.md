@@ -85,9 +85,18 @@ cd worker
 npx wrangler deploy
 ```
 
-Edit `ALLOWED_APP_HOSTS` in `wrangler.toml` first if the app is served from
-anywhere other than the two hosts listed. A callback naming a host that is not
-in that list is refused, and only those origins may read an answer back.
+`ALLOWED_APP_HOSTS` in `wrangler.toml` lists the public hosts. A private
+instance is added separately, so its address is not committed:
+
+```bash
+npx wrangler secret put EXTRA_APP_HOSTS
+```
+
+A callback naming a host in neither is refused, and only those origins may read
+an answer back. Note that a hostname is not really a secret — a TLS certificate
+puts it in the public transparency logs the day it is issued — so this keeps it
+out of a public repository rather than out of reach. What protects a private
+instance is that it requires signing in.
 
 `SHORTCUT_NAME` must match the Shortcut installed on the device — the one that
 takes text input and runs **Open URLs** on it. Copy to Clipboard is no longer

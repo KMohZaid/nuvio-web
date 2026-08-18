@@ -18,6 +18,10 @@ export default defineConfig(({ mode }) => {
   // workflow sets this; everything else (custom domain, local preview) stays
   // at "/" and is unaffected.
   const base = env.VITE_BASE_PATH || "/";
+  const devHosts = (env.DEV_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((host) => host.trim())
+    .filter(Boolean);
   return {
     base,
     define: {
@@ -76,13 +80,15 @@ export default defineConfig(({ mode }) => {
         }
       })
     ],
-    // The tunnel forwards the public Host header through to Vite, which
-    // rejects hosts it does not know with "Blocked request".
-    server: { port: 4174, host: "0.0.0.0", allowedHosts: ["nuvioweb.lucaboox.win"] },
+    // A tunnel forwards its public Host header through to Vite, which rejects
+    // hosts it does not know with "Blocked request". Whose tunnel that is
+    // belongs to whoever is testing, so it is named in .env.local rather than
+    // here: DEV_ALLOWED_HOSTS=host.one,host.two
+    server: { port: 4174, host: "0.0.0.0", allowedHosts: devHosts },
     // The tunnel targets preview, not dev: vite-plugin-pwa only emits a
     // service worker on build, so a PWA install needs the built output.
     // strictPort keeps it from drifting onto another port and silently
     // leaving the tunnel pointed at nothing.
-    preview: { port: 4180, strictPort: true, host: "0.0.0.0", allowedHosts: ["nuvioweb.lucaboox.win"] }
+    preview: { port: 4180, strictPort: true, host: "0.0.0.0", allowedHosts: devHosts }
   };
 });

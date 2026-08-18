@@ -5,7 +5,7 @@ import { parseExternalReport } from "../src/lib/externalHandoff.ts";
 // What the Shortcut copies is the whole webapp:// address, so the parser is
 // given a full URL rather than a query — iOS reopens an installed web app at
 // its own start address, so this is the only copy that still has the numbers.
-const COPIED = "webapp://nuvioweb.lucaboox.win/?nuvio-external=stopped&position=83&duration=5400";
+const COPIED = "webapp://nuvio.example/?nuvio-external=stopped&position=83&duration=5400";
 
 test("a stopped report is read out of the address the Shortcut copied", () => {
   assert.deepEqual(parseExternalReport(COPIED), {

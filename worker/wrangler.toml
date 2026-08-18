@@ -4,10 +4,16 @@ compatibility_date = "2026-08-01"
 
 # Every host the app is reached from. A callback naming anything else is
 # refused, and only these origins may read an answer back.
+#
+# Public hosts only. A private instance goes in EXTRA_APP_HOSTS, which is set
+# with `wrangler secret put` and so is never committed:
+#
+#   npx wrangler secret put EXTRA_APP_HOSTS
+#
 [vars]
 # localhost is the preview server. An origin can only claim to be localhost by
 # being it, so this widens nothing for anyone else.
-ALLOWED_APP_HOSTS = "nuvioweb.lucaboox.win,lucaboox.github.io,localhost:4180"
+ALLOWED_APP_HOSTS = "lucaboox.github.io,localhost:4180"
 SHORTCUT_NAME = "Open Nuvio"
 
 [[durable_objects.bindings]]

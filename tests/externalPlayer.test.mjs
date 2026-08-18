@@ -20,7 +20,7 @@ test("Infuse handoff encodes signed stream URLs and a useful filename", () => {
 
 test("the Shortcut return address keeps the trailing slash and a literal space", () => {
   const url = shortcutReturnUrl(
-    "https://nuvioweb.lucaboox.win/",
+    "https://nuvio.example/",
     "?nuvio-external=stopped",
   );
   assert.ok(url.startsWith("shortcuts://run-shortcut?"));
@@ -32,7 +32,7 @@ test("the Shortcut return address keeps the trailing slash and a literal space",
   assert.equal(params.get("name"), "Open Nuvio");
   assert.equal(
     params.get("text"),
-    "webapp://nuvioweb.lucaboox.win/?nuvio-external=stopped",
+    "webapp://nuvio.example/?nuvio-external=stopped",
   );
 });
 

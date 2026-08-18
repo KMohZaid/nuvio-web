@@ -19,8 +19,15 @@
 
 export interface Env {
   RETURN_SLOT: DurableObjectNamespace;
-  /** Hosts the app may be reached at, comma separated. */
+  /** Public hosts the app may be reached at, comma separated. */
   ALLOWED_APP_HOSTS: string;
+  /**
+   * Further hosts, kept out of the repository. A private instance's address is
+   * not a secret in the cryptographic sense — a certificate puts it in the
+   * public transparency logs the day it is issued — but there is no reason to
+   * publish it either, and a secret keeps it out of a public config file.
+   */
+  EXTRA_APP_HOSTS?: string;
   /** The Shortcut to run, which must match the one installed on the device. */
   SHORTCUT_NAME: string;
 }
@@ -87,7 +94,8 @@ const seconds = (value: string | null) => {
 };
 
 function allowedHosts(env: Env) {
-  return env.ALLOWED_APP_HOSTS.split(",")
+  return `${env.ALLOWED_APP_HOSTS},${env.EXTRA_APP_HOSTS ?? ""}`
+    .split(",")
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
 }
