@@ -22,12 +22,23 @@ const FLING_VELOCITY = 0.45;
 const SETTLE_MS = 220;
 const EASE = "cubic-bezier(.22,.61,.36,1)";
 
-export function useSwipeBack<T extends HTMLElement>(onDismiss: () => void) {
+export function useSwipeBack<T extends HTMLElement>(
+  onDismiss: () => void,
+  /**
+   * False while something is layered over the overlay. The listeners sit on
+   * the overlay node, so a touch anywhere in a panel drawn inside it reaches
+   * them — and dismissing then takes the overlay and the panel together,
+   * which is never what the gesture on the panel meant.
+   */
+  enabled = true,
+) {
   const ref = useRef<T>(null);
   // Kept in a ref so the listeners can stay mounted for the life of the
   // overlay rather than being torn down whenever the callback changes.
   const dismiss = useRef(onDismiss);
   dismiss.current = onDismiss;
+  const gestureEnabled = useRef(enabled);
+  gestureEnabled.current = enabled;
 
   useEffect(() => {
     const node = ref.current;
@@ -56,6 +67,7 @@ export function useSwipeBack<T extends HTMLElement>(onDismiss: () => void) {
     };
 
     const onStart = (event: TouchEvent) => {
+      if (!gestureEnabled.current) return;
       const touch = event.touches[0];
       // Only from the left edge: the page has horizontally scrolling cast and
       // trailer rows, and a full-width gesture would fight them.

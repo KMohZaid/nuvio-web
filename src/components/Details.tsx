@@ -372,7 +372,6 @@ export function Details({
     null,
   );
   useScrollLock();
-  const swipeRef = useSwipeBack<HTMLDivElement>(onClose);
   const heroRef = useRef<HTMLDivElement>(null);
   const [compactHeader, setCompactHeader] = useState(false);
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
@@ -431,6 +430,10 @@ export function Details({
     () => new Map(),
   );
   const [sourceOpen, setSourceOpen] = useState(false);
+  // The sources panel is drawn inside this overlay, so the back gesture has to
+  // stand down while it is up: a swipe there would otherwise carry both away
+  // at once. The panel closes with its own X.
+  const swipeRef = useSwipeBack<HTMLDivElement>(onClose, !sourceOpen);
   const [streams, setStreams] = useState<Stream[]>([]);
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceVideo, setSourceVideo] = useState<Video | undefined>();
