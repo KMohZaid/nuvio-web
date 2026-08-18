@@ -6519,3 +6519,38 @@ body.is-locked {
     grid-template-columns: 96px minmax(0, 1fr);
   }
 }
+
+/* Opposite corner to the next-episode card, so the two never collide when an
+   episode has both a late intro and early credits. */
+.player-skip {
+  position: absolute;
+  z-index: 4;
+  left: max(24px, env(safe-area-inset-left));
+  bottom: 118px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+  padding: 0 18px;
+  border: 1px solid #ffffff26;
+  border-radius: 12px;
+  background: #0f1418f2;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 14px 40px #0009;
+}
+.player-skip:hover {
+  background: #1a2128f2;
+}
+.player-skip svg {
+  width: 17px;
+}
+@media (max-width: 760px) {
+  .player-skip {
+    bottom: 104px;
+    height: 38px;
+    padding: 0 14px;
+    font-size: 13px;
+  }
+}

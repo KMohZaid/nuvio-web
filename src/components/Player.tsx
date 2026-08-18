@@ -42,6 +42,13 @@ import {
   shouldShowNextEpisode,
 } from "../lib/nextEpisode";
 import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
+import {
+  activeSkipSegment,
+  creditsStart,
+  loadSkipSegments,
+  skipLabel,
+  type SkipSegment,
+} from "../lib/skipSegments";
 import type { ExternalPlayerMode, Meta, Stream, Video } from "../types";
 
 type AudioChoice = { id: number; label: string };
@@ -164,6 +171,7 @@ export function Player({
   const [episodesOpen, setEpisodesOpen] = useState(false);
   /** Dismissed by hand, so it does not come back for the rest of the episode. */
   const [nextDismissed, setNextDismissed] = useState(false);
+  const [skipSegments, setSkipSegments] = useState<SkipSegment[]>([]);
   const [audioTracks, setAudioTracks] = useState<AudioChoice[]>([]);
   const [selectedAudio, setSelectedAudio] = useState(-1);
   const url = stream.url;
@@ -777,6 +785,20 @@ export function Player({
     element.volume = next;
     element.muted = next === 0;
   };
+  useEffect(() => {
+    let live = true;
+    setSkipSegments([]);
+    void loadSkipSegments(meta.id, video?.season, video?.episode).then(
+      (segments) => {
+        if (live) setSkipSegments(segments);
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [meta.id, video?.season, video?.episode]);
+  const skippable = activeSkipSegment(skipSegments, currentTime);
+
   const nextEpisode = useMemo(() => {
     if (!episodes?.length || !onPlayEpisode) return null;
     const candidate = resolveNextEpisode(
@@ -791,7 +813,12 @@ export function Player({
     !!nextEpisode &&
     !nextDismissed &&
     !error &&
-    shouldShowNextEpisode(currentTime * 1000, duration * 1000);
+    shouldShowNextEpisode(
+      currentTime * 1000,
+      duration * 1000,
+      undefined,
+      creditsStart(skipSegments),
+    );
 
   const seekLimit = duration || 0;
   const displayedTime = seekPreview ?? currentTime;
@@ -1043,6 +1070,17 @@ export function Player({
           </div>
         </div>
       </div>
+      {skippable && !error && (
+        <button
+          className="player-skip"
+          onClick={() => {
+            showControls();
+            void seekTo(skippable.end);
+          }}
+        >
+          <FastForward /> {skipLabel(skippable.kind)}
+        </button>
+      )}
       {showNextEpisode && nextEpisode && (
         <div className="player-next">
           <div>

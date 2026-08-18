@@ -78,8 +78,15 @@ export function shouldShowNextEpisode(
   positionMs: number,
   durationMs: number,
   percent = NEXT_EPISODE_PERCENT,
+  /** Seconds. Where the credits begin, when that is known. */
+  creditsStartSeconds?: number | null,
 ): boolean {
   if (durationMs <= 0 || positionMs <= 0) return false;
+  // Known credits beat the threshold, as they do in Nuvio: an episode with a
+  // long "next time" tail reaches 97% well after the story has finished, and
+  // one with no tail at all reaches it in the middle of the last scene.
+  if (creditsStartSeconds != null && creditsStartSeconds > 0)
+    return positionMs / 1000 >= creditsStartSeconds;
   const clamped = Math.min(100, Math.max(97, percent));
   return positionMs / durationMs >= clamped / 100;
 }

@@ -70,3 +70,19 @@ test("a source with nothing to play is not a candidate", () => {
     "x",
   );
 });
+
+test("known credits decide the moment, ahead of the threshold", () => {
+  // An episode with a long "next time" tail reaches 97% well after the story
+  // has ended, so the credits are the better signal.
+  assert.equal(shouldShowNextEpisode(600_000, 1_000_000, 97, 600), true);
+  assert.equal(shouldShowNextEpisode(599_000, 1_000_000, 97, 600), false);
+  // And one with no tail reaches 97% mid-scene, where the card would intrude.
+  assert.equal(shouldShowNextEpisode(980_000, 1_000_000, 97, 990), false);
+});
+
+test("without credits the threshold still decides", () => {
+  assert.equal(shouldShowNextEpisode(970_000, 1_000_000, 97, null), true);
+  assert.equal(shouldShowNextEpisode(960_000, 1_000_000, 97, undefined), false);
+  // A nonsensical credits mark is ignored rather than trusted.
+  assert.equal(shouldShowNextEpisode(970_000, 1_000_000, 97, 0), true);
+});
