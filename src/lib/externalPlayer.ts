@@ -11,6 +11,26 @@ export const isAndroid = () => /Android/i.test(navigator.userAgent);
 export const isMacOS = () =>
   !isAppleMobile() && /Macintosh|Mac OS X/i.test(navigator.userAgent);
 
+const isStandalone = () =>
+  (navigator as Navigator & { standalone?: boolean }).standalone === true ||
+  window.matchMedia?.("(display-mode: standalone)").matches === true;
+
+/**
+ * Whether a link back to us would actually reach us.
+ *
+ * An installed iOS web app cannot capture links. iOS hands every https URL to
+ * Safari no matter whose scope it falls in — home-screen web apps get no URL
+ * scheme and no universal links — and Safari is a separate storage container
+ * from the installed app: different cookies, different local storage. So the
+ * tab that opens is signed out and has never heard of the title that was
+ * playing. It cannot save anything.
+ *
+ * A player handed that address would send the viewer somewhere useless, so it
+ * is handed none, and the prompt back in the app asks instead. Android
+ * captures in-scope links into the installed app, so this only bites Apple.
+ */
+export const canReturnToApp = () => !(isAppleMobile() && isStandalone());
+
 export type ExternalPlayerSurface = "settings" | "player";
 type PlayerPlatform = "android" | "apple-mobile" | "macos" | "desktop";
 

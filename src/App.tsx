@@ -103,6 +103,7 @@ import {
   updateReady,
 } from "./lib/appUpdate";
 import {
+  canReturnToApp,
   externalPlayerLabel,
   externalPlayerOptions,
   isAndroid,
@@ -1299,7 +1300,11 @@ export function App() {
     const resumeMs = positionMs ?? resumePositionMs(meta, video);
     launchExternalPlayer(mode, url, video?.title || meta.name, {
       positionSeconds: resumeMs / 1000,
-      returnUrl: `${window.location.origin}${import.meta.env.BASE_URL}`,
+      // Omitted where a link back cannot reach us — an installed iOS web app
+      // would only send the viewer to a signed-out Safari tab.
+      returnUrl: canReturnToApp()
+        ? `${window.location.origin}${import.meta.env.BASE_URL}`
+        : undefined,
     });
     setMessage(
       mode === "copy"
