@@ -44,7 +44,46 @@ export {
 export type { SettingsBlob, SyncPreferenceType, SyncPreferenceValue };
 
 const CONFIG_KEY = "backend-config";
-const CLIENT_ID = `nuvio-web-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+/**
+ * This installation's identity, kept across reloads.
+ *
+ * Mirrors `SyncClientIdentity` — same shape, same validation, and the same
+ * insistence that it is stored rather than made up each time. It was generated
+ * per page load here, which was survivable while it only suppressed the echo
+ * of this client's own sync writes, but it also names the device in the
+ * account's device list, and a fresh name on every reload fills that list with
+ * one entry per visit.
+ */
+const CLIENT_ID_KEY = "nuvio-web-client-id";
+const CLIENT_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+function generateClientId() {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto?.getRandomValues?.(bytes);
+  return `nuvio-web-${Array.from(
+    bytes,
+    (byte) => CLIENT_ID_ALPHABET[byte % CLIENT_ID_ALPHABET.length],
+  ).join("")}`;
+}
+
+/** As the other clients validate it: 16–96 of letters, digits, "-" or "_". */
+const isValidClientId = (value: string) =>
+  value.length >= 16 && value.length <= 96 && /^[A-Za-z0-9_-]+$/.test(value);
+
+function loadClientId() {
+  try {
+    const stored = localStorage.getItem(CLIENT_ID_KEY)?.trim();
+    if (stored && isValidClientId(stored)) return stored;
+    const generated = generateClientId();
+    localStorage.setItem(CLIENT_ID_KEY, generated);
+    return generated;
+  } catch {
+    // Without storage it is per-session, which is what it was throughout.
+    return generateClientId();
+  }
+}
+
+export const CLIENT_ID = loadClientId();
 let activeSession: Session | null = null;
 
 type VaultCommand =

@@ -362,9 +362,13 @@ async function handle(command: WorkerCommand): Promise<unknown> {
       invalidateOtherVaults();
     });
     if (oldBackend && oldAccess) {
+      // scope=local, which the endpoint does not default to. Without it
+      // GoTrue revokes every refresh token the account holds, so signing out
+      // of this browser signed the same account out of the TV, the desktop app
+      // and every other device at once.
       void fetchJson(
         oldBackend,
-        "/auth/v1/logout",
+        "/auth/v1/logout?scope=local",
         { method: "POST" },
         oldAccess,
       ).catch(() => undefined);

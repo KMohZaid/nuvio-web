@@ -131,6 +131,10 @@ import {
   takeExternalReport,
   type ExternalPlayerReport,
 } from "./lib/externalHandoff";
+import {
+  registerCurrentDevice,
+  resetDeviceRegistration,
+} from "./lib/deviceSession";
 import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
   buildContinueWatching,
@@ -479,6 +483,25 @@ export function App() {
       })
       .finally(() => setBooting(false));
   }, []);
+  /**
+   * Puts this browser in the account's device list, and keeps it there.
+   *
+   * Where the official client registers: once when a session is established,
+   * and again on returning to the app, which its own fifteen minute interval
+   * turns into roughly an hourly heartbeat rather than a call per glance. A
+   * device that stops checking in is one that can be told apart from a device
+   * still in use, so the list is worth something to revoke from.
+   */
+  useEffect(() => {
+    if (!session) return;
+    resetDeviceRegistration();
+    void registerCurrentDevice(true);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void registerCurrentDevice();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [session]);
   /**
    * Puts back what the hand-off cost us, once its profile is open.
    *

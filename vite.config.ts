@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
@@ -11,6 +12,10 @@ function commit() {
     return "unknown";
   }
 }
+
+const { version } = createRequire(import.meta.url)("./package.json") as {
+  version: string;
+};
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
@@ -31,6 +36,9 @@ export default defineConfig(({ mode }) => {
       __APP_BUILD__: JSON.stringify(
         `${new Date().toISOString().slice(0, 16).replace("T", " ")} · ${commit()}`,
       ),
+      // Reported to the account's device list, so a device can be told from
+      // the build it is running.
+      __APP_VERSION__: JSON.stringify(version),
       "import.meta.env.VITE_NUVIO_SUPABASE_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_URL || env.NUVIO_SUPABASE_URL || ""),
       "import.meta.env.VITE_NUVIO_SUPABASE_FALLBACK_URL": JSON.stringify(env.VITE_NUVIO_SUPABASE_FALLBACK_URL || env.NUVIO_SUPABASE_FALLBACK_URL || ""),
       "import.meta.env.VITE_NUVIO_SUPABASE_ANON_KEY": JSON.stringify(env.VITE_NUVIO_SUPABASE_ANON_KEY || env.NUVIO_SUPABASE_ANON_KEY || ""),
