@@ -111,6 +111,11 @@ import {
   isMacOS,
   launchExternalPlayer,
 } from "./lib/externalPlayer";
+import {
+  clearExternalHandoff,
+  readExternalHandoff,
+  rememberExternalHandoff,
+} from "./lib/externalHandoff";
 import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
   buildContinueWatching,
@@ -297,6 +302,11 @@ export function App() {
   );
   /** Boot may open a profile by itself once; a later hydrate must not. */
   const autoOpenAttempted = useRef(false);
+  /**
+   * Read at mount, before this session can write one, so a hand-off that did
+   * not cost us the page is not also "resumed" on top of itself.
+   */
+  const resumeHandoff = useRef(readExternalHandoff());
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -429,6 +439,22 @@ export function App() {
       })
       .finally(() => setBooting(false));
   }, []);
+  /**
+   * Puts back what the hand-off cost us, once its profile is open.
+   *
+   * Runs after `activateProfile`, which clears both of these — the title page
+   * you were on, and the prompt that is the only way a position from the other
+   * player gets recorded.
+   */
+  useEffect(() => {
+    const resume = resumeHandoff.current;
+    if (!resume || !profile || profile.profileIndex !== resume.profileIndex)
+      return;
+    resumeHandoff.current = null;
+    clearExternalHandoff();
+    setSelected(resume.meta);
+    setExternalWatch({ meta: resume.meta, video: resume.video });
+  }, [profile]);
   const openProfile = useCallback(
     (next: Profile) => {
       localStorage.setItem("nuvio-active-profile", String(next.profileIndex));
@@ -466,13 +492,22 @@ export function App() {
       const last = nextProfiles.find((item) => item.profileIndex === stored);
       if (!isCurrent()) return;
       setProfiles(nextProfiles);
-      // Nothing loads until someone is chosen. Only a remembered profile skips
-      // the picker, and a locked one still has to be unlocked first — so the
-      // remembered case shows the PIN alone rather than the whole list.
-      if (!autoOpenAttempted.current && rememberProfileRef.current && last) {
+      // Nothing loads until someone is chosen. Two cases skip the picker: a
+      // remembered profile, and coming back from a hand-off to another player
+      // — that is a return to something already in progress, not an app open,
+      // so being asked who is watching loses the thread. A locked profile is
+      // still locked either way, and shows the PIN alone rather than the list.
+      const resume = resumeHandoff.current;
+      const resumeProfile = resume
+        ? nextProfiles.find(
+            (item) => item.profileIndex === resume.profileIndex,
+          )
+        : undefined;
+      const target = resumeProfile ?? (rememberProfileRef.current ? last : undefined);
+      if (!autoOpenAttempted.current && target) {
         autoOpenAttempted.current = true;
-        if (last.pinEnabled) setPinTarget(last);
-        else openProfile(last);
+        if (target.pinEnabled) setPinTarget(target);
+        else openProfile(target);
       }
     } catch (error) {
       if (!isCurrent()) return;
@@ -1222,6 +1257,10 @@ export function App() {
     meta: Meta,
     video?: Video,
   ) {
+    // Written before the launch, not after: handing off navigates away, and on
+    // Android the process may not survive to run another line.
+    if (profile && mode !== "copy" && mode !== "m3u")
+      rememberExternalHandoff(profile.profileIndex, meta, video);
     launchExternalPlayer(mode, url, video?.title || meta.name);
     setMessage(
       mode === "copy"
@@ -1724,14 +1763,20 @@ export function App() {
         <ExternalWatchPrompt
           meta={externalWatch.meta}
           video={externalWatch.video}
-          onDismiss={() => setExternalWatch(null)}
+          /* Answered here, so there is nothing left to resume on a later open. */
+          onDismiss={() => {
+            clearExternalHandoff();
+            setExternalWatch(null);
+          }}
           onFinished={() => {
             const current = externalWatch;
+            clearExternalHandoff();
             setExternalWatch(null);
             void toggleWatched(current.meta, current.video, true);
           }}
           onStopped={(positionMs, durationMs) => {
             const current = externalWatch;
+            clearExternalHandoff();
             setExternalWatch(null);
             savePlaybackProgress(current, positionMs, durationMs, false);
             setMessage("Saved your position.");
