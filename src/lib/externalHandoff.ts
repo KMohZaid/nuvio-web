@@ -100,22 +100,37 @@ export function lastExternalReturn(): string {
   }
 }
 
-/** Reads the report out of the address bar and takes it back out again. */
-export function takeExternalReport(): ExternalPlayerReport | null {
-  if (typeof window === "undefined") return null;
-  const params = new URLSearchParams(window.location.search);
-  const outcome = params.get("nuvio-external");
-  if (outcome !== "finished" && outcome !== "stopped") return null;
+/**
+ * Records what the address held, whether or not it said anything useful.
+ *
+ * A report that never arrives and a report that arrives empty look identical
+ * from the outside, and telling them apart is the whole question on the route
+ * through Shortcuts.
+ */
+export function noteExternalReturn(reason: string) {
+  if (typeof window === "undefined") return;
+  // Only when something arrived, or when an answer is outstanding — a blank
+  // address is the interesting case only while a player still owes us one.
+  // Otherwise every ordinary open would overwrite the reading being looked at.
+  if (!window.location.search && !readExternalHandoff()) return;
   try {
     localStorage.setItem(
       LAST_RETURN_KEY,
-      `${new Date().toISOString().slice(0, 16).replace("T", " ")} · ${
+      `${new Date().toISOString().slice(11, 19)} ${reason} · ${
         window.location.search || "(no parameters)"
       }`,
     );
   } catch {
     // Only the diagnostic is lost.
   }
+}
+
+/** Reads the report out of the address bar and takes it back out again. */
+export function takeExternalReport(): ExternalPlayerReport | null {
+  if (typeof window === "undefined") return null;
+  const params = new URLSearchParams(window.location.search);
+  const outcome = params.get("nuvio-external");
+  if (outcome !== "finished" && outcome !== "stopped") return null;
 
   // The parameters are the player's, and they should not survive a refresh or
   // end up in a shared link.

@@ -119,9 +119,11 @@ import {
 import {
   clearExternalHandoff,
   lastExternalReturn,
+  noteExternalReturn,
   readExternalHandoff,
   rememberExternalHandoff,
   takeExternalReport,
+  type ExternalPlayerReport,
 } from "./lib/externalHandoff";
 import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
@@ -316,8 +318,20 @@ export function App() {
    * must not happen again on every render.
    */
   const [bootHandoff] = useState(() => readExternalHandoff());
-  const [bootReport] = useState(() => takeExternalReport());
+  const [bootReport] = useState(() => {
+    // Noted before it is read: takeExternalReport strips the address on its
+    // way past, so afterwards there is nothing left to record.
+    noteExternalReturn("opened");
+    return takeExternalReport();
+  });
   const resumeConsumed = useRef(false);
+  /**
+   * What was last handed to another player, for as long as we are still owed
+   * an answer about it. A report can arrive well after boot — bringing an
+   * already-running app to the front does not mount anything — so the title it
+   * refers to has to outlive the moment the app started.
+   */
+  const handedOff = useRef<{ meta: Meta; video?: Video } | null>(null);
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -472,34 +486,36 @@ export function App() {
     clearExternalHandoff();
     setSelected(bootHandoff.meta);
     const watched = { meta: bootHandoff.meta, video: bootHandoff.video };
-    if (!bootReport) {
-      setExternalWatch(watched);
-      return;
-    }
-    if (bootReport.outcome === "finished") {
-      void toggleWatched(watched.meta, watched.video, true);
-      setMessage("Marked as watched.");
-      return;
-    }
-    // "Stopped" without a position is the Shortcut route: the player appends
-    // where it got to onto the address it was handed, which there is the
-    // shortcuts:// one, so it lands beside the text passed on rather than
-    // inside it and never arrives. Knowing playback ended is not knowing
-    // where, so it still has to be asked — silently saving nothing was the
-    // one thing this must not do.
-    if (bootReport.positionMs <= 0) {
-      setExternalWatch(watched);
-      return;
-    }
-    savePlaybackProgress(
-      watched,
-      bootReport.positionMs,
-      bootReport.durationMs,
-      false,
-    );
-    setMessage("Saved your position.");
+    handedOff.current = watched;
+    if (bootReport) applyExternalReport(bootReport);
+    else setExternalWatch(watched);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile, bootHandoff, bootReport]);
+  /**
+   * Watches for a report that arrives after the app is already up.
+   *
+   * Reading the address once, at mount, only works when the return is a fresh
+   * load. Reopening an app that is merely backgrounded mounts nothing, so a
+   * report delivered that way was never looked for — which is every return
+   * through the Shortcut, and why nothing was ever recorded.
+   */
+  useEffect(() => {
+    const check = (reason: string) => {
+      if (document.visibilityState !== "visible") return;
+      noteExternalReturn(reason);
+      const report = takeExternalReport();
+      if (report) applyExternalReport(report);
+    };
+    const onVisible = () => check("resumed");
+    const onShow = () => check("shown");
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("pageshow", onShow);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pageshow", onShow);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const openProfile = useCallback(
     (next: Profile) => {
       localStorage.setItem("nuvio-active-profile", String(next.profileIndex));
@@ -1286,6 +1302,39 @@ export function App() {
       .catch(() => undefined);
   }
 
+  /**
+   * Records what a player said about the title it was handed.
+   *
+   * Called whenever a report turns up — at boot when the return was a fresh
+   * load, and on being brought to the front when it was not.
+   */
+  function applyExternalReport(report: ExternalPlayerReport) {
+    const watched = handedOff.current;
+    if (!watched) return;
+    clearExternalHandoff();
+    if (report.outcome === "finished") {
+      handedOff.current = null;
+      setExternalWatch(null);
+      void toggleWatched(watched.meta, watched.video, true);
+      setMessage("Marked as watched.");
+      return;
+    }
+    // "Stopped" without a position is the Shortcut route's normal case: a
+    // player appends where it got to onto the address it was handed, which
+    // there is the shortcuts:// one, so it lands beside the text passed on
+    // rather than inside it. Knowing playback ended is not knowing where, so
+    // it still has to be asked — silently saving nothing is the one outcome
+    // this must never produce.
+    if (report.positionMs <= 0) {
+      setExternalWatch(watched);
+      return;
+    }
+    handedOff.current = null;
+    setExternalWatch(null);
+    savePlaybackProgress(watched, report.positionMs, report.durationMs, false);
+    setMessage("Saved your position.");
+  }
+
   /** Where a title resumes from, shared by the web player and the hand-off. */
   function resumePositionMs(meta: Meta, video?: Video) {
     const row = watchIndex.progress.get(
@@ -1314,8 +1363,11 @@ export function App() {
   ) {
     // Written before the launch, not after: handing off navigates away, and on
     // Android the process may not survive to run another line.
-    if (profile && mode !== "copy" && mode !== "m3u")
+    if (profile && mode !== "copy" && mode !== "m3u") {
       rememberExternalHandoff(profile.profileIndex, meta, video);
+      // Also held in memory, for the return that finds the app still running.
+      handedOff.current = { meta, video };
+    }
     const resumeMs = positionMs ?? resumePositionMs(meta, video);
     const appUrl = installedAppUrl();
     launchExternalPlayer(mode, url, video?.title || meta.name, {
@@ -3979,6 +4031,30 @@ function SettingsPage({
               Last return from a player:{" "}
               <code>{lastExternalReturn() || "nothing yet"}</code>
             </p>
+            <label className="setting-select-row">
+              <span>
+                <strong>Test the return</strong>
+                <small>
+                  Goes out through the Shortcut exactly as a player would,
+                  carrying a position of 1:23. Come back here and read the line
+                  above: if it shows <code>position=83</code> the whole route
+                  works, and if it shows only <code>nuvio-external</code> then
+                  the address arrives but what a player appends to it does not.
+                </small>
+              </span>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  window.location.href = shortcutReturnUrl(
+                    installedAppUrl(),
+                    "?nuvio-external=stopped&position=83&duration=5400",
+                  );
+                }}
+              >
+                Test
+              </button>
+            </label>
           </>
         )}
         <p>
