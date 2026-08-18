@@ -119,6 +119,7 @@ import {
 import {
   clearRelayToken,
   collectRelayReport,
+  describeReturnRoute,
   newRelayToken,
   pendingRelayToken,
   relayReturnUrl,
@@ -4093,6 +4094,21 @@ function SettingsPage({
             ))}
           </select>
         </label>
+        {/* Which route applies depends on where the app is running and what
+            has been set up — neither of which can be seen by looking at it. */}
+        <p className="settings-shortcut-target">
+          Running as{" "}
+          <b>
+            {isInstalledAppleWebApp()
+              ? "an installed web app"
+              : "a browser tab"}
+          </b>
+          . A player sent from here reports back:{" "}
+          {describeReturnRoute({
+            installedAppleWebApp: isInstalledAppleWebApp(),
+            shortcutReturn,
+          })}
+        </p>
         {/* Only where it is the one way back: everywhere else a plain link
             already reaches the app. */}
         {isInstalledAppleWebApp() && (

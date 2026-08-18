@@ -84,6 +84,26 @@ export function relayReturnUrl(
 }
 
 /**
+ * Which way home a hand-off started here would take.
+ *
+ * Four routes exist and which one applies depends on where the app is running
+ * and what has been set up, neither of which is visible while looking at it.
+ * Saying so plainly beats inferring it from whether something worked.
+ */
+export function describeReturnRoute(options: {
+  installedAppleWebApp: boolean;
+  shortcutReturn: boolean;
+}): string {
+  if (!options.installedAppleWebApp)
+    return "Straight back to this page, carrying the position. Nothing else needed.";
+  if (relayUrl())
+    return "Through the relay, which is the only route that carries a position into an installed app.";
+  if (options.shortcutReturn)
+    return "Through the Shortcut, which reopens the app but cannot carry a position — the prompt will ask.";
+  return "Nowhere. The prompt will ask what happened. Add a relay above to have it reported instead.";
+}
+
+/**
  * Asks the relay whether an answer is waiting. Reading empties the slot, so
  * this is asked once per return and the token dropped either way.
  */
