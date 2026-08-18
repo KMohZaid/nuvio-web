@@ -346,6 +346,13 @@ export function App() {
   const handedOff = useRef<{ meta: Meta; video?: Video } | null>(null);
   /** Held in state so Settings updates on a return rather than on a revisit. */
   const [lastReturn, setLastReturn] = useState(() => readExternalReturnLog());
+  /**
+   * A report waiting for somewhere to put it. Held rather than applied because
+   * it can arrive before a profile has been chosen, and saving needs one.
+   */
+  const [pendingReport, setPendingReport] = useState<ExternalPlayerReport | null>(
+    null,
+  );
   const [providerCredentials, setProviderCredentials] = useState<
     ProviderCredentialRow[]
   >([]);
@@ -501,10 +508,25 @@ export function App() {
     setSelected(bootHandoff.meta);
     const watched = { meta: bootHandoff.meta, video: bootHandoff.video };
     handedOff.current = watched;
-    if (bootReport) applyExternalReport(bootReport);
+    if (bootReport) setPendingReport(bootReport);
     else setExternalWatch(watched);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile, bootHandoff, bootReport]);
+  /**
+   * Applies a report once there is a profile to record it against.
+   *
+   * A report can arrive before the account has finished loading — the relay is
+   * asked the moment the app wakes, and a cold start asks it before anyone has
+   * been chosen. Saving needs a profile, so it waits for one here rather than
+   * being dropped on the floor by the writer.
+   */
+  useEffect(() => {
+    if (!pendingReport || !profile || !handedOff.current) return;
+    const report = pendingReport;
+    setPendingReport(null);
+    applyExternalReport(report);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingReport, profile]);
   /**
    * Watches for a report that arrives after the app is already up.
    *
@@ -514,28 +536,43 @@ export function App() {
    * through the Shortcut, and why nothing was ever recorded.
    */
   useEffect(() => {
+    /**
+     * Nothing in the address is the normal case on an installed iOS web app,
+     * so the relay is asked separately rather than as a fallback nobody
+     * reaches. Both answers are logged: "had nothing" is as much of a result
+     * as an answer, and distinguishes a relay that was never asked from one
+     * that was asked and was empty.
+     */
+    const pollRelay = (reason: string) => {
+      const token = pendingRelayToken();
+      if (!token) return;
+      void collectRelayReport(token).then((relayed) => {
+        noteExternalEvent(
+          relayed
+            ? `relay answered ${relayed.outcome} at ${Math.round(relayed.outcome === "stopped" ? relayed.positionMs / 1000 : 0)}s`
+            : `relay had nothing (${reason})`,
+        );
+        setLastReturn(readExternalReturnLog());
+        if (!relayed) return;
+        clearRelayToken();
+        setPendingReport(relayed);
+      });
+    };
     const check = (reason: string) => {
       if (document.visibilityState !== "visible") return;
       noteExternalReturn(reason);
       setLastReturn(readExternalReturnLog());
       const report = takeExternalReport();
       if (report) {
-        applyExternalReport(report);
+        setPendingReport(report);
         return;
       }
-      // Nothing in the address, which on an installed iOS web app is every
-      // time. If a hand-off went out through the relay, the answer is waiting
-      // there instead.
-      const token = pendingRelayToken();
-      if (!token) return;
-      void collectRelayReport(token).then((relayed) => {
-        if (!relayed) return;
-        clearRelayToken();
-        noteExternalEvent(`relay answered · ${relayed.outcome}`);
-        setLastReturn(readExternalReturnLog());
-        applyExternalReport(relayed);
-      });
+      pollRelay(reason);
     };
+    // A cold start is a return too, and the quietest kind: nothing becomes
+    // visible because it was never hidden, so no event fires and the relay
+    // would go unasked.
+    pollRelay("opened");
     const onVisible = () => check("resumed");
     const onShow = () => check("shown");
     document.addEventListener("visibilitychange", onVisible);
