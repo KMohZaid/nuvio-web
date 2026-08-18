@@ -80,20 +80,24 @@ export function clearExternalHandoff() {
  */
 export type ExternalPlayerReport =
   | { outcome: "finished" }
-  | { outcome: "stopped"; positionMs: number; durationMs: number };
+  | { outcome: "stopped"; positionMs: number; durationMs: number }
+  /** Arriving here at all is the answer to "does webapp:// reach us?". */
+  | { outcome: "test"; carriedQuery: boolean };
 
 /** Reads the report out of the address bar and takes it back out again. */
 export function takeExternalReport(): ExternalPlayerReport | null {
   if (typeof window === "undefined") return null;
   const params = new URLSearchParams(window.location.search);
   const outcome = params.get("nuvio-external");
-  if (outcome !== "finished" && outcome !== "stopped") return null;
+  if (outcome !== "finished" && outcome !== "stopped" && outcome !== "test")
+    return null;
 
   // The parameters are the player's, and they should not survive a refresh or
   // end up in a shared link.
   const clean = new URL(window.location.href);
   for (const key of [
     "nuvio-external",
+    "nuvio-probe",
     "url",
     "position",
     "duration",
@@ -103,6 +107,11 @@ export function takeExternalReport(): ExternalPlayerReport | null {
     clean.searchParams.delete(key);
   window.history.replaceState(null, "", clean.toString());
 
+  if (outcome === "test")
+    // A probe that arrives without its companion parameter opened the app but
+    // dropped the query — enough to come back, not enough to say where you got
+    // to, which is the difference that decides whether callbacks are usable.
+    return { outcome: "test", carriedQuery: params.get("nuvio-probe") === "1" };
   if (outcome === "finished") return { outcome: "finished" };
   // Both are reported in seconds, and a fractional position is normal.
   const seconds = (value: string | null) => {
