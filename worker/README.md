@@ -40,8 +40,19 @@ fragment — `#nuvio` — and a fragment is never sent to a server. So:
   the server sees them, the stream URL included. Nothing is worse than it would
   otherwise have been, and the position still arrives.
 
-Which of the two happens is a property of the player, and the handoff page says
-which it was while it is on screen.
+Which of the two happens is a property of the player. **Outplayer does the
+second**, measured rather than assumed: it parses the address and its
+parameters land in the query, so with Outplayer the stream URL is sent. The
+fragment is kept anyway — it costs a character and would take effect for any
+player that appends plainly, or if Outplayer ever changes.
+
+This is not a gap left in the design, and no rearrangement closes it. Recovering
+a position at all requires an `https` receiver, because that is the only kind of
+address a player's appended parameters survive into; and that receiver's request
+line is where the player also puts the stream URL. So automatic position and
+zero transmission cannot both be had. The alternative is not a cleverer route,
+it is the prompt: leave the relay unset and nothing is sent anywhere, at the
+cost of typing where you stopped.
 
 In the second case it is worth weighing whether a stream URL carries an access
 token. Most debrid links are short-lived and tied to the requesting IP, which
