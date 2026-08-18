@@ -14,8 +14,10 @@ import {
 import {
   ArrowLeft,
   Copy,
+  Eye,
   ExternalLink,
   FastForward,
+  List,
   LoaderCircle,
   Maximize,
   Music2,
@@ -34,6 +36,12 @@ import {
   useState,
   type CSSProperties,
 } from "react";
+import {
+  hasEpisodeAired,
+  resolveNextEpisode,
+  shouldShowNextEpisode,
+} from "../lib/nextEpisode";
+import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
 import type { ExternalPlayerMode, Meta, Stream, Video } from "../types";
 
 type AudioChoice = { id: number; label: string };
@@ -79,6 +87,9 @@ export function Player({
   onProgress,
   settings,
   startPositionMs = 0,
+  episodes,
+  watchIndex,
+  onPlayEpisode,
 }: {
   stream: Stream;
   meta: Meta;
@@ -96,6 +107,14 @@ export function Player({
   ): void;
   /** Where to resume from. 0 starts at the beginning. */
   startPositionMs?: number;
+  /**
+   * The run this episode belongs to, so the player can offer the next one and
+   * let another be chosen without leaving playback.
+   */
+  episodes?: Video[];
+  watchIndex?: WatchIndex;
+  /** Resolves a source for another episode and switches to it. */
+  onPlayEpisode?(next: Video): void;
   /** Reports a resume point. Fired periodically, on pause, and on exit. */
   onProgress(positionMs: number, durationMs: number, ended: boolean): void;
   settings: WebPlayerSettings;
@@ -142,6 +161,9 @@ export function Player({
   const [controlsVisible, setControlsVisible] = useState(true);
   const [audioOpen, setAudioOpen] = useState(false);
   const [externalPlayerOpen, setExternalPlayerOpen] = useState(false);
+  const [episodesOpen, setEpisodesOpen] = useState(false);
+  /** Dismissed by hand, so it does not come back for the rest of the episode. */
+  const [nextDismissed, setNextDismissed] = useState(false);
   const [audioTracks, setAudioTracks] = useState<AudioChoice[]>([]);
   const [selectedAudio, setSelectedAudio] = useState(-1);
   const url = stream.url;
@@ -733,6 +755,22 @@ export function Player({
     element.volume = next;
     element.muted = next === 0;
   };
+  const nextEpisode = useMemo(() => {
+    if (!episodes?.length || !onPlayEpisode) return null;
+    const candidate = resolveNextEpisode(
+      episodes,
+      video?.season,
+      video?.episode,
+    );
+    // An addon lists a whole season including episodes that do not exist yet.
+    return candidate && hasEpisodeAired(candidate.released) ? candidate : null;
+  }, [episodes, onPlayEpisode, video?.season, video?.episode]);
+  const showNextEpisode =
+    !!nextEpisode &&
+    !nextDismissed &&
+    !error &&
+    shouldShowNextEpisode(currentTime * 1000, duration * 1000);
+
   const seekLimit = duration || 0;
   const displayedTime = seekPreview ?? currentTime;
   const commitSeekPreview = (fallback: number) => {
@@ -975,12 +1013,112 @@ export function Player({
                 )}
               </div>
             )}
+            {!!episodes?.length && onPlayEpisode && (
+              <button
+                aria-label="Episodes"
+                className={episodesOpen ? "active" : ""}
+                aria-expanded={episodesOpen}
+                onClick={() => {
+                  setAudioOpen(false);
+                  setExternalPlayerOpen(false);
+                  setEpisodesOpen((value) => !value);
+                }}
+              >
+                <List />
+                <span>Episodes</span>
+              </button>
+            )}
             <button aria-label="Fullscreen" onClick={toggleFullscreen}>
               <Maximize />
             </button>
           </div>
         </div>
       </div>
+      {showNextEpisode && nextEpisode && (
+        <div className="player-next">
+          <div>
+            <small>Up next</small>
+            <strong>
+              {nextEpisode.season != null && nextEpisode.episode != null
+                ? `S${nextEpisode.season}·E${nextEpisode.episode} `
+                : ""}
+              {nextEpisode.title || "Next episode"}
+            </strong>
+          </div>
+          <button onClick={() => setNextDismissed(true)}>Not now</button>
+          <button
+            className="primary"
+            onClick={() => onPlayEpisode?.(nextEpisode)}
+          >
+            <FastForward /> Play
+          </button>
+        </div>
+      )}
+      {episodesOpen && !!episodes?.length && (
+        <div
+          className="player-episodes-scrim"
+          onClick={() => setEpisodesOpen(false)}
+        >
+          {/* The same list as the detail page, watched state included, so the
+              run reads the same whether you are choosing or watching. */}
+          <aside
+            className="player-episodes"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header>
+              <strong>Episodes</strong>
+              <button
+                className="circle-button"
+                aria-label="Close"
+                onClick={() => setEpisodesOpen(false)}
+              >
+                <X />
+              </button>
+            </header>
+            <div className="player-episode-list">
+              {episodes.map((item) => {
+                const key = watchKey(meta.id, item.season, item.episode);
+                const watched = watchIndex?.watched.has(key) ?? false;
+                const percent = watchIndex ? episodePercent(watchIndex, key) : 0;
+                const playing = item.id === video?.id;
+                return (
+                  <button
+                    key={item.id}
+                    className={playing ? "is-playing" : ""}
+                    disabled={playing || !hasEpisodeAired(item.released)}
+                    onClick={() => {
+                      setEpisodesOpen(false);
+                      onPlayEpisode?.(item);
+                    }}
+                  >
+                    <span className="player-episode-thumb">
+                      {item.thumbnail ? (
+                        <img src={item.thumbnail} alt="" loading="lazy" />
+                      ) : null}
+                      {percent > 0 && percent < 100 && (
+                        <i style={{ width: `${percent}%` }} />
+                      )}
+                      {watched && (
+                        <b aria-label="Watched">
+                          <Eye />
+                        </b>
+                      )}
+                    </span>
+                    <span className="player-episode-copy">
+                      <small>
+                        {item.season != null && item.episode != null
+                          ? `S${item.season} · E${item.episode}`
+                          : "Special"}
+                      </small>
+                      <strong>{item.title || `Episode ${item.episode ?? ""}`}</strong>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
+        </div>
+      )}
       {error && (
         <div className="player-error">
           <strong>Browser playback unavailable</strong>

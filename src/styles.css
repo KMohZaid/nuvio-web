@@ -6328,3 +6328,189 @@ body.is-locked {
   height: 100%;
   background: #000;
 }
+
+/* ---- Up next, and the episode list ------------------------------------ */
+/* Sits above the controls rather than over the picture, so the last minute of
+   an episode is still watchable while it is showing. */
+.player-next {
+  position: absolute;
+  z-index: 4;
+  right: max(24px, env(safe-area-inset-right));
+  bottom: 118px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(460px, calc(100vw - 40px));
+  padding: 13px 15px;
+  border: 1px solid #ffffff1f;
+  border-radius: 16px;
+  background: #0f1418f2;
+  box-shadow: 0 18px 50px #000a;
+}
+.player-next > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.player-next small {
+  color: #8d97a2;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.player-next strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.player-next button {
+  flex: none;
+  height: 38px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: #d9dde1;
+  cursor: pointer;
+}
+.player-next button.primary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: #f4f6f7;
+  color: #090b0d;
+  font-weight: 600;
+}
+.player-next button svg {
+  width: 17px;
+}
+
+/* A panel off the right edge, as it is on the detail page it mirrors. */
+.player-episodes-scrim {
+  position: absolute;
+  z-index: 6;
+  inset: 0;
+  background: #0006;
+  display: flex;
+  justify-content: flex-end;
+}
+.player-episodes {
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  background: var(--app-bg);
+  border-left: 1px solid var(--panel-border);
+  animation: player-episodes-in 0.18s ease-out;
+}
+@keyframes player-episodes-in {
+  from {
+    transform: translate3d(100%, 0, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .player-episodes {
+    animation: none;
+  }
+}
+.player-episodes > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: max(16px, env(safe-area-inset-top)) 16px 12px;
+  border-bottom: 1px solid var(--panel-border);
+}
+.player-episode-list {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+.player-episode-list > button {
+  display: grid;
+  grid-template-columns: 116px minmax(0, 1fr);
+  gap: 12px;
+  padding: 8px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--panel-soft);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.player-episode-list > button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.player-episode-list > button.is-playing {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  opacity: 1;
+}
+.player-episode-thumb {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+}
+.player-episode-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* The resume bar and the watched mark, as the detail page draws them. */
+.player-episode-thumb > i {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  background: #ef3340;
+}
+.player-episode-thumb > b {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #0b0e11cc;
+}
+.player-episode-thumb > b svg {
+  width: 13px;
+}
+.player-episode-copy {
+  display: grid;
+  gap: 3px;
+  align-content: center;
+  min-width: 0;
+}
+.player-episode-copy small {
+  color: #8d97a2;
+  font-size: 11px;
+}
+.player-episode-copy strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+@media (max-width: 760px) {
+  .player-next {
+    left: max(16px, env(safe-area-inset-left));
+    right: max(16px, env(safe-area-inset-right));
+    bottom: 104px;
+  }
+  .player-episode-list > button {
+    grid-template-columns: 96px minmax(0, 1fr);
+  }
+}

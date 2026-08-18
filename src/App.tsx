@@ -90,6 +90,7 @@ import {
   loadCatalog,
   loadHome,
   loadInstalledAddons,
+  loadStreams,
   normalizeManifestUrl,
   resolveMeta,
   searchAddons,
@@ -133,6 +134,7 @@ import {
   registerCurrentDevice,
   resetDeviceRegistration,
 } from "./lib/deviceSession";
+import { pickBingeStream } from "./lib/nextEpisode";
 import { syncProgress, syncWatched } from "./lib/watchSync";
 import {
   buildContinueWatching,
@@ -2004,6 +2006,35 @@ export function App() {
               ? 0
               : resumePositionMs(playback.meta, playback.video)
           }
+          episodes={playback.meta.videos}
+          watchIndex={watchIndex}
+          onPlayEpisode={(next) => {
+            // The same source, not a fresh choice. A binge group names a
+            // release that serves a whole run, so continuing within it keeps
+            // the quality, the audio and the host already chosen.
+            const bingeGroup = playback.stream.behaviorHints?.bingeGroup;
+            const current = playback;
+            setMessage("");
+            void loadStreams(current.meta.type, next.id, addons)
+              .then((streams) => {
+                const chosen = pickBingeStream(streams, bingeGroup);
+                if (!chosen) {
+                  setMessage(
+                    "No playable source was found for that episode. Open it from the title page to choose one.",
+                  );
+                  return;
+                }
+                setPlayback({
+                  stream: chosen,
+                  meta: current.meta,
+                  video: next,
+                  startAtBeginning: true,
+                });
+              })
+              .catch(() => {
+                setMessage("That episode's sources could not be loaded.");
+              });
+          }}
           onClose={() => setPlayback(null)}
           onExternalPlay={(mode, url, positionMs) => {
             // The web player is torn down first. Leaving it mounted keeps it
