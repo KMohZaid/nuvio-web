@@ -109,10 +109,8 @@ import {
   isAndroid,
   isAppleMobile,
   isExternalPlayerAvailable,
-  isInstalledAppleWebApp,
   isMacOS,
   launchExternalPlayer,
-  webAppReturnUrl,
 } from "./lib/externalPlayer";
 import {
   clearExternalHandoff,
@@ -342,13 +340,6 @@ export function App() {
     ) as ExternalPlayerMode | null;
     return stored && isExternalPlayerAvailable(stored) ? stored : "internal";
   });
-  /**
-   * Off until it is shown to work. iOS's webapp:// scheme is undocumented and
-   * has been broken at least once, so nothing depends on it by default.
-   */
-  const [webAppReturn, setWebAppReturn] = useState(
-    () => localStorage.getItem("nuvio-web-webapp-return") === "1",
-  );
   const [active, setActive] = useState<NavKey>("home");
   // The nav highlight follows `active` immediately; the page body renders from
   // the deferred copy, so a tap paints the new tab first and the heavy list
@@ -462,28 +453,6 @@ export function App() {
    * When that player said what it did, its word is taken and nothing is asked;
    * only a player that came back silent gets the prompt.
    */
-  /**
-   * Reports back on the webapp:// probe.
-   *
-   * Landing here at all means the scheme reached the installed app rather than
-   * Safari. Whether the query came with it is the second half: without it a
-   * player could bring you back but never say where it got to, so the callback
-   * would still have nothing to save.
-   */
-  useEffect(() => {
-    if (bootReport?.outcome !== "test") return;
-    if (bootReport.carriedQuery) {
-      localStorage.setItem("nuvio-web-webapp-return", "1");
-      setWebAppReturn(true);
-      setMessage(
-        "webapp:// works and carries its parameters. Outplayer will now report back here.",
-      );
-      return;
-    }
-    setMessage(
-      "webapp:// opened the app but dropped its parameters, so a player cannot report a position through it.",
-    );
-  }, [bootReport]);
   useEffect(() => {
     if (resumeConsumed.current || !bootHandoff || !profile) return;
     if (profile.profileIndex !== bootHandoff.profileIndex) return;
@@ -491,9 +460,7 @@ export function App() {
     clearExternalHandoff();
     setSelected(bootHandoff.meta);
     const watched = { meta: bootHandoff.meta, video: bootHandoff.video };
-    // A probe says nothing about what was watched, so it leaves the prompt to
-    // ask as it would have anyway.
-    if (!bootReport || bootReport.outcome === "test") {
+    if (!bootReport) {
       setExternalWatch(watched);
       return;
     }
@@ -1331,17 +1298,13 @@ export function App() {
     if (profile && mode !== "copy" && mode !== "m3u")
       rememberExternalHandoff(profile.profileIndex, meta, video);
     const resumeMs = positionMs ?? resumePositionMs(meta, video);
-    const page = `${window.location.origin}${import.meta.env.BASE_URL}`;
     launchExternalPlayer(mode, url, video?.title || meta.name, {
       positionSeconds: resumeMs / 1000,
-      // An https address cannot reach an installed iOS web app — it would only
-      // open a signed-out Safari tab — so there it is either webapp://, where
-      // that has been shown to work, or nothing and the prompt asks.
+      // Omitted where a link back cannot reach us: an installed iOS web app
+      // would only send the viewer to a signed-out Safari tab.
       returnUrl: canReturnToApp()
-        ? page
-        : webAppReturn
-          ? webAppReturnUrl(page)
-          : undefined,
+        ? `${window.location.origin}${import.meta.env.BASE_URL}`
+        : undefined,
     });
     setMessage(
       mode === "copy"
@@ -1799,7 +1762,6 @@ export function App() {
             credentialsReady={credentialsReady}
             onProviderCredential={saveProviderCredential}
             externalPlayer={externalPlayer}
-            webAppReturn={webAppReturn}
             onExternalPlayer={(mode) => {
               setExternalPlayer(mode);
               localStorage.setItem("nuvio-web-external-player", mode);
@@ -1963,12 +1925,15 @@ export function App() {
             setDetailLaunch(null);
           }}
           onLibrary={toggleLibrary}
-          onPlay={(stream, meta, video) => {
+          defaultPlayer={externalPlayer}
+          onPlay={(stream, meta, video, player) => {
+            // The picker in the sources panel wins for this launch only.
+            const chosen = player ?? externalPlayer;
             const url = stream.url || stream.externalUrl;
-            if (externalPlayer !== "internal" && url) {
+            if (chosen !== "internal" && url) {
               // Details stays open: the stream opened elsewhere, so this page
               // is exactly where you want to be when you come back.
-              handOffToExternalPlayer(externalPlayer, url, meta, video);
+              handOffToExternalPlayer(chosen, url, meta, video);
               return;
             }
             setPlayback({
@@ -2858,7 +2823,6 @@ function SettingsPage({
   onProviderCredential,
   externalPlayer,
   onExternalPlayer,
-  webAppReturn,
   onSignOut,
 }: {
   onRemuxLab(): void;
@@ -2897,8 +2861,6 @@ function SettingsPage({
   ): Promise<void>;
   externalPlayer: ExternalPlayerMode;
   onExternalPlayer(mode: ExternalPlayerMode): void;
-  /** Whether webapp:// has been shown to reach this installed web app. */
-  webAppReturn: boolean;
   onSignOut(): void;
 }) {
   const [category, setCategory] = useState<SettingsCategory>("appearance");
@@ -3946,34 +3908,6 @@ function SettingsPage({
             ))}
           </select>
         </label>
-        {/* Only where it is the sole option: on an installed iOS web app an
-            https callback opens Safari, which is a different storage container
-            and cannot save anything. */}
-        {isInstalledAppleWebApp() && (
-          <label className="setting-select-row">
-            <span>
-              <strong>Let Outplayer report back</strong>
-              <small>
-                Outplayer can say where it stopped, but iOS sends an ordinary
-                link to Safari, which is signed out. The webapp:// scheme
-                reaches this app instead — undocumented, and broken on some iOS
-                versions. Test it here; if it works this turns itself on.
-              </small>
-            </span>
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => {
-                const page = `${window.location.origin}${import.meta.env.BASE_URL}`;
-                window.location.href = webAppReturnUrl(
-                  `${page}${page.includes("?") ? "&" : "?"}nuvio-external=test&nuvio-probe=1`,
-                );
-              }}
-            >
-              {webAppReturn ? "Working · test again" : "Test"}
-            </button>
-          </label>
-        )}
         <p>
           The web remux fallback only re-boxes compatible tracks. DTS and
           TrueHD still require an external player; Nuvio Web does not transcode.

@@ -19,12 +19,7 @@ import {
   enrichMetadata,
   type MetadataEnrichmentConfig,
 } from "../lib/metadataEnrichment";
-import {
-  needsProbe,
-  probeSources,
-  statusFor,
-  subscribeSourceProbes,
-} from "../lib/sourceProbe";
+import { externalPlayerOptions } from "../lib/externalPlayer";
 import { episodePercent, watchKey, type WatchIndex } from "../lib/progress";
 import { seriesPlaybackTarget } from "../lib/seriesPlayback";
 import type {
@@ -41,7 +36,14 @@ import {
   type StreamBadgeSettings,
   type WebPlayerSettings,
 } from "../lib/webSettings";
-import type { ExternalRating, InstalledAddon, Meta, Stream, Video } from "../types";
+import type {
+  ExternalPlayerMode,
+  ExternalRating,
+  InstalledAddon,
+  Meta,
+  Stream,
+  Video,
+} from "../types";
 import { ContextMenu } from "./ContextMenu";
 
 const DEFAULT_DETAIL_COLOR = "18 22 26";
@@ -338,6 +340,7 @@ export function Details({
   onSetWatched,
   initialVideoId,
   openSourcesOnLoad = false,
+  defaultPlayer,
 }: {
   seed: Meta;
   addons: InstalledAddon[];
@@ -349,10 +352,21 @@ export function Details({
   metaScreenSettings: MetaScreenSettings;
   onClose(): void;
   onLibrary(meta: Meta): void;
-  onPlay(stream: Stream, meta: Meta, video?: Video): void;
+  /**
+   * `player` overrides the configured default for this one launch, which is
+   * what the picker in the sources panel sets.
+   */
+  onPlay(
+    stream: Stream,
+    meta: Meta,
+    video?: Video,
+    player?: ExternalPlayerMode,
+  ): void;
   onSetWatched(meta: Meta, video: Video | undefined, watched: boolean): void;
   initialVideoId?: string;
   openSourcesOnLoad?: boolean;
+  /** The player chosen in Settings, which the picker starts on. */
+  defaultPlayer: ExternalPlayerMode;
 }) {
   const [menu, setMenu] = useState<{ x: number; y: number; video: Video } | null>(
     null,
@@ -420,6 +434,14 @@ export function Details({
   const [streams, setStreams] = useState<Stream[]>([]);
   const [sourceBusy, setSourceBusy] = useState(false);
   const [sourceVideo, setSourceVideo] = useState<Video | undefined>();
+  /**
+   * Starts on the Settings default and lasts as long as the panel is open, so
+   * reaching for a different player once does not silently become the choice
+   * for everything after it.
+   */
+  const [sheetPlayer, setSheetPlayer] =
+    useState<ExternalPlayerMode>(defaultPlayer);
+  useEffect(() => setSheetPlayer(defaultPlayer), [defaultPlayer, sourceOpen]);
   const autoPlayTimer = useRef<number | undefined>(undefined);
   const sourceRequest = useRef(0);
   const sourceAbort = useRef<AbortController | null>(null);
@@ -464,12 +486,6 @@ export function Details({
   useEffect(() => {
     initialSourceConsumed.current = false;
   }, [seed.id, initialVideoId, openSourcesOnLoad]);
-  // Probe results live in a module cache, so this only forces a re-render.
-  const [, setProbeTick] = useState(0);
-  useEffect(
-    () => subscribeSourceProbes(() => setProbeTick((tick) => tick + 1)),
-    [],
-  );
   const seasons = useMemo(
     () =>
       [...new Set(meta.videos.map((video) => video.season ?? 0))].sort(
@@ -1061,26 +1077,25 @@ export function Details({
                 <h2>Choose a source</h2>
               </div>
               <div className="source-sheet-tools">
-                <button
-                  className="secondary"
-                  onClick={() =>
-                    void probeSources(
-                      streams
-                        .map((item) => item.url || item.externalUrl || "")
-                        .filter((target) =>
-                          needsProbe(
-                            target,
-                            streams.find(
-                              (item) =>
-                                (item.url || item.externalUrl) === target,
-                            )?.behaviorHints?.filename,
-                          ),
-                        ),
-                    )
-                  }
-                >
-                  Check playability
-                </button>
+                {/* Picking the player here rather than in Settings: which one
+                    suits a source is a property of the source, and it is the
+                    moment you are looking at them. */}
+                <label className="source-player">
+                  <span>Play in</span>
+                  <select
+                    value={sheetPlayer}
+                    onChange={(event) =>
+                      setSheetPlayer(event.target.value as ExternalPlayerMode)
+                    }
+                  >
+                    <option value="internal">Nuvio web player</option>
+                    {externalPlayerOptions("player").map((option) => (
+                      <option key={option.mode} value={option.mode}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <button
                   className="circle-button"
                   onClick={() => {
@@ -1103,7 +1118,9 @@ export function Details({
                     <button
                       className="source-main"
                       disabled={!stream.url && !stream.externalUrl}
-                      onClick={() => onPlay(stream, meta, sourceVideo)}
+                      onClick={() =>
+                        onPlay(stream, meta, sourceVideo, sheetPlayer)
+                      }
                     >
                       <span>
                         {stream.addonLogo ? (
@@ -1130,19 +1147,6 @@ export function Details({
                           {(() => {
                             const target =
                               stream.url || stream.externalUrl || "";
-                            const probed = statusFor(target);
-                            // A probe read the container, so it outranks any
-                            // guess made from the file name.
-                            if (probed)
-                              return (
-                                <>
-                                  {" · "}
-                                  <b className={`probe-state-${probed.state}`}>
-                                    {probed.label}
-                                  </b>
-                                  {` · ${probed.detail}`}
-                                </>
-                              );
                             const verdict = assessPlayback(
                               target,
                               stream.behaviorHints?.filename,

@@ -31,25 +31,6 @@ const isStandalone = () =>
  */
 export const canReturnToApp = () => !(isAppleMobile() && isStandalone());
 
-/** True only where the webapp:// escape hatch below is worth offering. */
-export const isInstalledAppleWebApp = () => isAppleMobile() && isStandalone();
-
-/**
- * The one address that can reach an installed iOS web app.
- *
- * iOS has a webapp:// scheme that opens a home-screen web app by its own URL,
- * and unlike an https link it lands in the installed app — the same storage as
- * the app itself, signed in, with the note about what was playing. If it
- * carries the query through it closes the loop completely.
- *
- * It is undocumented and was reported broken partway through iOS 26, so it is
- * offered as something to try rather than relied on, and Settings has a button
- * that answers the question on the device rather than in the abstract.
- */
-export function webAppReturnUrl(pageUrl: string) {
-  return `webapp://${pageUrl.replace(/^https?:\/\//i, "")}`;
-}
-
 export type ExternalPlayerSurface = "settings" | "player";
 type PlayerPlatform = "android" | "apple-mobile" | "macos" | "desktop";
 
